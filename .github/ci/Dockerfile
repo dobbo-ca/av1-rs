@@ -1,0 +1,137 @@
+# CI image: Rust runs here, on the in-cluster BuildKit, because the ARC runner has no toolchain.
+# av1-rs has no private dependencies, so no stage needs a token. The fuzz crate's dependency
+# (libfuzzer-sys from crates.io) is fetched in `toolchain`, before the source is copied.
+FROM rust:1.99.1-bookworm AS toolchain
+# gcc-aarch64-linux-gnu: the linker of `cargo build --target aarch64-unknown-linux-gnu`.
+RUN rustup component add rustfmt clippy && rustup target add aarch64-unknown-linux-gnu \
+    && apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+    && rm -rf /var/lib/apt/lists/*
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+WORKDIR /src
+COPY tests/fuzz/Cargo.toml tests/fuzz/Cargo.lock tests/fuzz/
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src tests/fuzz/fuzz_targets && touch src/lib.rs \
+    && for t in probe decode; do touch tests/fuzz/fuzz_targets/$t.rs; done \
+    && cargo fetch --locked --manifest-path tests/fuzz/Cargo.toml \
+    && rm -rf src tests/fuzz/fuzz_targets
+
+FROM toolchain AS src
+ENV CARGO_NET_OFFLINE=true
+COPY . .
+
+# The checks run in the build, so a red check fails the build. The target dir is a cache mount;
+# every RUN touches the .rs files first, because the cache is shared by all branches and cargo
+# compares mtimes.
+FROM src AS ci
+RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
+    find src examples tests -name '*.rs' -exec touch {} + && cargo fmt --check
+RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
+    find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --all-targets -- -D warnings
+RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
+    find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
+RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
+    find src examples tests -name '*.rs' -exec touch {} + && cargo test --locked --no-fail-fast
+# The examples are built too, so the cross linker runs (a lib alone is not linked).
+RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
+    find src examples tests -name '*.rs' -exec touch {} + && cargo build --locked --release --target aarch64-unknown-linux-gnu --examples
+
+# qemu-user, for the arm64 stages (the cross gcc is in `toolchain`).
+FROM toolchain AS qemu-tools
+RUN apt-get update && apt-get install -y --no-install-recommends qemu-user \
+    && rm -rf /var/lib/apt/lists/*
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64 -L /usr/aarch64-linux-gnu" \
+    CARGO_NET_OFFLINE=true
+
+FROM qemu-tools AS qemu-arm64
+COPY . .
+
+# aarch64 tests under qemu-user. There is no NEON code yet, so only the library unit tests run
+# (the full suite runs natively in `ci`); the SIMD kernel tests join here when SIMD lands.
+FROM qemu-arm64 AS arm64
+RUN --mount=type=cache,id=av1-rs-target-arm64,sharing=locked,target=/src/target \
+    find src examples tests -name '*.rs' -exec touch {} + \
+    && cargo test --locked --release --target aarch64-unknown-linux-gnu --lib
+
+# The C oracles (CI only, never linked into the crate): dav1d 1.0.0 and aomdec 3.6.0 from
+# bookworm. Nothing of the crate is copied here, so a crate change does not rebuild it.
+FROM toolchain AS oracles
+RUN apt-get update && apt-get install -y --no-install-recommends dav1d aom-tools \
+    && rm -rf /var/lib/apt/lists/*
+ENV CARGO_NET_OFFLINE=true
+
+# The public corpus (tests/parity/corpus.txt, every file checked against its pinned hash) in a
+# cache mount, so a build downloads it once. sharing=locked: two builds never download at once.
+# Only a list of the files reaches the layer.
+FROM oracles AS data
+COPY tests/parity/fetch.sh tests/parity/corpus.txt /parity/
+RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked \
+    sh /parity/fetch.sh /parity/corpus.txt /data \
+    && (cd /data && find . -type f \( -name '*.ivf' -o -name '*.obu' \) | sort) > /data.list && wc -l /data.list
+
+# The Rust oracle on the x86_64 host, one thread: the tree that the aarch64 oracle must reproduce.
+FROM src AS x86-ref
+COPY --from=data /data.list /data.list
+RUN --mount=type=cache,id=av1-rs-target-parity,sharing=locked,target=/src/target \
+    find src examples tests -name '*.rs' -exec touch {} + \
+    && cargo build --locked --release --example oracle && cp target/release/examples/oracle /usr/local/bin/av1-oracle
+RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
+    sh tests/parity/run.sh ref /ref
+
+# Parity gate (tests/parity/run.sh full): av1-rs vs dav1d and aomdec on the corpus, and one
+# thread vs default threads. The stage does not fail on a diff: the report (summary.md, *.diff,
+# status) is the build output (target parity-report), and the workflow fails on `status`.
+FROM oracles AS parity
+COPY . .
+COPY --from=data /data.list /data.list
+RUN --mount=type=cache,id=av1-rs-target-parity,sharing=locked,target=/src/target \
+    find src examples tests -name '*.rs' -exec touch {} + \
+    && cargo build --locked --release --example oracle && cp target/release/examples/oracle /usr/local/bin/av1-oracle
+RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
+    mkdir -p /report && { sh tests/parity/run.sh full /report; echo $? > /report/status; }
+
+FROM scratch AS parity-report
+COPY --from=parity /report /
+
+# The oracle built for aarch64, run under qemu-user on a subset of the corpus, compared with the
+# x86_64 output above.
+FROM qemu-arm64 AS parity-arm64
+COPY --from=data /data.list /data.list
+RUN --mount=type=cache,id=av1-rs-target-arm64,sharing=locked,target=/src/target \
+    find src examples tests -name '*.rs' -exec touch {} + \
+    && cargo build --locked --release --target aarch64-unknown-linux-gnu --example oracle \
+    && cp target/aarch64-unknown-linux-gnu/release/examples/oracle /usr/local/bin/av1-oracle-arm64
+RUN --mount=type=bind,from=x86-ref,source=/ref,target=/ref,rw \
+    --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
+    sh tests/parity/run.sh arm /ref
+
+# Fuzzing (fuzz.yml): nightly and cargo-fuzz, with the targets built into the image. The workflow
+# runs it with `docker create` + `docker start`, so a BuildKit cache hit cannot skip the fuzzing.
+FROM toolchain AS fuzz-tools
+RUN rustup toolchain install nightly --profile minimal \
+    && cargo install cargo-fuzz --locked --version 0.13.1
+ENV CARGO_NET_OFFLINE=true
+
+# Seeds: the corpus streams (as Section 5 temporal units, see run.sh seeds), each with one option
+# byte at the end (the targets read their options from the last byte).
+FROM fuzz-tools AS fuzz
+COPY . .
+COPY --from=data /data.list /data.list
+RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
+    sh tests/parity/run.sh seeds tests/fuzz/seeds
+RUN cargo +nightly fuzz build --fuzz-dir tests/fuzz
+
+# Benchmark (bench.yml): dav1d and examples/bench on the same corpus, in one container, so the
+# ratio compares the same machine. Information only (no speed bar). BENCH_RUN changes per run,
+# so a cache hit of the same source does not reuse an old timing.
+FROM oracles AS bench
+COPY . .
+COPY --from=data /data.list /data.list
+RUN --mount=type=cache,id=av1-rs-target-bench,sharing=locked,target=/src/target \
+    find src examples tests -name '*.rs' -exec touch {} + \
+    && cargo build --locked --release --example oracle && cp target/release/examples/oracle /usr/local/bin/av1-oracle
+ARG BENCH_RUN=0
+RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
+    echo "run $BENCH_RUN" && mkdir -p /report && { sh tests/parity/bench.sh /report; echo $? > /report/status; }
+
+FROM scratch AS bench-report
+COPY --from=bench /report /

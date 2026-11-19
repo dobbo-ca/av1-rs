@@ -1,0 +1,19 @@
+[package]
+name = "av1"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+description = "AV1 intra-only decoder (AVIF stills and key frames), bit-exact to the AV1 specification, with strict resource limits."
+publish = false
+
+[dependencies]
+
+# The tests decode whole frames, so they run optimised; this crate keeps its own overflow checks
+# and debug assertions in dev builds.
+[profile.test]
+opt-level = 2
+
+# One codegen unit, so the decode loops inline across modules.
+[profile.release]
+codegen-units = 1
