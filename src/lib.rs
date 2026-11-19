@@ -51,8 +51,10 @@
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
 mod bits;
+mod cdef;
 mod cdf;
 mod cdf_tables;
+mod coef;
 mod consts;
 mod decoder;
 mod error;
@@ -60,15 +62,19 @@ mod frame;
 mod grain;
 mod header;
 mod ledger;
+mod lf;
 mod limits;
+mod lr;
 mod obu;
 mod predict;
 mod quant;
 mod recon;
 mod scan;
 mod seq;
+mod superres;
 mod symbol;
 mod tables;
+mod tile;
 mod transform;
 
 use std::sync::atomic::AtomicBool;
