@@ -752,7 +752,7 @@ mod tests {
         };
         for mode in 0..13 {
             for delta in -3..=3 {
-                for log2w in 2..=6 {
+                for log2w in 2usize..=6 {
                     for log2h in 2..=6 {
                         if log2w.abs_diff(log2h) > 2 {
                             continue;

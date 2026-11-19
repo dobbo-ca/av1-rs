@@ -343,7 +343,6 @@ pub(crate) fn apply_film_grain(p: &FilmGrainParams, input: &GrainInput, out: [&m
     };
     let pixel_max = (1i32 << bd) - 1;
     let scaling_shift = u32::from(p.grain_scaling_minus_8) + 8;
-    let mut out = out;
 
     if !input.mono_chrome {
         let (sx, sy) = sub(1);
