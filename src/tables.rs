@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn split_and_mode_tables() {
         assert_eq!(SPLIT_TX_SIZE[TX_64X64], TX_32X32);
-        assert_eq!(SPLIT_TX_SIZE[TX_16X32], TX_8X16);
+        assert_eq!(SPLIT_TX_SIZE[TX_16X32], TX_16X16);
         assert_eq!(MODE_TO_TXFM[0], DCT_DCT);
         assert_eq!(MODE_TO_TXFM[1], ADST_DCT);
         assert_eq!(MODE_TO_TXFM[4], ADST_ADST);
