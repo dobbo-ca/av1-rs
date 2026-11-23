@@ -50,6 +50,7 @@
 )]
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
+mod avif;
 mod bits;
 mod cdef;
 mod cdf;
@@ -80,8 +81,10 @@ mod transform;
 
 use std::sync::atomic::AtomicBool;
 
+pub use avif::{AvifImage, decode_avif};
 pub use decoder::Decoder;
 pub use error::Error;
+pub use isobmff;
 pub use limits::Limits;
 pub use obu::split_temporal_units;
 

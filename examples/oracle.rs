@@ -6,7 +6,8 @@
 //! ```
 //!
 //! Inputs (sorted by name): `.ivf` (each IVF frame is one temporal unit), `.obu`, `.av1` and
-//! `.bin` (low-overhead OBU stream), `.annexb` (Annex B). Other files are skipped. For each
+//! `.bin` (low-overhead OBU stream), `.annexb` (Annex B), `.avif` (see below). Other files are
+//! skipped. For each
 //! `<stem>` the output directory gets:
 //!
 //! - `<stem>.yuv`: every output frame, planes Y, U, V one after the other, visible size only;
@@ -18,13 +19,20 @@
 //!   frames before the error are still written; `inter` is the expected stop of a stream with
 //!   inter frames).
 //!
+//! An `.avif` input goes through `av1::decode_avif`: `<stem>.yuv` is the primary image (grid
+//! assembled and cropped; transforms are not applied), `<stem>.frames` has its one line, and
+//! `<stem>.alpha.yuv` the alpha image when there is one. `--info` does not apply to `.avif`.
+//!
 //! With `--info` the decode is replaced by `av1::probe` and `<stem>.info` has one line per
 //! frame: `type show W H frameW bitdepth layout` (`show` is 1 when the frame is output).
 //!
 //! Exit status: 0 when every file was processed (whatever the decode result), 2 on a usage or
 //! I/O error.
 
-use av1::{Decoder, Error, Format, Frame, Limits, Options, PlaneData, probe, split_temporal_units};
+use av1::{
+    Decoder, Error, Format, Frame, Limits, Options, PlaneData, decode_avif, probe,
+    split_temporal_units,
+};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,6 +53,7 @@ struct Args {
 enum Kind {
     Ivf,
     Obu(Format),
+    Avif,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -87,6 +96,7 @@ fn kind_of(path: &Path) -> Option<Kind> {
         "ivf" => Some(Kind::Ivf),
         "obu" | "av1" | "bin" => Some(Kind::Obu(Format::Section5)),
         "annexb" => Some(Kind::Obu(Format::AnnexB)),
+        "avif" => Some(Kind::Avif),
         _ => None,
     }
 }
@@ -123,16 +133,20 @@ fn layout(mono: bool, ssx: bool, ssy: bool) -> &'static str {
     }
 }
 
+fn append_planes(yuv: &mut Vec<u8>, f: &Frame) {
+    for p in &f.planes {
+        match &p.data {
+            PlaneData::U8(v) => yuv.extend_from_slice(v),
+            PlaneData::U16(v) => yuv.extend(v.iter().flat_map(|s| s.to_le_bytes())),
+        }
+    }
+}
+
 fn write_frames(frames: &[Frame], stem: &Path) -> std::io::Result<()> {
     let mut yuv = Vec::new();
     let mut lines = String::new();
     for f in frames {
-        for p in &f.planes {
-            match &p.data {
-                PlaneData::U8(v) => yuv.extend_from_slice(v),
-                PlaneData::U16(v) => yuv.extend(v.iter().flat_map(|s| s.to_le_bytes())),
-            }
-        }
+        append_planes(&mut yuv, f);
         let l = layout(f.mono_chrome, f.subsampling_x, f.subsampling_y);
         let _ = writeln!(lines, "{} {} {} {}", f.width, f.height, f.bit_depth, l);
     }
@@ -158,9 +172,33 @@ fn run_file(
         return Ok(());
     };
     let stem = out_dir.join(name);
+    if let Kind::Avif = kind {
+        let options = Options {
+            operating_point: args.operating_point,
+            all_layers: args.all_layers,
+            film_grain: args.film_grain,
+            ..Options::default()
+        };
+        return match decode_avif(&data, &options, limits, &AtomicBool::new(false)) {
+            Ok(avif) => {
+                write_frames(std::slice::from_ref(&avif.image), &stem)?;
+                if let Some(alpha) = &avif.alpha {
+                    let mut yuv = Vec::new();
+                    append_planes(&mut yuv, alpha);
+                    fs::write(stem.with_extension("alpha.yuv"), yuv)?;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                write_frames(&[], &stem)?;
+                write_err(&stem, &e)
+            }
+        };
+    }
     let units: Result<(Format, Vec<&[u8]>), Error> = match kind {
         Kind::Ivf => ivf_frames(&data).map(|u| (Format::Section5, u)),
         Kind::Obu(format) => split_temporal_units(&data, format).map(|u| (format, u)),
+        Kind::Avif => return Ok(()),
     };
     let (format, units) = match units {
         Ok(u) => u,
@@ -181,7 +219,7 @@ fn run_file(
                 joined = units.concat();
                 &joined[..]
             }
-            Kind::Obu(_) => &data[..],
+            Kind::Obu(_) | Kind::Avif => &data[..],
         };
         let mut text = String::new();
         let stopped = match probe(stream, format, limits) {

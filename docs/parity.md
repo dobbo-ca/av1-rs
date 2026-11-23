@@ -17,6 +17,9 @@ a corpus stream fails the gate. The gate also compares `--threads 1` with the de
 8-bit as bytes and higher depths as little-endian u16; the dav1d `.yuv` layout), `<stem>.frames`
 (one line per frame: `W H bitdepth layout`) and `<stem>.err` (the error class).
 
+`examples/oracle.rs` also takes `.avif` files (`av1::decode_avif`; the alpha image goes to `<stem>.alpha.yuv`).
+`examples/avifx.rs` is a CI-only extraction tool, not part of the library: `avifx <out-dir> <file.avif>...` writes every AV1 coded item reachable from the primary image (itself, its grid tiles, its alpha item and the alpha's tiles) as `<out-dir>/<stem>.item<id>.obu`, the `av1C` configOBUs followed by the item data, a Section 5 stream that dav1d and aomdec read.
+
 ## Modes
 
 `tests/parity/mode` holds the gate mode. `info` (phase 1, headers only): the frame size and

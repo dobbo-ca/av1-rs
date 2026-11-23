@@ -29,12 +29,14 @@ pub enum Error {
     MetadataLimit,
     /// The cancel flag was set.
     Cancelled,
+    /// The AVIF container is broken or over a limit: the `class()` of the `isobmff` error.
+    Container(&'static str),
 }
 
 impl Error {
     /// A short stable token for the kind of error, for logs and test oracles: `"truncated"`,
     /// `"invalid"`, `"unsupported"`, `"inter"`, `"alloc"`, `"oom"`, `"width"`, `"height"`,
-    /// `"pixels"`, `"metadata"` or `"cancelled"`.
+    /// `"pixels"`, `"metadata"`, `"cancelled"` or `"container"`.
     pub fn class(&self) -> &'static str {
         match self {
             Error::Truncated => "truncated",
@@ -48,6 +50,7 @@ impl Error {
             Error::PixelLimit => "pixels",
             Error::MetadataLimit => "metadata",
             Error::Cancelled => "cancelled",
+            Error::Container(_) => "container",
         }
     }
 }
@@ -66,6 +69,7 @@ impl fmt::Display for Error {
             Error::PixelLimit => f.write_str("frame pixel limit exceeded"),
             Error::MetadataLimit => f.write_str("metadata limit exceeded"),
             Error::Cancelled => f.write_str("cancelled"),
+            Error::Container(class) => write!(f, "container: {class}"),
         }
     }
 }

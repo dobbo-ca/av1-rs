@@ -64,16 +64,19 @@ fsize() {
 
 full() {
   REP=$1 bad=0
-  rm -rf $W; mkdir -p "$REP" $W/in $W/r1 $W/rn $W/dav $W/aom
+  rm -rf $W; mkdir -p "$REP" $W/in $W/r1 $W/rn $W/dav $W/aom $W/avd
   inputs $W/in
+  # AVIF: every coded item (av1C config OBUs + item bytes) becomes a Section 5 stream in the same
+  # directory, so dav1d and aomdec check the AV1 decode of each item (examples/avifx.rs).
+  ls $W/in/*.avif >/dev/null 2>&1 && { av1-avifx $W/in $W/in/*.avif > "$REP/avifx.log" 2>&1 || bad=1; }
   n=$(ls $W/in | wc -l)
   # 240 libaom vectors + 49 dav1d-test-data streams: a mount that did not arrive must fail.
   [ "$n" -ge 285 ] || { echo "corpus has $n streams, want at least 285" >&2; bad=1; }
   flag=; [ "$MODE" = info ] && flag=--info
   av1-oracle $flag --threads 1 $W/in $W/r1 || bad=1
   av1-oracle $flag $W/in $W/rn || bad=1
-  : > $W/d-dav1d; : > $W/d-aom; : > $W/d-md5; : > $W/d-err
-  frames=0 cmpd=0 aomd=0 md5d=0
+  : > $W/d-dav1d; : > $W/d-aom; : > $W/d-md5; : > $W/d-err; : > $W/d-avif
+  frames=0 cmpd=0 aomd=0 md5d=0 avifd=0
   for p in $W/in/*; do
     f=$(basename "$p"); s=$(stem "$f")
     if [ "$MODE" = info ]; then out=$W/r1/$s.info; else out=$W/r1/$s.frames; fi
@@ -88,6 +91,16 @@ full() {
       echo "$f: av1-rs error $(cat $W/r1/$s.err) ($(cat $W/r1/$s.why 2>/dev/null)) after $N frames" >> $W/d-err
     fi
     [ "$N" -gt 0 ] || continue
+    # The whole AVIF image (grid assembled, before irot/imir/clap) against avifdec (libavif with
+    # dav1d); its y4m minus the header and the one FRAME line is the same layout as .yuv.
+    case $f in *.avif)
+      avifdec --jobs 1 "$p" $W/avd/$s.y4m >/dev/null 2>&1 || { echo "$f: avifdec failed" >> $W/d-avif; continue; }
+      hl=$(head -n 1 $W/avd/$s.y4m | wc -c)
+      tail -c +$((hl + 7)) $W/avd/$s.y4m > $W/avd/$s.yuv
+      cmp -s $W/avd/$s.yuv $W/r1/$s.yuv || echo "$f: differs from avifdec: $(mismatch $W/avd/$s.yuv $W/r1/$s.yuv $W/r1/$s.frames)" >> $W/d-avif
+      avifd=$((avifd + 1))
+      continue ;;
+    esac
     frames=$((frames + N))
     if [ "$MODE" = info ]; then
       dav1d -q --threads 1 --limit "$N" -i "$p" -o $W/dav/$s.y4m 2>/dev/null || { echo "$f: dav1d failed" >> $W/d-dav1d; continue; }
@@ -134,12 +147,12 @@ full() {
   {
     echo "## av1-rs parity ($MODE)"
     echo
-    echo "$n streams, $frames frames compared; $cmpd streams vs dav1d, $aomd vs aomdec, $md5d vs the published md5."
+    echo "$n inputs (streams, AVIF files and their extracted items), $frames frames compared; $cmpd streams vs dav1d, $aomd vs aomdec, $md5d vs the published md5, $avifd AVIF files vs avifdec."
     echo
     echo "| gate | result |"
     echo "|---|---|"
   } > "$REP/summary.md"
-  for g in err dav1d aom md5 threads; do
+  for g in err dav1d aom md5 avif threads; do
     l=$(wc -l < $W/d-$g)
     if [ "$l" -eq 0 ]; then echo "| $g | ok |" >> "$REP/summary.md"
     else echo "| $g | FAIL, $l lines |" >> "$REP/summary.md"; bad=1; head -n 300 $W/d-$g > "$REP/$g.diff"; fi

@@ -1,5 +1,6 @@
 # CI image: Rust runs here, on the in-cluster BuildKit, because the ARC runner has no toolchain.
-# av1-rs has no private dependencies, so no stage needs a token. The fuzz crate's dependency
+# The one private dependency, isobmff-rs, is fetched in `toolchain` with the App token (below);
+# every later stage builds offline. The fuzz crate's dependency
 # (libfuzzer-sys from crates.io) is fetched in `toolchain`, before the source is copied.
 FROM rust:1.99.1-bookworm AS toolchain
 # gcc-aarch64-linux-gnu: the linker of `cargo build --target aarch64-unknown-linux-gnu`.
@@ -11,8 +12,14 @@ WORKDIR /src
 COPY tests/fuzz/Cargo.toml tests/fuzz/Cargo.lock tests/fuzz/
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src tests/fuzz/fuzz_targets && touch src/lib.rs \
-    && for t in probe decode; do touch tests/fuzz/fuzz_targets/$t.rs; done \
-    && cargo fetch --locked --manifest-path tests/fuzz/Cargo.toml \
+    && for t in probe decode avif; do touch tests/fuzz/fuzz_targets/$t.rs; done
+# isobmff-rs is a private dobbo-ca port: the dobbo-ca-ci-read App token reaches this one RUN as
+# the BuildKit secret gh_token, and the insteadOf rewrite is removed in the same command.
+RUN --mount=type=secret,id=gh_token \
+    git config --global url."https://x-access-token:$(cat /run/secrets/gh_token)@github.com/".insteadOf "https://github.com/" \
+    && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo fetch --locked \
+    && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo fetch --locked --manifest-path tests/fuzz/Cargo.toml \
+    && git config --global --unset-all url."https://x-access-token:$(cat /run/secrets/gh_token)@github.com/".insteadOf \
     && rm -rf src tests/fuzz/fuzz_targets
 
 FROM toolchain AS src
@@ -55,7 +62,7 @@ RUN --mount=type=cache,id=av1-rs-target-arm64,sharing=locked,target=/src/target 
 # The C oracles (CI only, never linked into the crate): dav1d 1.0.0 and aomdec 3.6.0 from
 # bookworm. Nothing of the crate is copied here, so a crate change does not rebuild it.
 FROM toolchain AS oracles
-RUN apt-get update && apt-get install -y --no-install-recommends dav1d aom-tools \
+RUN apt-get update && apt-get install -y --no-install-recommends dav1d aom-tools libavif-bin \
     && rm -rf /var/lib/apt/lists/*
 ENV CARGO_NET_OFFLINE=true
 
@@ -66,14 +73,14 @@ FROM oracles AS data
 COPY tests/parity/fetch.sh tests/parity/corpus.txt /parity/
 RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked \
     sh /parity/fetch.sh /parity/corpus.txt /data \
-    && (cd /data && find . -type f \( -name '*.ivf' -o -name '*.obu' \) | sort) > /data.list && wc -l /data.list
+    && (cd /data && find . -type f \( -name '*.ivf' -o -name '*.obu' -o -name '*.avif' \) | sort) > /data.list && wc -l /data.list
 
 # The Rust oracle on the x86_64 host, one thread: the tree that the aarch64 oracle must reproduce.
 FROM src AS x86-ref
 COPY --from=data /data.list /data.list
 RUN --mount=type=cache,id=av1-rs-target-parity,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + \
-    && cargo build --locked --release --example oracle && cp target/release/examples/oracle /usr/local/bin/av1-oracle
+    && cargo build --locked --release --example oracle --example avifx && cp target/release/examples/oracle /usr/local/bin/av1-oracle && cp target/release/examples/avifx /usr/local/bin/av1-avifx
 RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
     sh tests/parity/run.sh ref /ref
 
@@ -85,7 +92,7 @@ COPY . .
 COPY --from=data /data.list /data.list
 RUN --mount=type=cache,id=av1-rs-target-parity,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + \
-    && cargo build --locked --release --example oracle && cp target/release/examples/oracle /usr/local/bin/av1-oracle
+    && cargo build --locked --release --example oracle --example avifx && cp target/release/examples/oracle /usr/local/bin/av1-oracle && cp target/release/examples/avifx /usr/local/bin/av1-avifx
 RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
     mkdir -p /report && { sh tests/parity/run.sh full /report; echo $? > /report/status; }
 
@@ -128,7 +135,7 @@ COPY . .
 COPY --from=data /data.list /data.list
 RUN --mount=type=cache,id=av1-rs-target-bench,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + \
-    && cargo build --locked --release --example oracle && cp target/release/examples/oracle /usr/local/bin/av1-oracle
+    && cargo build --locked --release --example oracle --example avifx && cp target/release/examples/oracle /usr/local/bin/av1-oracle && cp target/release/examples/avifx /usr/local/bin/av1-avifx
 ARG BENCH_RUN=0
 RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
     echo "run $BENCH_RUN" && mkdir -p /report && { sh tests/parity/bench.sh /report; echo $? > /report/status; }

@@ -7,6 +7,7 @@ its temporal units. Seeds: the parity corpus (`run.sh seeds`).
 | Target | Entry point |
 |---|---|
 | `probe` | `av1::probe`: OBU framing, sequence, frame and tile group headers |
+| `avif` | `av1::decode_avif`: isobmff-rs item graph, av1C, grid assembly, alpha |
 | `decode` | `Decoder::decode_temporal_unit` on every temporal unit (option bits: Annex B, 2 threads, no film grain) |
 
 `.github/workflows/fuzz.yml`: weekly (Thursday 12:23 UTC) and on dispatch, two jobs at a time,
