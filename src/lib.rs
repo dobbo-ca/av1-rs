@@ -68,6 +68,7 @@ mod lf;
 mod limits;
 mod lr;
 mod obu;
+mod parallel;
 mod predict;
 mod quant;
 mod recon;

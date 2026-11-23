@@ -61,7 +61,8 @@ cdef.rs       CDEF (7.15)
 superres.rs   upscaling (7.16)
 lr.rs         loop restoration (7.17): Wiener, self-guided
 grain.rs      film grain synthesis (7.18.3), applied to a copy at output when enabled
-frame.rs      FrameState: the spec's frame-level arrays; Plane buffers
+frame.rs      FrameState: the spec's frame-level arrays; Plane buffers; tile-sized states
+parallel.rs   run_parallel: the one-scope work scheduler (tiles of a frame, tiles of a grid)
 decoder.rs    the frame decode process (7.x "decode frame wrapup"), reference slots (7.20/7.21),
               show_existing_frame, output (7.18), operating point / layer selection
 ```
@@ -95,7 +96,9 @@ OBUs -> seq header -> frame header -> tile groups -> (per tile) blocks:
      -> reference update (7.20) -> output (7.18) [-> film grain, optional]
 ```
 
-Tiles decode serially (`TileDecoder`, one per tile, in tile group order); the frame CDFs are the
+Tiles decode (`TileDecoder`, one per tile) in tile group order, or in parallel on up to
+`max_threads` threads, each on a tile-sized state merged into the frame state (docs/threading.md;
+an `allow_intrabc` frame is serial); the frame CDFs are the
 defaults for `base_q_idx` (an intra frame has `primary_ref_frame == NONE`), and the tile CDFs
 the exit process returns are dropped: only a later frame that loads them would need the frame
 end update, and no intra frame does. The wrapup (`decoder.rs`) runs `loop_filter_frame` on
@@ -124,7 +127,7 @@ decoder. `decode_avif` parses the file with `isobmff::Limits` taken from ours (`
 `max_threads`, `max_pixels`) and decodes the primary image and its alpha image the same way. A
 coded `av01` item is one Section 5 temporal unit, the `av1C` configOBUs followed by the item
 data, decoded by a fresh `Decoder`; the last output frame is the image (`Options::operating_point`
-picks the layer of a layered item). A grid decodes its tiles one after another and pastes each
+picks the layer of a layered item). A grid decodes its tiles on up to `max_threads` threads and pastes each
 into the output at `col * tile_w`, `row * tile_h` (chroma positions scaled by the subsampling),
 clipped to the grid width and height; the tiles must agree on size, bit depth and subsampling,
 and the output cannot be larger than `columns * tile_w` x `rows * tile_h`. An identity image is

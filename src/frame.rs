@@ -3,7 +3,7 @@
 //! allocated and released when they drop.
 #![allow(dead_code)]
 
-use crate::consts::RESTORE_NONE;
+use crate::consts::{MI_SIZE, RESTORE_NONE};
 use crate::error::Error;
 use crate::header::FrameHeader;
 use crate::ledger::{Ledger, zeroed};
@@ -81,15 +81,50 @@ impl Drop for Charged {
     }
 }
 
+/// Copies the `rows` x `cols` top-left rectangle of `src` (rows `src_stride` apart) into `dst`
+/// (rows `dst_stride` apart) at (`row0`, `col0`). Does nothing for an array that is not
+/// allocated (empty `src`), and skips a row that does not fit.
+fn copy_rect<T: Copy>(
+    dst: &mut [T],
+    dst_stride: usize,
+    (row0, col0): (usize, usize),
+    src: &[T],
+    src_stride: usize,
+    (rows, cols): (usize, usize),
+) {
+    if src.is_empty() {
+        return;
+    }
+    for r in 0..rows {
+        let s = src.get(r * src_stride..r * src_stride + cols);
+        let d_start = (row0 + r) * dst_stride + col0;
+        let d = dst.get_mut(d_start..d_start + cols);
+        if let (Some(s), Some(d)) = (s, d) {
+            d.copy_from_slice(s);
+        }
+    }
+}
+
 /// `count_units_in_frame( unitSize, frameSize )` of spec 5.11.57.
 fn count_units_in_frame(unit_size: usize, frame_size: usize) -> usize {
     ((frame_size + (unit_size >> 1)) / unit_size).max(1)
 }
 
+/// `lr_type` value of a unit a tile has not written (a tile state made by
+/// [`FrameState::new_tile`] starts with every unit unset).
+const LR_UNSET: u8 = 255;
+
 /// The spec's frame-level decode state for the frame being decoded: the dimensions, the sample
 /// planes and the per-mode-info arrays of spec 5.11 (named as in docs/design.md).
 ///
 /// The per-mode-info arrays hold `mi_rows * mi_cols` entries, index `row * mi_cols + col`.
+///
+/// A state made by [`FrameState::new_tile`] is the same structure for one tile, in the tile's
+/// own coordinates: `mi_rows`, `mi_cols`, the arrays and the planes are the tile's, its origin
+/// in the frame is `mi_row0` / `mi_col0`, and the tile decode runs on it unchanged (tile row 0,
+/// tile column 0 of its own `mi_row_starts` / `mi_col_starts`). Tiles start on superblock
+/// boundaries and read nothing outside themselves, so this is the same decode as on the frame
+/// state; [`FrameState::merge_tile`] copies the result into the frame state.
 #[derive(Debug)]
 pub(crate) struct FrameState {
     /// `MiSizes`.
@@ -159,6 +194,10 @@ pub(crate) struct FrameState {
     pub upscaled_width: usize,
     pub mi_rows: usize,
     pub mi_cols: usize,
+    /// Position of this state's top-left mode info unit in the frame: 0 for the frame state, the
+    /// tile origin for a [`FrameState::new_tile`] state.
+    pub mi_row0: usize,
+    pub mi_col0: usize,
     /// `MiRowStarts` and `MiColStarts`, one entry more than there are tile rows or columns.
     pub mi_row_starts: Vec<usize>,
     pub mi_col_starts: Vec<usize>,
@@ -188,11 +227,179 @@ impl FrameState {
         seq: &SequenceHeader,
         ledger: &Arc<Ledger>,
     ) -> Result<FrameState, Error> {
+        let luma_w = (h.frame_width as usize + 127) & !127;
+        let luma_h = (h.frame_height as usize + 127) & !127;
+        Self::build(
+            h,
+            seq,
+            ledger,
+            (h.mi_rows as usize, h.mi_cols as usize),
+            (luma_w, luma_h),
+        )
+    }
+
+    /// The state for tile (`tile_row`, `tile_col`) of the frame with header `h`: arrays and
+    /// planes of the tile's size only (planes rounded up to 128, so every block write of a
+    /// superblock is in bounds), the loop restoration arrays of the whole frame (a few bytes per
+    /// unit) with every unit unset. Dimensions were checked against `Limits` by the caller.
+    ///
+    /// # Errors
+    /// `Invalid` for a tile outside the frame, `AllocLimit` or `OutOfMemory` from the buffers.
+    pub(crate) fn new_tile(
+        h: &FrameHeader,
+        seq: &SequenceHeader,
+        ledger: &Arc<Ledger>,
+        tile_row: usize,
+        tile_col: usize,
+    ) -> Result<FrameState, Error> {
+        let at = |v: &[u32], i: usize| {
+            v.get(i)
+                .map(|&x| x as usize)
+                .ok_or(Error::Invalid("tile index out of range"))
+        };
+        let starts = &h.tile_info;
+        let (row0, row1) = (
+            at(&starts.mi_row_starts, tile_row)?,
+            at(&starts.mi_row_starts, tile_row + 1)?,
+        );
+        let (col0, col1) = (
+            at(&starts.mi_col_starts, tile_col)?,
+            at(&starts.mi_col_starts, tile_col + 1)?,
+        );
+        if row0 > row1 || col0 > col1 || row1 > h.mi_rows as usize || col1 > h.mi_cols as usize {
+            return Err(Error::Invalid("tile outside the frame"));
+        }
+        let (mi_rows, mi_cols) = (row1 - row0, col1 - col0);
+        let luma_w = (mi_cols * MI_SIZE + 127) & !127;
+        let luma_h = (mi_rows * MI_SIZE + 127) & !127;
+        let mut s = Self::build(h, seq, ledger, (mi_rows, mi_cols), (luma_w, luma_h))?;
+        s.mi_row0 = row0;
+        s.mi_col0 = col0;
+        s.mi_row_starts = vec![0, mi_rows];
+        s.mi_col_starts = vec![0, mi_cols];
+        for t in &mut s.lr_type {
+            t.fill(LR_UNSET);
+        }
+        Ok(s)
+    }
+
+    /// Copies what the decode of the tile state `t` wrote into this frame state: the tile's
+    /// rectangle of every mode-info array, the loop restoration units it set, and the samples of
+    /// the superblocks it covers (`sb_size` is 64 or 128). Tiles are disjoint, so the order of
+    /// the merges does not matter.
+    pub(crate) fn merge_tile(&mut self, t: &FrameState, sb_size: usize) {
+        let (r0, c0, rows, cols) = (t.mi_row0, t.mi_col0, t.mi_rows, t.mi_cols);
+        let (dst_stride, src_stride) = (self.mi_cols, t.mi_cols);
+        let (at, dims) = ((r0, c0), (rows, cols));
+        let (ds, ss) = (dst_stride, src_stride);
+        copy_rect(&mut self.mi_sizes, ds, at, &t.mi_sizes, ss, dims);
+        copy_rect(&mut self.skips, ds, at, &t.skips, ss, dims);
+        copy_rect(&mut self.is_inters, ds, at, &t.is_inters, ss, dims);
+        copy_rect(&mut self.segment_ids, ds, at, &t.segment_ids, ss, dims);
+        copy_rect(&mut self.y_modes, ds, at, &t.y_modes, ss, dims);
+        copy_rect(&mut self.uv_modes, ds, at, &t.uv_modes, ss, dims);
+        copy_rect(&mut self.ref_frames0, ds, at, &t.ref_frames0, ss, dims);
+        copy_rect(&mut self.tx_sizes, ds, at, &t.tx_sizes, ss, dims);
+        copy_rect(
+            &mut self.inter_tx_sizes,
+            ds,
+            at,
+            &t.inter_tx_sizes,
+            ss,
+            dims,
+        );
+        copy_rect(&mut self.mvs, ds, at, &t.mvs, ss, dims);
+        copy_rect(&mut self.tx_types, ds, at, &t.tx_types, ss, dims);
+        copy_rect(&mut self.delta_lfs, ds, at, &t.delta_lfs, ss, dims);
+        copy_rect(&mut self.cdef_idx, ds, at, &t.cdef_idx, ss, dims);
+        for i in 0..2 {
+            copy_rect(
+                &mut self.palette_sizes[i],
+                ds,
+                at,
+                &t.palette_sizes[i],
+                ss,
+                dims,
+            );
+            copy_rect(
+                &mut self.palette_colors[i],
+                ds,
+                at,
+                &t.palette_colors[i],
+                ss,
+                dims,
+            );
+        }
+        for plane in 0..self.num_planes {
+            // `LoopfilterTxSizes` of a chroma plane is stored at the subsampled position.
+            let (sx, sy) = if plane == 0 {
+                (0, 0)
+            } else {
+                (self.subsampling_x, self.subsampling_y)
+            };
+            copy_rect(
+                &mut self.loopfilter_tx_sizes[plane],
+                dst_stride,
+                (r0 >> sy, c0 >> sx),
+                &t.loopfilter_tx_sizes[plane],
+                src_stride,
+                ((rows + sy) >> sy, (cols + sx) >> sx),
+            );
+            // The samples of the tile's superblocks (blocks never cross a superblock, so this
+            // is all the tile can have written), clipped to the frame plane.
+            let (Some(dst), Some(src)) = (self.curr_frame.get_mut(plane), t.curr_frame.get(plane))
+            else {
+                continue;
+            };
+            let (ox, oy) = ((c0 * MI_SIZE) >> sx, (r0 * MI_SIZE) >> sy);
+            let w = ((cols * MI_SIZE).next_multiple_of(sb_size) >> sx)
+                .min(src.width)
+                .min(dst.width.saturating_sub(ox));
+            let hgt = ((rows * MI_SIZE).next_multiple_of(sb_size) >> sy)
+                .min(src.height)
+                .min(dst.height.saturating_sub(oy));
+            for y in 0..hgt {
+                let s = src.px.get(y * src.stride..y * src.stride + w);
+                let d = dst
+                    .px
+                    .get_mut((oy + y) * dst.stride + ox..(oy + y) * dst.stride + ox + w);
+                if let (Some(s), Some(d)) = (s, d) {
+                    d.copy_from_slice(s);
+                }
+            }
+        }
+        for plane in 0..3 {
+            for (idx, &ty) in t.lr_type[plane].iter().enumerate() {
+                if ty == LR_UNSET {
+                    continue;
+                }
+                if let (Some(a), Some(b), Some(c), Some(d)) = (
+                    self.lr_type[plane].get_mut(idx),
+                    self.lr_wiener[plane].get_mut(idx),
+                    self.lr_sgr_set[plane].get_mut(idx),
+                    self.lr_sgr_xqd[plane].get_mut(idx),
+                ) {
+                    *a = ty;
+                    *b = t.lr_wiener[plane].get(idx).copied().unwrap_or_default();
+                    *c = t.lr_sgr_set[plane].get(idx).copied().unwrap_or_default();
+                    *d = t.lr_sgr_xqd[plane].get(idx).copied().unwrap_or_default();
+                }
+            }
+        }
+    }
+
+    /// Allocates a state of `mi_rows` x `mi_cols` mode info units and luma planes of
+    /// `luma_w` x `luma_h` samples (chroma shifted down) for the frame of header `h`.
+    fn build(
+        h: &FrameHeader,
+        seq: &SequenceHeader,
+        ledger: &Arc<Ledger>,
+        (mi_rows, mi_cols): (usize, usize),
+        (luma_w, luma_h): (usize, usize),
+    ) -> Result<FrameState, Error> {
         let num_planes = usize::from(seq.num_planes);
         let subsampling_x = usize::from(seq.subsampling_x);
         let subsampling_y = usize::from(seq.subsampling_y);
-        let luma_w = (h.frame_width as usize + 127) & !127;
-        let luma_h = (h.frame_height as usize + 127) & !127;
         let mut curr_frame = Vec::with_capacity(num_planes);
         for plane in 0..num_planes {
             let (pw, ph) = if plane == 0 {
@@ -202,8 +409,6 @@ impl FrameState {
             };
             curr_frame.push(Plane::new(pw, ph, ledger)?);
         }
-        let mi_rows = h.mi_rows as usize;
-        let mi_cols = h.mi_cols as usize;
         let n = mi_rows.checked_mul(mi_cols).ok_or(Error::AllocLimit)?;
         let mut charged = Charged::new(ledger);
         let planes_n = |plane: usize| if plane < num_planes { n } else { 0 };
@@ -300,8 +505,10 @@ impl FrameState {
             frame_width: h.frame_width as usize,
             frame_height: h.frame_height as usize,
             upscaled_width: h.upscaled_width as usize,
-            mi_rows: h.mi_rows as usize,
-            mi_cols: h.mi_cols as usize,
+            mi_rows,
+            mi_cols,
+            mi_row0: 0,
+            mi_col0: 0,
             mi_row_starts: h
                 .tile_info
                 .mi_row_starts
