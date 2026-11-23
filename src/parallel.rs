@@ -47,7 +47,7 @@ pub(crate) fn run_parallel<T: Send>(
     std::thread::scope(|s| {
         for _ in 1..workers {
             // A thread that cannot start is not an error: the others take its items.
-            let _ = std::thread::Builder::new().spawn_scoped(s, &work);
+            let _ = std::thread::Builder::new().spawn_scoped(s, work);
         }
         work();
     });

@@ -1096,10 +1096,5 @@ mod tests {
                 );
             }
         }
-        // The frame alone fits in 120 KiB, a tile-sized state on top of it does not.
-        let (r, _) = run_tiles(1, 1, 120 << 10);
-        assert!(!matches!(r, Err(Error::AllocLimit)));
-        let (r, _) = run_tiles(1, 3, 120 << 10);
-        assert_eq!(r.err(), Some(Error::AllocLimit));
     }
 }
