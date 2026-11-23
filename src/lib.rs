@@ -41,7 +41,11 @@
 //! [`decode`] and [`Decoder::decode_temporal_unit`] take an `&AtomicBool`. Setting it from
 //! another thread makes the decode return [`Error::Cancelled`] at the next OBU or tile.
 
-#![forbid(unsafe_code)]
+#![deny(
+    unsafe_code,
+    unsafe_op_in_unsafe_fn,
+    clippy::undocumented_unsafe_blocks
+)]
 #![cfg_attr(
     not(test),
     deny(
@@ -78,6 +82,12 @@ mod quant;
 mod recon;
 mod scan;
 mod seq;
+// The SIMD tiers; `unsafe` is allowed only in its load/store helpers and in the dispatch fns.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
+#[allow(dead_code)] // the kernel families join one per PR
+mod simd;
 mod superres;
 mod symbol;
 mod tables;

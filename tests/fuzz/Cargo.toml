@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-av1 = { path = "../.." }
+av1 = { path = "../..", features = ["fuzzing"] }
 
 # Not part of the root package: only this crate may depend on libfuzzer-sys.
 [workspace]

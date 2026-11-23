@@ -6,7 +6,8 @@ Information only: there is no speed bar. `.github/workflows/bench.yml` runs
 with one thread and once with the default threads (`nproc`). av1-rs runs twice: the default
 release build (runtime SIMD dispatch) and the release-binary build of docs/conventions.md
 (`-C target-cpu=x86-64-v4 -C target-feature=+false-deps-tzcnt,+false-deps-bls`, fat LTO,
-`panic=abort`). The figure is the wall time of the whole class, best of 5. No decoder writes
+`panic=abort`), and a third table times the default build with each SIMD tier forced
+(`AV1_SIMD`). The figure is the wall time of the whole class, best of 5. No decoder writes
 samples (`--null`, `-o /dev/null`).
 
 ## Classes

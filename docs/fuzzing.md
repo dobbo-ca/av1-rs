@@ -10,6 +10,11 @@ its temporal units. Seeds: the parity corpus (`run.sh seeds`).
 | `avif` | `av1::decode_avif`: isobmff-rs item graph, av1C, grid assembly, alpha |
 | `decode` | `Decoder::decode_temporal_unit` on every temporal unit (option bits: Annex B, 2 threads, no film grain) |
 
+Each SIMD kernel family adds a cross-tier target `simd_<family>`: it calls
+`av1::fuzzing::<family>` (feature `fuzzing`, enabled only by the fuzz crate), which builds kernel
+inputs from the bytes, runs every available tier and asserts that each output equals the scalar
+output.
+
 `.github/workflows/fuzz.yml`: weekly (Thursday 12:23 UTC) and on dispatch, two jobs at a time,
 `-rss_limit_mb=2048 -malloc_limit_mb=512`, crashers uploaded as artifacts.
 
