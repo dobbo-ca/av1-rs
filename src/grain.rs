@@ -1,8 +1,10 @@
 //! Film grain synthesis (spec 7.18.3), applied to a copy of the output frame.
 //!
-//! The code follows the spec text one to one; the noise stripes are built one at a time and
-//! blended into a full noise image per plane, which gives the same result as the spec's
-//! whole-frame `noiseStripe` arrays.
+//! The code follows the spec text one to one. Each band of 32 luma rows builds its noise stripe
+//! (and, with overlap, the stripe above it) and blends it into its rows of the image, which
+//! gives the same result as the spec's whole-frame `noiseStripe` and `noiseImage` arrays.
+//! The blend of a row is the `grain` SIMD kernel family (`simd::grain`); the scalar row fns
+//! here are its oracle.
 #![allow(dead_code)]
 
 use crate::consts::MC_IDENTITY;
@@ -10,7 +12,11 @@ use crate::decoder::check_cancel;
 use crate::error::Error;
 use crate::header::FilmGrainParams;
 use crate::ledger::Ledger;
+use crate::parallel::run_parallel;
+use crate::simd::Simd;
+use crate::simd::grain::{blend_chroma, blend_luma};
 use crate::tables::GAUSSIAN_SEQUENCE;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
 /// Frame data the film grain process reads (spec 7.18.3 inputs).
@@ -211,149 +217,95 @@ fn scale_lut(lut: &[i32; 256], bit_depth: u32, index: i32) -> i32 {
     }
 }
 
-/// Spec 7.18.3.
-///
-/// Writes the frame with grain into `out` (same layout as the input planes, strides as in
-/// `input`); every sample of the `width` x `height` area of each present plane is written.
-/// Planes 1 and 2 are ignored for monochrome. The caller guarantees `bit_depth` in 8..=12 and
-/// that every plane slice (input and output) covers its area as described on [`GrainInput`].
-///
-/// Note on dav1d: the spec's order is followed (chroma noise uses the luma samples before luma
-/// noise is added; odd sizes read the last luma column twice through `lumaNextX`). No place was
-/// found where it differs from dav1d's `filmgrain_tmpl.c` output.
-///
-/// The noise images and stripe buffers are charged to `ledger` for the duration of the call and
-/// allocated fallibly.
-pub(crate) fn apply_film_grain(
-    p: &FilmGrainParams,
-    input: &GrainInput,
-    out: [&mut [u16]; 3],
-    ledger: &Ledger,
-    cancel: &AtomicBool,
-) -> Result<(), Error> {
-    let bd = input.bit_depth;
-    let grain_center = 128i32 << (bd - 8);
-    let grain_min = -grain_center;
-    let grain_max = (256i32 << (bd - 8)) - 1 - grain_center;
-    let num_planes = if input.mono_chrome { 1 } else { 3 };
-    let (w, h) = (input.width, input.height);
-    let seed = u32::from(p.grain_seed);
+/// `scale_lut( plane, v )` for every `v` below `1 << bit_depth` (`bit_depth` in 8..=12), for
+/// the SIMD kernels, which look the scale up by sample value.
+pub(crate) fn scale_table(lut: &[i32; 256], bit_depth: u32) -> [i32; 4096] {
+    let mut t = [0i32; 4096];
+    for (v, s) in t.iter_mut().enumerate().take(1 << bit_depth) {
+        *s = scale_lut(lut, bit_depth, v as i32);
+    }
+    t
+}
 
-    let grain = generate_grain(p, input, grain_min, grain_max);
-    let luts = [scaling_lut(p, 0), scaling_lut(p, 1), scaling_lut(p, 2)];
+/// The parameters of the noise blend of one plane (spec 7.18.3.5, last step).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Blend {
+    /// 8..=12.
+    pub bit_depth: u32,
+    /// `(1 << bit_depth) - 1`.
+    pub pixel_max: i32,
+    /// `ScalingShift`, 8..=11.
+    pub scaling_shift: u32,
+    /// The clip range of the result (`minValue`, `maxLuma` or `maxChroma`).
+    pub min: i32,
+    pub max: i32,
+    /// Chroma only: the horizontal subsampling (0 or 1), `chroma_scaling_from_luma`,
+    /// `luma_mult - 128`, `mult - 128` and `(offset - 256) << (bit_depth - 8)`.
+    pub sx: usize,
+    pub cfl: bool,
+    pub luma_mult: i32,
+    pub mult: i32,
+    pub offset: i32,
+}
 
-    // Spec 7.18.3.5, first two steps: noise stripes blended into one noise image per plane.
-    let sub = |plane: usize| -> (usize, usize) {
-        if plane == 0 {
-            (0, 0)
-        } else {
-            (
-                usize::from(input.subsampling_x),
-                usize::from(input.subsampling_y),
+/// Spec 7.18.3.5, last step, one luma row: `out[x]` from `src[x]` and `noise[x]`. The scalar
+/// oracle of `simd::grain::blend_luma`; the slices have the same length, samples are below
+/// `1 << bit_depth`.
+pub(crate) fn blend_luma_row(
+    out: &mut [u16],
+    src: &[u16],
+    noise: &[i32],
+    lut: &[i32; 256],
+    b: &Blend,
+) {
+    for ((o, &s), &g) in out.iter_mut().zip(src).zip(noise) {
+        let orig = i32::from(s);
+        let n = round2(scale_lut(lut, b.bit_depth, orig) * g, b.scaling_shift);
+        *o = (orig + n).clamp(b.min, b.max) as u16;
+    }
+}
+
+/// Spec 7.18.3.5, last step, one chroma row: `out[x]` from `src[x]`, `noise[x]` and the luma
+/// row `luma` (the whole row of the frame width, or its tail from `x0 << sx` for an `out`
+/// starting at `x0`). The scalar oracle of `simd::grain::blend_chroma`; `out`, `src` and
+/// `noise` have the same length, at most `(luma.len() + sx) >> sx`.
+pub(crate) fn blend_chroma_row(
+    out: &mut [u16],
+    src: &[u16],
+    luma: &[u16],
+    noise: &[i32],
+    lut: &[i32; 256],
+    b: &Blend,
+) {
+    let last = luma.len().saturating_sub(1);
+    for x in 0..out.len() {
+        let orig = i32::from(src[x]);
+        let luma_x = x << b.sx;
+        let average_luma = if b.sx == 1 {
+            round2(
+                i32::from(luma[luma_x]) + i32::from(luma[(luma_x + 1).min(last)]),
+                1,
             )
-        }
-    };
-    let dims = |plane: usize| -> (usize, usize) {
-        let (sx, sy) = sub(plane);
-        ((w + sx) >> sx, (h + sy) >> sy)
-    };
-    let sw = (w + 1).div_ceil(2).div_ceil(16) * 32 + 34;
-    // Charge the noise images and two stripe buffers (`cur`, `prev`) per plane up front.
-    let mut samples = 2 * 34 * sw * num_planes;
-    for plane in 0..num_planes {
-        let (pw, ph) = dims(plane);
-        samples += pw * ph;
+        } else {
+            i32::from(luma[luma_x])
+        };
+        let merged = if b.cfl {
+            average_luma
+        } else {
+            let combined = average_luma * b.luma_mult + orig * b.mult;
+            ((combined >> 6) + b.offset).clamp(0, b.pixel_max)
+        };
+        let n = round2(
+            scale_lut(lut, b.bit_depth, merged) * noise[x],
+            b.scaling_shift,
+        );
+        out[x] = (orig + n).clamp(b.min, b.max) as u16;
     }
-    let _held = ledger.charge(
-        samples
-            .checked_mul(size_of::<i32>())
-            .ok_or(Error::AllocLimit)?,
-    )?;
-    let mut noise: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    for plane in 0..num_planes {
-        let (pw, ph) = dims(plane);
-        noise[plane] = zeros(pw * ph)?;
-    }
-    let mut prev: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    for (luma_num, _) in (0..h.div_ceil(2)).step_by(16).enumerate() {
-        check_cancel(cancel)?;
-        let mut cur: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-        for plane in 0..num_planes {
-            cur[plane] = zeros(34 * sw)?;
-        }
-        let mut rng = Rng(seed);
-        rng.0 ^= (((luma_num * 37 + 178) & 255) << 8) as u32;
-        rng.0 ^= ((luma_num * 173 + 105) & 255) as u32;
-        for x in (0..w.div_ceil(2)).step_by(16) {
-            let rand = rng.get(8) as usize;
-            let (offset_x, offset_y) = (rand >> 4, rand & 15);
-            for plane in 0..num_planes {
-                let (psx, psy) = sub(plane);
-                let plane_off_x = if psx == 1 {
-                    6 + offset_x
-                } else {
-                    9 + offset_x * 2
-                };
-                let plane_off_y = if psy == 1 {
-                    6 + offset_y
-                } else {
-                    9 + offset_y * 2
-                };
-                let gs = grain.stride[plane];
-                for i in 0..34 >> psy {
-                    for j in 0..34 >> psx {
-                        let mut g = grain.data[plane][(plane_off_y + i) * gs + plane_off_x + j];
-                        let col = if psx == 0 { x * 2 + j } else { x + j };
-                        let slot = i * sw + col;
-                        if p.overlap_flag && x > 0 {
-                            let old = cur[plane][slot];
-                            if psx == 0 && j < 2 {
-                                g = if j == 0 {
-                                    old * 27 + g * 17
-                                } else {
-                                    old * 17 + g * 27
-                                };
-                                g = round2(g, 5).clamp(grain_min, grain_max);
-                            } else if psx == 1 && j == 0 {
-                                g = round2(old * 23 + g * 22, 5).clamp(grain_min, grain_max);
-                            }
-                        }
-                        cur[plane][slot] = g;
-                    }
-                }
-            }
-        }
-        for plane in 0..num_planes {
-            let (_, psy) = sub(plane);
-            let (pw, ph) = dims(plane);
-            let first = luma_num << (5 - psy);
-            let last = ph.min((luma_num + 1) << (5 - psy));
-            for y in first..last {
-                let i = y - first;
-                for x in 0..pw {
-                    let mut g = cur[plane][i * sw + x];
-                    if p.overlap_flag && luma_num > 0 {
-                        if psy == 0 && i < 2 {
-                            let old = prev[plane][(i + 32) * sw + x];
-                            g = if i == 0 {
-                                old * 27 + g * 17
-                            } else {
-                                old * 17 + g * 27
-                            };
-                            g = round2(g, 5).clamp(grain_min, grain_max);
-                        } else if psy == 1 && i < 1 {
-                            let old = prev[plane][(i + 16) * sw + x];
-                            g = round2(old * 23 + g * 22, 5).clamp(grain_min, grain_max);
-                        }
-                    }
-                    noise[plane][y * pw + x] = g;
-                }
-            }
-        }
-        prev = cur;
-    }
+}
 
-    // Spec 7.18.3.5, last step: blend the noise with the image.
+/// The blend parameters of the three planes and whether each plane gets noise.
+fn blend_params(p: &FilmGrainParams, input: &GrainInput) -> ([Blend; 3], [bool; 3]) {
+    let bd = input.bit_depth;
     let (min_value, max_luma, max_chroma) = if p.clip_to_restricted_range {
         let max_luma = 235i32 << (bd - 8);
         let max_chroma = if input.matrix_coefficients == MC_IDENTITY {
@@ -366,65 +318,261 @@ pub(crate) fn apply_film_grain(
         let m = (256i32 << (bd - 8)) - 1;
         (0, m, m)
     };
-    let pixel_max = (1i32 << bd) - 1;
-    let scaling_shift = u32::from(p.grain_scaling_minus_8) + 8;
+    let luma = Blend {
+        bit_depth: bd,
+        pixel_max: (1i32 << bd) - 1,
+        scaling_shift: u32::from(p.grain_scaling_minus_8) + 8,
+        min: min_value,
+        max: max_luma,
+        sx: 0,
+        cfl: false,
+        luma_mult: 0,
+        mult: 0,
+        offset: 0,
+    };
+    let chroma = |luma_mult: u8, mult: u8, offset: u16| Blend {
+        max: max_chroma,
+        sx: usize::from(input.subsampling_x),
+        cfl: p.chroma_scaling_from_luma,
+        luma_mult: i32::from(luma_mult) - 128,
+        mult: i32::from(mult) - 128,
+        offset: (i32::from(offset) - 256) << (bd - 8),
+        ..luma
+    };
+    (
+        [
+            luma,
+            chroma(p.cb_luma_mult, p.cb_mult, p.cb_offset),
+            chroma(p.cr_luma_mult, p.cr_mult, p.cr_offset),
+        ],
+        [
+            p.num_y_points > 0,
+            p.num_cb_points > 0 || p.chroma_scaling_from_luma,
+            p.num_cr_points > 0 || p.chroma_scaling_from_luma,
+        ],
+    )
+}
 
-    if !input.mono_chrome {
-        let (sx, sy) = sub(1);
-        let (cw, ch) = dims(1);
-        let params = [
-            (p.num_cb_points, p.cb_luma_mult, p.cb_mult, p.cb_offset),
-            (p.num_cr_points, p.cr_luma_mult, p.cr_mult, p.cr_offset),
-        ];
-        for (k, &(num_points, luma_mult, mult, offset)) in params.iter().enumerate() {
-            let plane = k + 1;
-            let stride = input.strides[plane];
-            let apply = num_points > 0 || p.chroma_scaling_from_luma;
-            for y in 0..ch {
-                for x in 0..cw {
-                    let orig = i32::from(input.planes[plane][y * stride + x]);
-                    let mut value = orig;
-                    if apply {
-                        let luma_x = x << sx;
-                        let luma_y = y << sy;
-                        let luma_next_x = (luma_x + 1).min(w - 1);
-                        let row = &input.planes[0][luma_y * input.strides[0]..];
-                        let average_luma = if sx == 1 {
-                            round2(i32::from(row[luma_x]) + i32::from(row[luma_next_x]), 1)
-                        } else {
-                            i32::from(row[luma_x])
-                        };
-                        let merged = if p.chroma_scaling_from_luma {
-                            average_luma
-                        } else {
-                            let combined = average_luma * (i32::from(luma_mult) - 128)
-                                + orig * (i32::from(mult) - 128);
-                            ((combined >> 6) + ((i32::from(offset) - 256) << (bd - 8)))
-                                .clamp(0, pixel_max)
-                        };
-                        let n = noise[plane][y * cw + x];
-                        let n = round2(scale_lut(&luts[plane], bd, merged) * n, scaling_shift);
-                        value = (orig + n).clamp(min_value, max_chroma);
+/// Spec 7.18.3.5, first step: the noise stripe of luma block row `luma_num` for each plane
+/// below `num_planes`, into `stripe` (34 rows of `sw` samples per plane, plane subsampling
+/// `subs`). The generator is seeded per stripe, so stripes are independent of each other.
+fn build_stripe(
+    luma_num: usize,
+    p: &FilmGrainParams,
+    grain: &Grain,
+    subs: [(usize, usize); 3],
+    num_planes: usize,
+    w: usize,
+    sw: usize,
+    grain_min: i32,
+    grain_max: i32,
+    stripe: &mut [Vec<i32>; 3],
+) {
+    let mut rng = Rng(u32::from(p.grain_seed));
+    rng.0 ^= (((luma_num * 37 + 178) & 255) << 8) as u32;
+    rng.0 ^= ((luma_num * 173 + 105) & 255) as u32;
+    for x in (0..w.div_ceil(2)).step_by(16) {
+        let rand = rng.get(8) as usize;
+        let (offset_x, offset_y) = (rand >> 4, rand & 15);
+        for plane in 0..num_planes {
+            let (psx, psy) = subs[plane];
+            let plane_off_x = if psx == 1 {
+                6 + offset_x
+            } else {
+                9 + offset_x * 2
+            };
+            let plane_off_y = if psy == 1 {
+                6 + offset_y
+            } else {
+                9 + offset_y * 2
+            };
+            let gs = grain.stride[plane];
+            for i in 0..34 >> psy {
+                for j in 0..34 >> psx {
+                    let mut g = grain.data[plane][(plane_off_y + i) * gs + plane_off_x + j];
+                    let col = if psx == 0 { x * 2 + j } else { x + j };
+                    let slot = i * sw + col;
+                    if p.overlap_flag && x > 0 {
+                        let old = stripe[plane][slot];
+                        if psx == 0 && j < 2 {
+                            g = if j == 0 {
+                                old * 27 + g * 17
+                            } else {
+                                old * 17 + g * 27
+                            };
+                            g = round2(g, 5).clamp(grain_min, grain_max);
+                        } else if psx == 1 && j == 0 {
+                            g = round2(old * 23 + g * 22, 5).clamp(grain_min, grain_max);
+                        }
                     }
-                    out[plane][y * stride + x] = value as u16;
+                    stripe[plane][slot] = g;
                 }
             }
         }
     }
-    for y in 0..h {
-        for x in 0..w {
-            let orig = i32::from(input.planes[0][y * input.strides[0] + x]);
-            let mut value = orig;
-            if p.num_y_points > 0 {
-                let n = round2(
-                    scale_lut(&luts[0], bd, orig) * noise[0][y * w + x],
-                    scaling_shift,
-                );
-                value = (orig + n).clamp(min_value, max_luma);
-            }
-            out[0][y * input.strides[0] + x] = value as u16;
+}
+
+/// Spec 7.18.3.
+///
+/// Writes the frame with grain into `out` (same layout as the input planes, strides as in
+/// `input`); every sample of the `width` x `height` area of each present plane is written.
+/// Planes 1 and 2 are ignored for monochrome. The caller guarantees `bit_depth` in 8..=12 and
+/// samples below `1 << bit_depth`; a plane slice (input or output) that does not cover its
+/// area as described on [`GrainInput`] is `Error::Invalid`.
+///
+/// Note on dav1d: the spec's order is followed (chroma noise uses the luma samples before luma
+/// noise is added; odd sizes read the last luma column twice through `lumaNextX`). No place was
+/// found where it differs from dav1d's `filmgrain_tmpl.c` output.
+///
+/// The frame is done in bands of 32 luma rows (one noise stripe each) on up to `max_threads`
+/// threads (`parallel::run_parallel`, one scope). A band builds its own stripe and, with
+/// overlap, the stripe above it (each stripe seeds its own generator), so the bands are
+/// independent and the output is the same for every thread count. The stripe buffers of a band
+/// are charged to `ledger` while the band runs and allocated fallibly; `cancel` is checked
+/// before each band. `simd` picks the blend kernels.
+pub(crate) fn apply_film_grain(
+    p: &FilmGrainParams,
+    input: &GrainInput,
+    out: [&mut [u16]; 3],
+    ledger: &Ledger,
+    cancel: &AtomicBool,
+    max_threads: usize,
+    simd: Simd,
+) -> Result<(), Error> {
+    let bd = input.bit_depth;
+    let grain_center = 128i32 << (bd - 8);
+    let grain_min = -grain_center;
+    let grain_max = (256i32 << (bd - 8)) - 1 - grain_center;
+    let num_planes = if input.mono_chrome { 1 } else { 3 };
+    let (w, h) = (input.width, input.height);
+    if w == 0 || h == 0 {
+        return Ok(());
+    }
+    let cs = (
+        usize::from(input.subsampling_x),
+        usize::from(input.subsampling_y),
+    );
+    let subs = [(0, 0), cs, cs];
+    let dims = |plane: usize| -> (usize, usize) {
+        let (sx, sy) = subs[plane];
+        ((w + sx) >> sx, (h + sy) >> sy)
+    };
+    // Every row read or written below lies inside these sizes.
+    for plane in 0..num_planes {
+        let (pw, ph) = dims(plane);
+        let stride = input.strides[plane];
+        let need = (ph - 1)
+            .checked_mul(stride)
+            .and_then(|n| n.checked_add(pw))
+            .ok_or(Error::Invalid("film grain plane size"))?;
+        if stride < pw || input.planes[plane].len() < need || out[plane].len() < need {
+            return Err(Error::Invalid("film grain plane size"));
         }
     }
+
+    let grain = generate_grain(p, input, grain_min, grain_max);
+    let luts = [scaling_lut(p, 0), scaling_lut(p, 1), scaling_lut(p, 2)];
+    let tables = luts.each_ref().map(|lut| scale_table(lut, bd));
+    let (blends, applies) = blend_params(p, input);
+
+    let sw = (w + 1).div_ceil(2).div_ceil(16) * 32 + 34;
+    let bands = h.div_ceil(32);
+    // Band `b` of a plane is its rows from `b << (5 - sy)`: one chunk of the output per band.
+    let [o0, o1, o2] = out;
+    let rows = |plane: usize| (input.strides[plane] << (5 - subs[plane].1)).max(1);
+    let mut chunks = [
+        o0.chunks_mut(rows(0)),
+        o1.chunks_mut(rows(1)),
+        o2.chunks_mut(rows(2)),
+    ];
+    let outs: Vec<Mutex<[&mut [u16]; 3]>> = (0..bands)
+        .map(|_| Mutex::new(chunks.each_mut().map(|c| c.next().unwrap_or_default())))
+        .collect();
+
+    run_parallel(bands, max_threads, |b| {
+        check_cancel(cancel)?;
+        let stripes = if p.overlap_flag && b > 0 { 2 } else { 1 };
+        let _held = ledger.charge(
+            ((stripes * 34 * num_planes + 1) * sw)
+                .checked_mul(size_of::<i32>())
+                .ok_or(Error::AllocLimit)?,
+        )?;
+        let mut cur: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut prev: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for plane in 0..num_planes {
+            cur[plane] = zeros(34 * sw)?;
+            if stripes == 2 {
+                prev[plane] = zeros(34 * sw)?;
+            }
+        }
+        let mut row = zeros(sw)?;
+        build_stripe(
+            b, p, &grain, subs, num_planes, w, sw, grain_min, grain_max, &mut cur,
+        );
+        if stripes == 2 {
+            build_stripe(
+                b - 1,
+                p,
+                &grain,
+                subs,
+                num_planes,
+                w,
+                sw,
+                grain_min,
+                grain_max,
+                &mut prev,
+            );
+        }
+        let mut dst_band = outs[b].lock().unwrap_or_else(|e| e.into_inner());
+        for plane in 0..num_planes {
+            let (_, psy) = subs[plane];
+            let (pw, ph) = dims(plane);
+            let stride = input.strides[plane];
+            let first = b << (5 - psy);
+            let last = ph.min((b + 1) << (5 - psy));
+            for y in first..last {
+                let i = y - first;
+                // Spec 7.18.3.5, second step: the top rows blend with the stripe above.
+                let noise: &[i32] = if stripes == 2 && i < 2 >> psy {
+                    let (wo, wn) = if psy == 1 {
+                        (23, 22)
+                    } else if i == 0 {
+                        (27, 17)
+                    } else {
+                        (17, 27)
+                    };
+                    let old = &prev[plane][(i + (32 >> psy)) * sw..][..pw];
+                    let new = &cur[plane][i * sw..][..pw];
+                    for ((r, &o), &g) in row.iter_mut().zip(old).zip(new) {
+                        *r = round2(o * wo + g * wn, 5).clamp(grain_min, grain_max);
+                    }
+                    &row[..pw]
+                } else {
+                    &cur[plane][i * sw..][..pw]
+                };
+                let src = &input.planes[plane][y * stride..][..pw];
+                let dst = &mut dst_band[plane][i * stride..][..pw];
+                if !applies[plane] {
+                    dst.copy_from_slice(src);
+                } else if plane == 0 {
+                    blend_luma(simd, dst, src, noise, &luts[0], &tables[0], &blends[0]);
+                } else {
+                    let luma = &input.planes[0][(y << psy) * input.strides[0]..][..w];
+                    blend_chroma(
+                        simd,
+                        dst,
+                        src,
+                        luma,
+                        noise,
+                        &luts[plane],
+                        &tables[plane],
+                        &blends[plane],
+                    );
+                }
+            }
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -505,22 +653,241 @@ mod tests {
         let ledger = Ledger::default();
         ledger.reset(1 << 20, 0).unwrap();
         let go = AtomicBool::new(false);
-        apply_film_grain(&p, &input, [&mut oy, &mut ou, &mut ov], &ledger, &go).unwrap();
+        apply_film_grain(
+            &p,
+            &input,
+            [&mut oy, &mut ou, &mut ov],
+            &ledger,
+            &go,
+            1,
+            Simd::scalar(),
+        )
+        .unwrap();
         let tiny = Ledger::default();
         tiny.reset(crate::ledger::SMALL, 0).unwrap();
         let (mut ty, mut tu, mut tv) = (oy.clone(), ou.clone(), ov.clone());
         assert_eq!(
-            apply_film_grain(&p, &input, [&mut ty, &mut tu, &mut tv], &tiny, &go),
+            apply_film_grain(
+                &p,
+                &input,
+                [&mut ty, &mut tu, &mut tv],
+                &tiny,
+                &go,
+                1,
+                Simd::scalar()
+            ),
             Err(Error::AllocLimit)
         );
         // A set cancel flag stops the grain before it writes anything.
         let stop = AtomicBool::new(true);
         assert_eq!(
-            apply_film_grain(&p, &input, [&mut ty, &mut tu, &mut tv], &ledger, &stop),
+            apply_film_grain(
+                &p,
+                &input,
+                [&mut ty, &mut tu, &mut tv],
+                &ledger,
+                &stop,
+                1,
+                Simd::scalar()
+            ),
             Err(Error::Cancelled)
         );
         assert_eq!(oy, y);
         assert_eq!(ou, u);
         assert_eq!(ov, v);
+    }
+
+    /// The film grain as it was before the bands: whole noise images built stripe after stripe,
+    /// then the scalar blend over every row.
+    fn reference(p: &FilmGrainParams, input: &GrainInput) -> [Vec<u16>; 3] {
+        let bd = input.bit_depth;
+        let grain_min = -(128i32 << (bd - 8));
+        let grain_max = (128i32 << (bd - 8)) - 1;
+        let num_planes = if input.mono_chrome { 1 } else { 3 };
+        let (w, h) = (input.width, input.height);
+        let cs = (
+            usize::from(input.subsampling_x),
+            usize::from(input.subsampling_y),
+        );
+        let subs = [(0, 0), cs, cs];
+        let dims = |plane: usize| {
+            let (sx, sy) = subs[plane];
+            ((w + sx) >> sx, (h + sy) >> sy)
+        };
+        let grain = generate_grain(p, input, grain_min, grain_max);
+        let sw = (w + 1).div_ceil(2).div_ceil(16) * 32 + 34;
+        let mut noise: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for plane in 0..num_planes {
+            let (pw, ph) = dims(plane);
+            noise[plane] = vec![0; pw * ph];
+        }
+        let mut prev: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for luma_num in 0..h.div_ceil(32) {
+            let mut cur: [Vec<i32>; 3] = [vec![0; 34 * sw], vec![0; 34 * sw], vec![0; 34 * sw]];
+            build_stripe(
+                luma_num, p, &grain, subs, num_planes, w, sw, grain_min, grain_max, &mut cur,
+            );
+            for plane in 0..num_planes {
+                let (_, psy) = subs[plane];
+                let (pw, ph) = dims(plane);
+                let first = luma_num << (5 - psy);
+                let last = ph.min((luma_num + 1) << (5 - psy));
+                for y in first..last {
+                    let i = y - first;
+                    for x in 0..pw {
+                        let mut g = cur[plane][i * sw + x];
+                        if p.overlap_flag && luma_num > 0 {
+                            if psy == 0 && i < 2 {
+                                let old = prev[plane][(i + 32) * sw + x];
+                                g = if i == 0 {
+                                    old * 27 + g * 17
+                                } else {
+                                    old * 17 + g * 27
+                                };
+                                g = round2(g, 5).clamp(grain_min, grain_max);
+                            } else if psy == 1 && i < 1 {
+                                let old = prev[plane][(i + 16) * sw + x];
+                                g = round2(old * 23 + g * 22, 5).clamp(grain_min, grain_max);
+                            }
+                        }
+                        noise[plane][y * pw + x] = g;
+                    }
+                }
+            }
+            prev = cur;
+        }
+        let luts = [scaling_lut(p, 0), scaling_lut(p, 1), scaling_lut(p, 2)];
+        let (blends, applies) = blend_params(p, input);
+        let mut out: [Vec<u16>; 3] = [
+            input.planes[0].to_vec(),
+            input.planes[1].to_vec(),
+            input.planes[2].to_vec(),
+        ];
+        for plane in 0..num_planes {
+            let (psy, (pw, ph)) = (subs[plane].1, dims(plane));
+            let stride = input.strides[plane];
+            for y in 0..ph {
+                let src = &input.planes[plane][y * stride..][..pw];
+                let dst = &mut out[plane][y * stride..][..pw];
+                let n = &noise[plane][y * pw..][..pw];
+                if !applies[plane] {
+                    dst.copy_from_slice(src);
+                } else if plane == 0 {
+                    blend_luma_row(dst, src, n, &luts[0], &blends[0]);
+                } else {
+                    let luma = &input.planes[0][(y << psy) * input.strides[0]..][..w];
+                    blend_chroma_row(dst, src, luma, n, &luts[plane], &blends[plane]);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_tier_and_thread_count_matches_the_reference() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(n)) as u32
+        };
+        // (bit depth, subsampling x, y, mono, width, height): odd sizes, 1 to 3 bands.
+        let cases = [
+            (8, true, true, false, 37usize, 67usize),
+            (10, true, true, false, 64, 70),
+            (12, true, false, false, 33, 65),
+            (8, false, false, false, 40, 33),
+            (10, false, false, true, 35, 66),
+            (12, true, true, false, 1, 1),
+            (8, true, true, false, 2, 64),
+        ];
+        for (k, &(bd, sx, sy, mono, w, h)) in cases.iter().enumerate() {
+            let mut p = FilmGrainParams {
+                apply_grain: true,
+                grain_seed: rnd(65536) as u16,
+                num_y_points: (k % 3) as u8 + 1,
+                chroma_scaling_from_luma: k % 4 == 1,
+                num_cb_points: (k % 2) as u8 + 1,
+                num_cr_points: (k % 3) as u8,
+                grain_scaling_minus_8: rnd(4) as u8,
+                ar_coeff_lag: rnd(4) as u8,
+                ar_coeff_shift_minus_6: rnd(4) as u8,
+                grain_scale_shift: rnd(2) as u8,
+                cb_mult: rnd(256) as u8,
+                cb_luma_mult: rnd(256) as u8,
+                cb_offset: rnd(512) as u16,
+                cr_mult: rnd(256) as u8,
+                cr_luma_mult: rnd(256) as u8,
+                cr_offset: rnd(512) as u16,
+                overlap_flag: k % 3 != 2,
+                clip_to_restricted_range: k % 2 == 1,
+                ..Default::default()
+            };
+            for i in 0..16 {
+                // Increasing point values; the scalings are anything.
+                p.point_y_value[i] = (i * 16 + rnd(16) as usize) as u8;
+                p.point_cb_value[i] = (i * 16 + rnd(16) as usize) as u8;
+                p.point_cr_value[i] = (i * 16 + rnd(16) as usize) as u8;
+                p.point_y_scaling[i] = rnd(256) as u8;
+                p.point_cb_scaling[i] = rnd(256) as u8;
+                p.point_cr_scaling[i] = rnd(256) as u8;
+            }
+            for c in p.ar_coeffs_y_plus_128.iter_mut() {
+                *c = 96 + rnd(64) as u8;
+            }
+            for c in p
+                .ar_coeffs_cb_plus_128
+                .iter_mut()
+                .chain(p.ar_coeffs_cr_plus_128.iter_mut())
+            {
+                *c = 96 + rnd(64) as u8;
+            }
+            let (cw, ch) = if mono {
+                (0, 0)
+            } else {
+                (
+                    (w + usize::from(sx)) >> usize::from(sx),
+                    (h + usize::from(sy)) >> usize::from(sy),
+                )
+            };
+            // Strides wider than the planes; samples anywhere in range, extremes included.
+            let (ys, cs) = (w + 3, cw + 5);
+            let max = (1u32 << bd) - 1;
+            let mut plane = |stride: usize, rows: usize| -> Vec<u16> {
+                (0..stride * rows)
+                    .map(|_| match rnd(8) {
+                        0 => 0,
+                        1 => max as u16,
+                        _ => rnd(max + 1) as u16,
+                    })
+                    .collect()
+            };
+            let (y, u, v) = (plane(ys, h), plane(cs, ch), plane(cs, ch));
+            let input = GrainInput {
+                bit_depth: bd,
+                mono_chrome: mono,
+                subsampling_x: sx,
+                subsampling_y: sy,
+                matrix_coefficients: if k % 4 == 3 { MC_IDENTITY } else { 1 },
+                width: w,
+                height: h,
+                planes: [&y, &u, &v],
+                strides: [ys, cs, cs],
+            };
+            let want = reference(&p, &input);
+            let ledger = Ledger::default();
+            ledger.reset(1 << 24, 0).unwrap();
+            let go = AtomicBool::new(false);
+            for simd in crate::simd::available() {
+                for threads in [1, 2, 3] {
+                    let mut got = [y.clone(), u.clone(), v.clone()];
+                    let [g0, g1, g2] = &mut got;
+                    apply_film_grain(&p, &input, [g0, g1, g2], &ledger, &go, threads, simd)
+                        .unwrap();
+                    assert_eq!(got, want, "case {k} {simd:?} threads {threads}");
+                }
+            }
+        }
     }
 }

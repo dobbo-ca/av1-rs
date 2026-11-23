@@ -175,6 +175,16 @@ pub(crate) fn store64_u16(a: &mut [u16; 4], v: __m128i) {
     unsafe { _mm_storel_epi64(a.as_mut_ptr().cast(), v) }
 }
 
+/// `table[idx & 4095]` for each of the 8 lanes of `idx` (a gather from a 4096-entry table).
+#[inline]
+#[target_feature(enable = "avx2")]
+pub(crate) fn gather256_i32(table: &[i32; 4096], idx: __m256i) -> __m256i {
+    let idx = _mm256_and_si256(idx, _mm256_set1_epi32(4095));
+    // SAFETY: every lane index was just masked to 0..4096, so each 4-byte read (scale 4) is
+    // inside `table` (the array type); the target feature is enabled on this fn.
+    unsafe { _mm256_i32gather_epi32::<4>(table.as_ptr(), idx) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
