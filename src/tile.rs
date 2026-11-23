@@ -506,9 +506,9 @@ impl<'a> TileDecoder<'a> {
             }
         }
         let TileDecoder { sd, cdf, .. } = self;
-        if !sd.exit() {
-            return Err(Error::Invalid("tile padding or trailing bits"));
-        }
+        // The padding check of the exit process is a conformance requirement on the encoder;
+        // dav1d and libaom do not enforce it, so a stream they decode is not refused here.
+        let _padding_ok = sd.exit();
         Ok(cdf)
     }
 
