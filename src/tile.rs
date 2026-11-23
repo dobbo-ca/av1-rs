@@ -805,13 +805,9 @@ impl<'a> TileDecoder<'a> {
         let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size];
         let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size];
         let (ssx, ssy) = (self.fs.subsampling_x, self.fs.subsampling_y);
-        self.has_chroma = if bh4 == 1 && ssy != 0 && (r & 1) == 0 {
-            false
-        } else if bw4 == 1 && ssx != 0 && (c & 1) == 0 {
-            false
-        } else {
-            self.fs.num_planes > 1
-        };
+        let no_chroma =
+            (bh4 == 1 && ssy != 0 && (r & 1) == 0) || (bw4 == 1 && ssx != 0 && (c & 1) == 0);
+        self.has_chroma = !no_chroma && self.fs.num_planes > 1;
         self.avail_u = self.is_inside(r as isize - 1, c as isize);
         self.avail_l = self.is_inside(r as isize, c as isize - 1);
         self.avail_u_chroma = self.avail_u;
@@ -1059,9 +1055,7 @@ impl<'a> TileDecoder<'a> {
         let prev_l = if self.avail_l { seg(r, c - 1) } else { -1 };
         let pred = if prev_u == -1 {
             if prev_l == -1 { 0 } else { prev_l }
-        } else if prev_l == -1 {
-            prev_u
-        } else if prev_ul == prev_u {
+        } else if prev_l == -1 || prev_ul == prev_u {
             prev_u
         } else {
             prev_l
