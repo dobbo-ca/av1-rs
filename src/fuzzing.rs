@@ -245,3 +245,18 @@ pub fn ipred(data: &[u8]) {
         _ => check::filter_edge(&mut next),
     }
 }
+
+/// Kernel family `itx`: one block (size, type, bit depth, coded region, coefficients within
+/// the dequantizer clamp, samples) built from the bytes, every tier against scalar. Bytes past
+/// the end read as zero.
+pub fn itx(data: &[u8]) {
+    let mut bytes = data.iter().copied();
+    let mut next = move || {
+        let mut v = 0u32;
+        for _ in 0..4 {
+            v = (v << 8) | u32::from(bytes.next().unwrap_or(0));
+        }
+        v
+    };
+    crate::simd::itx::check_random(&mut next);
+}

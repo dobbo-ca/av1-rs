@@ -34,6 +34,7 @@ use crate::consts::*;
 use crate::error::Error;
 use crate::frame::{Charged, FrameState};
 use crate::header::FrameHeader;
+use crate::recon::ItxScratch;
 use crate::seq::SequenceHeader;
 use crate::symbol::SymbolDecoder;
 use crate::tables::{
@@ -172,6 +173,9 @@ pub(crate) struct TileDecoder<'a> {
     /// `BlockDecoded[ plane ][ y ][ x ]` stored at `[ y + 1 ][ x + 1 ]`; use
     /// [`TileDecoder::block_decoded_at`] and [`TileDecoder::set_block_decoded`].
     pub block_decoded: [[[bool; BD]; BD]; 3],
+
+    /// The reconstruction buffers (fixed size, reused by every transform block).
+    pub itx: Box<ItxScratch>,
 
     _charged: Charged,
 }
@@ -470,6 +474,7 @@ impl<'a> TileDecoder<'a> {
             left_dc_context,
             left_seg_pred_context,
             block_decoded: [[[false; BD]; BD]; 3],
+            itx: ItxScratch::new(),
             _charged: charged,
         })
     }

@@ -2,10 +2,11 @@
 
 #![allow(dead_code)]
 
-use crate::consts::IDTX;
+use crate::consts::{DCT_DCT, IDTX};
 use crate::quant::{QM_OFFSET, QUANTIZER_MATRIX};
+use crate::simd::{self, Simd};
 use crate::tables::{TX_HEIGHT_LOG2, TX_WIDTH_LOG2};
-use crate::transform::{FLIP_LR, FLIP_UD, inverse_transform_2d};
+use crate::transform::{DQ_LEN, DQ_STRIDE, MID_LEN, Plan, dc_only};
 
 /// Everything `reconstruct` needs besides the pixels and the coefficients.
 #[derive(Clone, Copy, Debug)]
@@ -29,12 +30,35 @@ pub(crate) struct ReconParams {
     pub bit_depth: u32,
 }
 
+/// Working buffers of [`reconstruct`], kept by the tile decoder so that no block zeroes them
+/// (every entry is written before it is read).
+pub(crate) struct ItxScratch {
+    /// `Dequant` of the coded region, layout `transform::DQ_STRIDE`.
+    dq: [i32; DQ_LEN],
+    /// The row pass output.
+    mid: [i32; MID_LEN],
+}
+
+impl ItxScratch {
+    pub(crate) fn new() -> Box<Self> {
+        Box::new(Self {
+            dq: [0; DQ_LEN],
+            mid: [0; MID_LEN],
+        })
+    }
+}
+
 /// Spec 7.12.3 reconstruct process.
 ///
 /// `quant` is the spec's `Quant[]` with `Quant[ i * tw + j ]`, `tw = Min( 32, w )`,
 /// `th = Min( 32, h )`. The block at `(x, y)` of size `w x h` is updated in `px` (row stride
 /// `stride`). The caller guarantees `tx_sz < 19`, `tx_type < 16`, `plane < 3`, `qm_level <= 15`,
-/// `quant.len() >= tw * th` and that the block lies inside `px`; if not, nothing is written.
+/// `bit_depth` in 8..=12, `quant.len() >= tw * th` and that the block lies inside `px`; if not,
+/// nothing is written.
+///
+/// Only the coded region (up to the last nonzero row and column of `quant`) is dequantized and
+/// row-transformed. A DCT_DCT block with only the DC coefficient takes the flat fast path
+/// ([`dc_only`]), which gives exactly the full transform's samples.
 pub(crate) fn reconstruct(
     px: &mut [u16],
     stride: usize,
@@ -42,6 +66,8 @@ pub(crate) fn reconstruct(
     y: usize,
     p: &ReconParams,
     quant: &[i32],
+    scratch: &mut ItxScratch,
+    simd: Simd,
 ) {
     let (Some(&log2_w), Some(&log2_h)) = (TX_WIDTH_LOG2.get(p.tx_sz), TX_HEIGHT_LOG2.get(p.tx_sz))
     else {
@@ -57,6 +83,19 @@ pub(crate) fn reconstruct(
         return;
     }
 
+    // The coded region. An all-zero block still runs as a 1x1 region, so the samples are clipped
+    // exactly as the full transform clips them.
+    let (mut rows, mut cols) = (1, 1);
+    for i in 0..th {
+        if let Some(j) = quant[i * tw..i * tw + tw].iter().rposition(|&v| v != 0) {
+            rows = i + 1;
+            cols = cols.max(j + 1);
+        }
+    }
+    let Some(plan) = Plan::new(p.tx_sz, p.tx_type, p.lossless, p.bit_depth, rows, cols) else {
+        return;
+    };
+
     let dq_denom: i64 = match p.tx_sz {
         3 | 9 | 10 | 17 | 18 => 2, // TX_32X32, TX_16X32, TX_32X16, TX_16X64, TX_64X16
         4 | 11 | 12 => 4,          // TX_64X64, TX_32X64, TX_64X32
@@ -67,9 +106,8 @@ pub(crate) fn reconstruct(
     let qm_offset = QM_OFFSET[p.tx_sz];
     let lim = 1i64 << (7 + p.bit_depth);
 
-    let mut dequant = [0i32; 64 * 64];
-    for i in 0..th {
-        for j in 0..tw {
+    for i in 0..rows {
+        for j in 0..cols {
             let q = if i == 0 && j == 0 { p.dc_q } else { p.ac_q };
             let q2 = if use_qm {
                 (i64::from(q) * i64::from(qm[qm_offset + i * tw + j]) + 16) >> 5
@@ -79,30 +117,22 @@ pub(crate) fn reconstruct(
             let dq = i64::from(quant[i * tw + j]) * q2;
             let mag = (dq.unsigned_abs() & 0xFF_FFFF) as i64 / dq_denom;
             let dq2 = if dq < 0 { -mag } else { mag };
-            dequant[i * w + j] = dq2.clamp(-lim, lim - 1) as i32;
+            scratch.dq[j * DQ_STRIDE + i] = dq2.clamp(-lim, lim - 1) as i32;
         }
     }
 
-    let mut residual = [0i32; 64 * 64];
-    inverse_transform_2d(
-        &dequant,
-        &mut residual,
-        p.tx_sz,
-        p.tx_type,
-        p.lossless,
-        p.bit_depth,
-    );
-
-    let (flip_ud, flip_lr) = (FLIP_UD[p.tx_type], FLIP_LR[p.tx_type]);
-    let max = (1i32 << p.bit_depth) - 1;
-    for i in 0..h {
-        let yy = if flip_ud { h - i - 1 } else { i };
-        let row = &mut px[(y + yy) * stride + x..(y + yy) * stride + x + w];
-        for j in 0..w {
-            let xx = if flip_lr { w - j - 1 } else { j };
-            row[xx] = (i32::from(row[xx]) + residual[i * w + j]).clamp(0, max) as u16;
+    let blk = &mut px[y * stride + x..];
+    if rows == 1 && cols == 1 && p.tx_type == DCT_DCT && !p.lossless {
+        let d = dc_only(&plan, scratch.dq[0]);
+        let max = (1i32 << p.bit_depth) - 1;
+        for i in 0..h {
+            for s in &mut blk[i * stride..i * stride + w] {
+                *s = (i32::from(*s) + d).clamp(0, max) as u16;
+            }
         }
+        return;
     }
+    simd::itx::inverse_transform_add(simd, &plan, &scratch.dq, &mut scratch.mid, blk, stride);
 }
 
 #[cfg(test)]
@@ -125,7 +155,16 @@ mod tests {
     #[test]
     fn zero_coefficients_leave_pixels_unchanged() {
         let mut px = vec![100u16; 16 * 16];
-        reconstruct(&mut px, 16, 4, 4, &params(1, 0), &[0; 64]);
+        reconstruct(
+            &mut px,
+            16,
+            4,
+            4,
+            &params(1, 0),
+            &[0; 64],
+            &mut ItxScratch::new(),
+            simd::best(),
+        );
         assert!(px.iter().all(|&v| v == 100));
     }
 
@@ -136,7 +175,16 @@ mod tests {
         let mut px = vec![100u16; 8 * 8];
         let mut quant = [0i32; 16];
         quant[0] = 125;
-        reconstruct(&mut px, 8, 2, 2, &params(0, 0), &quant);
+        reconstruct(
+            &mut px,
+            8,
+            2,
+            2,
+            &params(0, 0),
+            &quant,
+            &mut ItxScratch::new(),
+            simd::best(),
+        );
         for r in 0..8 {
             for c in 0..8 {
                 let inside = (2..6).contains(&r) && (2..6).contains(&c);
@@ -150,10 +198,28 @@ mod tests {
         let mut px = vec![250u16; 16];
         let mut quant = [0i32; 16];
         quant[0] = 1000;
-        reconstruct(&mut px, 4, 0, 0, &params(0, 0), &quant);
+        reconstruct(
+            &mut px,
+            4,
+            0,
+            0,
+            &params(0, 0),
+            &quant,
+            &mut ItxScratch::new(),
+            simd::best(),
+        );
         assert!(px.iter().all(|&v| v == 255));
         quant[0] = -1000;
-        reconstruct(&mut px, 4, 0, 0, &params(0, 0), &quant);
+        reconstruct(
+            &mut px,
+            4,
+            0,
+            0,
+            &params(0, 0),
+            &quant,
+            &mut ItxScratch::new(),
+            simd::best(),
+        );
         assert!(px.iter().all(|&v| v < 255));
     }
 
@@ -166,7 +232,16 @@ mod tests {
         quant[9] = 5;
         let run = |tx_type| {
             let mut px = vec![128u16; 64];
-            reconstruct(&mut px, 8, 0, 0, &params(1, tx_type), &quant);
+            reconstruct(
+                &mut px,
+                8,
+                0,
+                0,
+                &params(1, tx_type),
+                &quant,
+                &mut ItxScratch::new(),
+                simd::best(),
+            );
             px
         };
         // ADST_DCT (1) vs FLIPADST_DCT (4): mirrored vertically.
@@ -193,7 +268,16 @@ mod tests {
         let mut quant = [0i32; 32 * 32];
         quant[0] = 1000;
         let mut px = vec![100u16; 32 * 32];
-        reconstruct(&mut px, 32, 0, 0, &params(3, 0), &quant);
+        reconstruct(
+            &mut px,
+            32,
+            0,
+            0,
+            &params(3, 0),
+            &quant,
+            &mut ItxScratch::new(),
+            simd::best(),
+        );
         assert!(px.iter().all(|&v| v == 131));
     }
 
@@ -205,9 +289,27 @@ mod tests {
         let mut a = vec![100u16; 16];
         let mut b = vec![100u16; 16];
         let mut p = params(0, 0);
-        reconstruct(&mut a, 4, 0, 0, &p, &quant);
+        reconstruct(
+            &mut a,
+            4,
+            0,
+            0,
+            &p,
+            &quant,
+            &mut ItxScratch::new(),
+            simd::best(),
+        );
         p.qm_level = 0;
-        reconstruct(&mut b, 4, 0, 0, &p, &quant);
+        reconstruct(
+            &mut b,
+            4,
+            0,
+            0,
+            &p,
+            &quant,
+            &mut ItxScratch::new(),
+            simd::best(),
+        );
         assert_eq!(a, b);
     }
 }

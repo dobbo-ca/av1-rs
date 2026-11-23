@@ -22,6 +22,8 @@ pub(crate) mod lr;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86;
 
+pub(crate) mod itx;
+
 use std::sync::OnceLock;
 
 /// A SIMD tier, lowest first.

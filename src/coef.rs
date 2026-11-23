@@ -714,7 +714,16 @@ impl TileDecoder<'_> {
             bit_depth,
         };
         let fp = &mut self.fs.curr_frame[plane];
-        reconstruct(&mut fp.px, fp.stride, start_x, start_y, &p, quant);
+        reconstruct(
+            &mut fp.px,
+            fp.stride,
+            start_x,
+            start_y,
+            &p,
+            quant,
+            &mut self.itx,
+            crate::simd::best(),
+        );
     }
 
     /// `get_filter_type( plane )` (spec 7.11.2.8).

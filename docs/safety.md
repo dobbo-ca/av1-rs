@@ -56,6 +56,7 @@ Production code passes `simd::best()`; tests loop over `simd::available()`.
 | `lr` | `lr::wiener_filter`, `lr::self_guided_filter` | `wiener`, `self_guided`: loop restoration of one block of at most 64 x 64 samples inside one stripe, from the source window that `lr::source_window` gathers (stripe edge rules unchanged): the Wiener filter and the self guided filter (box sums r = 1 and r = 2, the a/b computation, the weighted combination). The arithmetic is in 32-bit lanes; the module doc gives the bounds that make it exact. Blocks narrower than one vector use the oracle | AVX2 (8 x i32), NEON (4 x i32); AVX-512 runs the AVX2 kernel |
 | `cdef` | `cdef::cdef_direction`, `cdef::cdef_filter` | `direction` (7.15.2, one 8x8 luma block), `filter` (7.15.3, one 8x8, 4x4, 4x8 or 8x4 block), 8/10/12-bit. The filter copies the block and a 2-sample border into a padded 16-bit block with the sentinel `0x8000` for unavailable taps (dav1d's design, see NOTICE), so the kernel has no per-tap check. The dispatch takes the oracle for a block whose premises do not hold (block not fully inside `MiRows` x `MiCols`, a sample of 4096 or more, strengths above 255, a plane too short); decoded frames always meet them (`MiRows` and `MiCols` are even, samples fit the bit depth) | AVX2 (16 lanes), NEON (8 lanes); AVX-512 runs the AVX2 kernels |
 | `ipred` | `src/predict.rs` | Paeth; Smooth, Smooth_V, Smooth_H; directional zone 1 without upsampling; intra edge filter; palette (rows of 8); CFL alpha step | AVX2 (8 x i32), NEON (4 x i32); AVX-512 runs the AVX2 kernels |
+| `itx` | `transform::inverse_transform_add` | 2D inverse transform + add/clip into the samples: DCT 4..64, ADST 4/8/16, identity 4..32, flips, rect scaling, row/column shifts and clamps | AVX2 (8 lanes), AVX-512 (16 lanes, blocks of at least 16x16; smaller blocks use AVX2), NEON (4 lanes) |
 
 Tiers not written:
 
@@ -85,6 +86,14 @@ Tiers not written:
 - AVX-512: not written; the Avx512 tier runs the AVX2 kernels. Rows are 4 to 64 samples and
   most intra blocks are 4 to 16 wide, so 16-lane vectors would only help the widest blocks.
 - Code written for this crate; dav1d's ipred was not ported.
+
+`itx` notes: all tiers use `i32` lanes for 8, 10 and 12 bit. At 8 and 10 bit every rotation sum
+fits `i32` (the dequantizer clamp bounds the inputs); at 12 bit each rotation splits its inputs
+into `hi * 4096 + lo` so the wrapped result equals the scalar `i64` result (`src/simd/itx/mod.rs`
+has the bounds). The lossless Walsh-Hadamard transform stays scalar on every tier (lossless 4x4
+blocks only). The DC-only DCT_DCT fast path (`transform::dc_only`, used by `recon`) is scalar
+and tier-independent. The 1D transforms of all tiers come from one macro (`itx_kernels!`) over
+per-tier vector primitives, written from the spec code (not ported from dav1d).
 
 ## Kernels kept and dropped
 
