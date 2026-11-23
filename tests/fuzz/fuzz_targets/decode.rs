@@ -35,9 +35,20 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     };
+    // Work budget: tile data past the end reads as zeros, so a few bytes can decode a whole
+    // frame. Stop after 64M output luma samples so one input stays under the timeout.
+    let mut budget: u64 = 64 << 20;
     for u in units {
-        if dec.decode_temporal_unit(u, format, &cancel).is_err() {
-            break;
+        match dec.decode_temporal_unit(u, format, &cancel) {
+            Ok(frames) => {
+                for f in &frames {
+                    budget = budget.saturating_sub(u64::from(f.width) * u64::from(f.height));
+                }
+                if budget == 0 {
+                    break;
+                }
+            }
+            Err(_) => break,
         }
     }
 });

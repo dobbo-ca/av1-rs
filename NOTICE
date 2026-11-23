@@ -10,5 +10,4 @@ at aomedia.org/license.
 Ported code
 -----------
 
-(To be filled in by the integrator: every part ported from dav1d or rav1d, with the source file
-and licence line "BSD-2-Clause, Copyright (c) VideoLAN and dav1d authors".)
+None: dav1d and rav1d were used only as design guides (see docs/dependencies.md).

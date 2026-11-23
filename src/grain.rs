@@ -6,7 +6,9 @@
 #![allow(dead_code)]
 
 use crate::consts::MC_IDENTITY;
+use crate::error::Error;
 use crate::header::FilmGrainParams;
+use crate::ledger::Ledger;
 use crate::tables::GAUSSIAN_SEQUENCE;
 
 /// Frame data the film grain process reads (spec 7.18.3 inputs).
@@ -217,7 +219,15 @@ fn scale_lut(lut: &[i32; 256], bit_depth: u32, index: i32) -> i32 {
 /// Note on dav1d: the spec's order is followed (chroma noise uses the luma samples before luma
 /// noise is added; odd sizes read the last luma column twice through `lumaNextX`). No place was
 /// found where it differs from dav1d's `filmgrain_tmpl.c` output.
-pub(crate) fn apply_film_grain(p: &FilmGrainParams, input: &GrainInput, out: [&mut [u16]; 3]) {
+///
+/// The noise images and stripe buffers are charged to `ledger` for the duration of the call and
+/// allocated fallibly.
+pub(crate) fn apply_film_grain(
+    p: &FilmGrainParams,
+    input: &GrainInput,
+    out: [&mut [u16]; 3],
+    ledger: &Ledger,
+) -> Result<(), Error> {
     let bd = input.bit_depth;
     let grain_center = 128i32 << (bd - 8);
     let grain_min = -grain_center;
@@ -245,16 +255,27 @@ pub(crate) fn apply_film_grain(p: &FilmGrainParams, input: &GrainInput, out: [&m
         ((w + sx) >> sx, (h + sy) >> sy)
     };
     let sw = (w + 1).div_ceil(2).div_ceil(16) * 32 + 34;
+    // Charge the noise images and two stripe buffers (`cur`, `prev`) per plane up front.
+    let mut samples = 2 * 34 * sw * num_planes;
+    for plane in 0..num_planes {
+        let (pw, ph) = dims(plane);
+        samples += pw * ph;
+    }
+    let _held = ledger.charge(
+        samples
+            .checked_mul(size_of::<i32>())
+            .ok_or(Error::AllocLimit)?,
+    )?;
     let mut noise: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for plane in 0..num_planes {
         let (pw, ph) = dims(plane);
-        noise[plane] = vec![0; pw * ph];
+        noise[plane] = zeros(pw * ph)?;
     }
     let mut prev: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for (luma_num, _) in (0..h.div_ceil(2)).step_by(16).enumerate() {
         let mut cur: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         for plane in 0..num_planes {
-            cur[plane] = vec![0; 34 * sw];
+            cur[plane] = zeros(34 * sw)?;
         }
         let mut rng = Rng(seed);
         rng.0 ^= (((luma_num * 37 + 178) & 255) << 8) as u32;
@@ -400,6 +421,15 @@ pub(crate) fn apply_film_grain(p: &FilmGrainParams, input: &GrainInput, out: [&m
             out[0][y * input.strides[0] + x] = value as u16;
         }
     }
+    Ok(())
+}
+
+/// `n` zeros, allocated fallibly (the bytes are charged by the caller).
+fn zeros(n: usize) -> Result<Vec<i32>, Error> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).map_err(|_| Error::OutOfMemory)?;
+    v.resize(n, 0);
+    Ok(v)
 }
 
 #[cfg(test)]
@@ -468,7 +498,16 @@ mod tests {
             vec![0u16; u.len()],
             vec![0u16; v.len()],
         );
-        apply_film_grain(&p, &input, [&mut oy, &mut ou, &mut ov]);
+        let ledger = Ledger::default();
+        ledger.reset(1 << 20, 0).unwrap();
+        apply_film_grain(&p, &input, [&mut oy, &mut ou, &mut ov], &ledger).unwrap();
+        let tiny = Ledger::default();
+        tiny.reset(crate::ledger::SMALL, 0).unwrap();
+        let (mut ty, mut tu, mut tv) = (oy.clone(), ou.clone(), ov.clone());
+        assert_eq!(
+            apply_film_grain(&p, &input, [&mut ty, &mut tu, &mut tv], &tiny),
+            Err(Error::AllocLimit)
+        );
         assert_eq!(oy, y);
         assert_eq!(ou, u);
         assert_eq!(ov, v);

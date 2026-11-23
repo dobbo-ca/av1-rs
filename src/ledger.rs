@@ -6,7 +6,7 @@ use crate::error::Error;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Booked at the start for the small allocations that do not scale with the input and are not
-/// charged one by one (headers, tile lists, the metadata of one frame). A `max_alloc` below this
+/// charged one by one (headers, tile lists). A `max_alloc` below this
 /// is `Error::AllocLimit` at once.
 pub(crate) const SMALL: usize = 1024;
 

@@ -34,14 +34,15 @@ checked against pinned upstream hashes (no hash is computed by us):
 |---|---|---|---|
 | libaom test vectors (`storage.googleapis.com/aom-test-data`) | 240 streams + their `.md5` | sha1 from libaom `test/test-data.sha1` at aom `04fc2a69e977` | BSD-2-Clause + AOM Patent License 1.0 (libaom) |
 | dav1d-test-data (features, film grain, intra, issues, resize, svc, 10/12-bit features) | 49 streams | git blob id at `61afa1ce` | dav1d project, BSD-2-Clause |
+| AVIF samples: av1-avif (Link-U, Xiph) and libavif test files (`tests/parity/corpus.txt`) | 151 files | pins in `corpus.txt` | av1-avif: Link-U CC-BY-SA-4.0, Xiph CC-BY-SA-3.0; libavif `tests/data`: BSD-2-Clause, Kodak unrestricted, CC-BY-3.0 (per file, see the pinned repositories) |
 
 Not used: the AV1 Argon streams (no licence is stated: the generator repository says "All
 rights reserved" and AOM's announcement gives no terms), the two libaom `.mkv` vectors (dav1d has
-no Matroska input; dav1d-test-data has the same streams as IVF), and AVIF samples (phase 6).
+no Matroska input; dav1d-test-data has the same streams as IVF).
 
 ## Results
 
-Filled per phase from the `parity` job on `main`.
+The `parity` job on `main` gates: 289 streams (240 libaom + 49 dav1d-test-data) against dav1d, and against aomdec and the published md5 where those apply, and 151 AVIF files against avifdec (libavif with dav1d; a file avifdec cannot decode is listed in `avifdec-failed.txt` and not gated) plus every coded item against dav1d and aomdec. `run.sh` fails the job if fewer than 289 streams or 151 AVIF files are present, or if fewer than 280 streams (extracted AVIF items included) or 100 AVIF files were actually compared. The exact counts of compared frames, streams and files are the first lines of the job `summary.md`; the known differences are listed below. Pin the floors in `run.sh` from the latest green run.
 
 ## Known oracle differences
 
