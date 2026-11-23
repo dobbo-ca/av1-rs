@@ -91,8 +91,7 @@ fn temporal_unit(stream: &[u8]) -> Vec<u8> {
         }
         let mut size = 0usize;
         let mut shift = 0;
-        loop {
-            let Some(&b) = stream.get(p) else { break };
+        while let Some(&b) = stream.get(p) {
             p += 1;
             size |= usize::from(b & 0x7f) << shift;
             shift += 7;

@@ -59,3 +59,8 @@ Filled per phase from the `parity` job on `main`.
   libavif `poc_*` files are security reproducers: fuzz seeds, not compared. When an image has
   alpha, avifdec's y4m holds the color planes then the alpha plane, so the gate compares it with
   `.yuv` followed by `.alpha.yuv`.
+- The Xiph AVIF files are layered (`a1lx`, 2 or 3 spatial layers in one item): as with the
+  `svc-L2*` streams, av1-rs and dav1d output the base layer and aomdec the top layer, so these
+  items are compared with dav1d only. `animated_alpha_sample_without_shown_frame`: its alpha item
+  has no shown frame; av1-rs returns no alpha plane and libavif 0.11 outputs one, so the file is
+  compared through its items only.

@@ -92,6 +92,8 @@ full() {
     # - *_tile_shared_in_dimg: an item used twice in dimg; av1-rs refuses it, as libavif >= 1.1.1.
     # - *_reversed_dimg_order: libavif 0.11 ignores the dimg order (fixed in 1.1.1).
     case $f in libavif__poc_*) continue ;; esac
+    # - animated_alpha_sample_without_shown_frame: the alpha item has no shown frame; av1-rs
+    #   returns no alpha, libavif 0.11 outputs one: compared through its items only.
     if [ -f $W/r1/$s.err ] && [ "$(cat $W/r1/$s.err)" != inter ]; then
       case $f in
         *_tile_shared_in_dimg.avif) ;;
@@ -103,7 +105,7 @@ full() {
     # dav1d); its y4m minus the header and the one FRAME line is the same layout as .yuv, plus
     # the alpha plane when there is one.
     case $f in *.avif)
-      case $f in *_reversed_dimg_order.avif) continue ;; esac
+      case $f in *_reversed_dimg_order.avif|*animated_alpha_sample_without_shown_frame.avif) continue ;; esac
       avifdec --jobs 1 "$p" $W/avd/$s.y4m >/dev/null 2>&1 || { echo "$f" >> "$REP/avifdec-failed.txt"; continue; }
       hl=$(head -n 1 $W/avd/$s.y4m | wc -c)
       tail -c +$((hl + 7)) $W/avd/$s.y4m > $W/avd/$s.yuv
@@ -133,7 +135,7 @@ full() {
       # Two spatial layers: the upper layer is an inter frame (it predicts from the base), so
       # av1-rs and dav1d (all layers) output the base layer, while libaom outputs the upper
       # layer. Checked against dav1d only (docs/parity.md).
-      *svc-L2*) ;;
+      *svc-L2*|av1-avif__Xiph__*) ;;
       *)
         ab=; case $f in *.annexb) ab=--annexb ;; esac
         aomdec $ab --rawvideo --limit="$N" -o $W/aom/$s.yuv "$p" 2>$W/stderr || echo "$f: aomdec failed: $(head -c 160 $W/stderr | tr '\n' ' ')" >> $W/d-aom
