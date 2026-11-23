@@ -87,7 +87,7 @@ mod transform;
 use obu::TemporalUnits;
 use std::sync::atomic::AtomicBool;
 
-pub use avif::{AvifImage, decode_avif};
+pub use avif::{AvifImage, decode_avif, decode_avif_item};
 pub use decoder::Decoder;
 pub use error::Error;
 pub use isobmff;

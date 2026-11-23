@@ -139,3 +139,6 @@ Transforms (`clap`, `irot`, `imir`), the `colr` properties and the premultiplied
 through raw in `AvifImage`; nothing is applied. Exif, XMP, gain map, depth and thumbnail items are
 not returned and there is no option for them yet (a known gap against the owner metadata rule);
 callers can use the re-exported `isobmff::parse` on the same file.
+
+`decode_avif_item` decodes any image item of such a parse (same paths, no alpha, no re-parse); its
+`max_alloc` is the peak of the call, an eighth for the item byte reads and the rest for the ledger.

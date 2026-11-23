@@ -21,6 +21,7 @@ let frames = av1::decode(&data, Format::Section5, &Options::default(), &limits, 
 ```
 
 AVIF stills are decoded with `av1::decode_avif` (the primary image and its alpha image, grids assembled).
+`av1::decode_avif_item` decodes any image item of an already parsed file (coded, grid or identity; no alpha, transforms not applied).
 
 ## Resource limits
 

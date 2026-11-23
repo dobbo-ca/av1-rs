@@ -100,6 +100,49 @@ pub fn decode_avif(
     })
 }
 
+/// Decodes image item `id` of `heif`, the parse of `file`, as [`decode_avif`] decodes the primary
+/// image: a coded `av01` item, a grid or an identity image. There is no alpha image, the
+/// transforms are not applied, and nothing is parsed again.
+///
+/// `limits.max_alloc` is the peak of this call: an eighth is given to the `isobmff` reads of the
+/// item bytes and the rest to one ledger for every decoder, the assembled grid, the item copies
+/// and the output. `limits.max_metadata` is counted on top of `max_alloc`, as in [`Decoder`]. The
+/// frame size limits apply to every decoded frame and to the grid; `cancel` is checked between
+/// tiles and inside every decode.
+///
+/// # Errors
+/// [`Error::Container`] when `id` is not an image item of `heif` or the item is broken, otherwise
+/// the errors of [`decode_avif`] for the primary image.
+pub fn decode_avif_item(
+    heif: &Heif,
+    file: &[u8],
+    id: u32,
+    options: &Options,
+    limits: &Limits,
+    cancel: &AtomicBool,
+) -> Result<Frame, Error> {
+    let ilimits = isobmff::Limits {
+        max_alloc: limits.max_alloc / 8,
+        max_threads: limits.max_threads,
+        max_pixels: limits.max_pixels,
+        ..isobmff::Limits::default()
+    };
+    let ledger = Arc::new(Ledger::default());
+    // A `max_alloc` below the small-allocation allowance only means that every charge fails.
+    let _ = ledger.reset(limits.max_alloc - limits.max_alloc / 8, 0);
+    let ctx = Ctx {
+        heif,
+        file,
+        options,
+        limits,
+        ilimits: &ilimits,
+        ledger,
+        cancel,
+    };
+    let image = heif.image(id).map_err(container)?;
+    decode_image(&ctx, &image, false)
+}
+
 fn decode_image(ctx: &Ctx<'_>, image: &Image, nested: bool) -> Result<Frame, Error> {
     match &image.kind {
         ImageKind::Coded { .. } => decode_coded(ctx, image),
