@@ -32,8 +32,8 @@ AVIF stills are decoded with `av1::decode_avif` (the primary image and its alpha
 | `max_pixels` | 2^28 | `PixelLimit` |
 | `max_metadata` (bytes) | 16 MiB | `MetadataLimit` |
 
-`max_alloc` is the enforced peak working memory of one call (all threads; charged before each
-allocation, released on drop). `max_threads = 1` spawns no thread; otherwise the tiles of a frame
+`max_alloc` is the enforced peak working memory of one decoder, or of one `decode_avif` call (all threads; charged before each
+allocation, released on drop). That covers frame buffers, film grain buffers and the output frames of one temporal unit until it returns; frames already returned (except by `decode`, which counts the frames it collects), the temporal-unit index of `split_temporal_units` and the item bytes inside `isobmff` are not counted, and `max_metadata` is on top. `max_threads = 1` spawns no thread; otherwise the tiles of a frame
 and the tiles of an AVIF grid decode on up to `max_threads` threads, with the same output. A frame size is checked
 before anything is allocated. Setting the cancel flag returns `Error::Cancelled` at the next OBU
 or tile. Details: [docs/limits.md](docs/limits.md).
@@ -43,3 +43,5 @@ or tile. Details: [docs/limits.md](docs/limits.md).
 - [docs/design.md](docs/design.md): method (spec-literal), modules, pipeline
 - [docs/parity.md](docs/parity.md): oracles (dav1d, aomdec), corpus, gates, results
 - [docs/fuzzing.md](docs/fuzzing.md), [docs/dependencies.md](docs/dependencies.md)
+- [docs/threading.md](docs/threading.md), [docs/limits.md](docs/limits.md)
+- [docs/safety.md](docs/safety.md), [docs/benchmarks.md](docs/benchmarks.md)

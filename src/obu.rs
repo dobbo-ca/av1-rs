@@ -244,9 +244,13 @@ pub(crate) fn parse_metadata(payload: &[u8]) -> Result<Metadata, Error> {
     if let [head @ .., 0x80] = rest {
         rest = head;
     }
+    let mut kept = Vec::new();
+    kept.try_reserve_exact(rest.len())
+        .map_err(|_| Error::OutOfMemory)?;
+    kept.extend_from_slice(rest);
     Ok(Metadata {
         metadata_type,
-        payload: rest.to_vec(),
+        payload: kept,
     })
 }
 

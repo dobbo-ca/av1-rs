@@ -4,7 +4,7 @@
 //! the output as they are decoded. Transforms, colour and the alpha plane are passed through
 //! raw: nothing is applied.
 
-use crate::ledger::Ledger;
+use crate::ledger::{Held, Ledger};
 use crate::parallel::run_parallel;
 use crate::{Decoder, Error, Format, Frame, Limits, Options, Plane, PlaneData};
 use isobmff::{Av1c, Codec, CodecConfig, Grid, Heif, Image, ImageKind};
@@ -37,6 +37,9 @@ struct Ctx<'a> {
     options: &'a Options,
     limits: &'a Limits,
     ilimits: &'a isobmff::Limits,
+    /// One budget for the whole call: every decoder, the grid canvas, the item copy and the
+    /// decoded primary image (while the alpha item decodes).
+    ledger: Arc<Ledger>,
     cancel: &'a AtomicBool,
 }
 
@@ -45,9 +48,11 @@ struct Ctx<'a> {
 /// A coded item is decoded as one Section 5 temporal unit: the `av1C` configOBUs followed by the
 /// item data. A grid is assembled from its tiles; an identity image is its input. Overlays and
 /// other item types are [`Error::Unsupported`]. The frame size limits of `limits` apply to every
-/// decoded frame and to the assembled grid, and the assembled grid is charged against
-/// `max_alloc`; each item decode gets `limits` whole. `cancel` is checked between tiles and
-/// inside every decode.
+/// decoded frame and to the assembled grid; one ledger of `max_alloc` covers every decoder, the
+/// assembled grid, the item copies and the primary image while the alpha item decodes. `cancel`
+/// is checked between tiles and inside every decode.
+///
+/// Exif, XMP, gain map, depth and thumbnail items are not returned; use `isobmff::parse` for them.
 ///
 /// # Errors
 /// [`Error::Container`] (the class of the `isobmff` error) for a broken file, otherwise the
@@ -65,12 +70,16 @@ pub fn decode_avif(
         ..isobmff::Limits::default()
     };
     let heif = isobmff::parse(file, &ilimits, cancel).map_err(container)?;
+    let ledger = Arc::new(Ledger::default());
+    // A `max_alloc` below the small-allocation allowance only means that every charge fails.
+    let _ = ledger.reset(limits.max_alloc, 0);
     let ctx = Ctx {
         heif: &heif,
         file,
         options,
         limits,
         ilimits: &ilimits,
+        ledger,
         cancel,
     };
     let primary = heif.primary_image().map_err(container)?;
@@ -109,7 +118,11 @@ fn decode_image(ctx: &Ctx<'_>, image: &Image, nested: bool) -> Result<Frame, Err
 /// One coded AV1 item: configOBUs + item data, decoded by a fresh decoder; the last output
 /// frame is the image.
 fn decode_coded(ctx: &Ctx<'_>, image: &Image) -> Result<Frame, Error> {
-    decode_item(ctx, image, Decoder::new(ctx.options.clone(), *ctx.limits))
+    let decoder = Decoder::with_ledger(ctx.options.clone(), *ctx.limits, Arc::clone(&ctx.ledger));
+    let frame = decode_item(ctx, image, decoder)?;
+    // The frame stays booked for the rest of the call (the alpha item decodes while it is held).
+    ctx.ledger.reserve(frame_bytes(&frame))?;
+    Ok(frame)
 }
 
 /// [`decode_coded`] with the decoder given (a grid tile shares its ledger with the others).
@@ -121,7 +134,7 @@ fn decode_item(ctx: &Ctx<'_>, image: &Image, mut decoder: Decoder) -> Result<Fra
     else {
         return Err(Error::Unsupported("avif codec"));
     };
-    let unit = temporal_unit(ctx, image.id, av1c)?;
+    let (unit, _held) = temporal_unit(ctx, image.id, av1c)?;
     decoder
         .decode_temporal_unit(&unit, Format::Section5, ctx.cancel)?
         .pop()
@@ -129,7 +142,7 @@ fn decode_item(ctx: &Ctx<'_>, image: &Image, mut decoder: Decoder) -> Result<Fra
 }
 
 /// The Section 5 stream of one item: the `av1C` configOBUs, then the item data.
-fn temporal_unit(ctx: &Ctx<'_>, id: u32, av1c: &Av1c) -> Result<Vec<u8>, Error> {
+fn temporal_unit<'a>(ctx: &'a Ctx<'_>, id: u32, av1c: &Av1c) -> Result<(Vec<u8>, Held<'a>), Error> {
     let config = Heif::slice(ctx.file, av1c.config_obus).ok_or(Error::Truncated)?;
     let data = ctx
         .heif
@@ -139,15 +152,14 @@ fn temporal_unit(ctx: &Ctx<'_>, id: u32, av1c: &Av1c) -> Result<Vec<u8>, Error> 
         .len()
         .checked_add(data.len())
         .ok_or(Error::AllocLimit)?;
-    if total > ctx.limits.max_alloc {
-        return Err(Error::AllocLimit);
-    }
+    // Booked until the item has decoded (the caller keeps the guard).
+    let held = ctx.ledger.charge(total)?;
     let mut unit = Vec::new();
     unit.try_reserve_exact(total)
         .map_err(|_| Error::OutOfMemory)?;
     unit.extend_from_slice(config);
     unit.extend_from_slice(&data);
-    Ok(unit)
+    Ok((unit, held))
 }
 
 fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
@@ -164,9 +176,6 @@ fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
         max_threads: (max_threads / workers).max(1),
         ..*ctx.limits
     };
-    let ledger = Arc::new(Ledger::default());
-    // A `max_alloc` below the small-allocation allowance only means that every charge fails.
-    let _ = ledger.reset(ctx.limits.max_alloc, 0);
     let canvas: Mutex<Option<Canvas>> = Mutex::new(None);
     run_parallel(grid.tiles.len(), max_threads, |i| {
         if ctx.cancel.load(Ordering::Relaxed) {
@@ -177,14 +186,14 @@ fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
             .get(i)
             .ok_or(Error::Invalid("avif grid tile count"))?;
         let tile = ctx.heif.image(*id).map_err(container)?;
-        let decoder = Decoder::with_ledger(ctx.options.clone(), inner, Arc::clone(&ledger));
+        let decoder = Decoder::with_ledger(ctx.options.clone(), inner, Arc::clone(&ctx.ledger));
         let frame = decode_item(ctx, &tile, decoder)?;
         let i = u32::try_from(i).map_err(|_| Error::Invalid("avif grid tile count"))?;
         let mut guard = canvas.lock().unwrap_or_else(|e| e.into_inner());
         // The canvas is sized by whichever tile finishes first; tile 0 then sets the properties
         // of the output frame, as in a serial decode.
         if guard.is_none() {
-            let mut c = Canvas::new(&frame, grid, ctx.limits)?;
+            let mut c = Canvas::new(&frame, grid, ctx.limits, &ctx.ledger)?;
             c.first = i;
             *guard = Some(c);
         }
@@ -212,6 +221,16 @@ struct Canvas {
     first: u32,
 }
 
+/// The sample bytes of a frame.
+pub(crate) fn frame_bytes(f: &Frame) -> usize {
+    f.planes.iter().fold(0usize, |n, p| {
+        n.saturating_add(match &p.data {
+            PlaneData::U8(v) => v.len(),
+            PlaneData::U16(v) => v.len().saturating_mul(2),
+        })
+    })
+}
+
 fn zeroed<T: Clone + Default>(n: u64) -> Result<Vec<T>, Error> {
     let n = usize::try_from(n).map_err(|_| Error::AllocLimit)?;
     let mut v = Vec::new();
@@ -223,7 +242,7 @@ fn zeroed<T: Clone + Default>(n: u64) -> Result<Vec<T>, Error> {
 impl Canvas {
     /// Sizes the output for `grid` from its first decoded tile, checking the size against
     /// `limits` and the planes against `max_alloc` before allocating them.
-    fn new(first: &Frame, grid: &Grid, limits: &Limits) -> Result<Canvas, Error> {
+    fn new(first: &Frame, grid: &Grid, limits: &Limits, ledger: &Ledger) -> Result<Canvas, Error> {
         let (w, h) = (grid.width, grid.height);
         let (tw, th) = (first.width, first.height);
         if w == 0 || h == 0 {
@@ -242,6 +261,13 @@ impl Canvas {
             || u64::from(h) > u64::from(th) * u64::from(grid.rows)
         {
             return Err(Error::Invalid("avif grid larger than its tiles"));
+        }
+        // Every tile must reach into the output (HEIF 6.6.2.3.1): the tiles decoded stay within
+        // about 4x the output size.
+        if u64::from(w) <= u64::from(tw) * u64::from(grid.columns - 1)
+            || u64::from(h) <= u64::from(th) * u64::from(grid.rows - 1)
+        {
+            return Err(Error::Invalid("avif grid tile outside the output"));
         }
         let (sx, sy) = (
             u32::from(first.subsampling_x),
@@ -265,9 +291,8 @@ impl Canvas {
             .iter()
             .map(|&(pw, ph)| u64::from(pw) * u64::from(ph) * bytes_per_sample)
             .sum();
-        if total > limits.max_alloc as u64 {
-            return Err(Error::AllocLimit);
-        }
+        // Booked for the rest of the call: the canvas is the image the caller gets.
+        ledger.reserve(usize::try_from(total).map_err(|_| Error::AllocLimit)?)?;
         let mut planes = Vec::with_capacity(dims.len());
         for (width, height) in dims {
             let n = u64::from(width) * u64::from(height);
@@ -425,6 +450,12 @@ mod tests {
         }
     }
 
+    fn led(l: &Limits) -> Ledger {
+        let ledger = Ledger::default();
+        let _ = ledger.reset(l.max_alloc, 0);
+        ledger
+    }
+
     fn bytes(p: &Plane) -> &[u8] {
         match &p.data {
             PlaneData::U8(v) => v,
@@ -436,7 +467,13 @@ mod tests {
     fn grid_of_two_tiles_is_cropped() {
         let (a, b) = (frame(4, 2, 1, 10), frame(4, 2, 2, 20));
         // Two 4x2 tiles side by side, output cropped from 8x2 to 7x2.
-        let mut canvas = Canvas::new(&a, &grid(2, 1, 7, 2), &Limits::default()).unwrap();
+        let mut canvas = Canvas::new(
+            &a,
+            &grid(2, 1, 7, 2),
+            &Limits::default(),
+            &led(&Limits::default()),
+        )
+        .unwrap();
         canvas.paste(&a, 0, 0).unwrap();
         canvas.paste(&b, 1, 0).unwrap();
         let f = canvas.frame;
@@ -453,7 +490,13 @@ mod tests {
     #[test]
     fn mismatched_tiles_are_an_error() {
         let a = frame(4, 2, 1, 10);
-        let mut canvas = Canvas::new(&a, &grid(2, 1, 8, 2), &Limits::default()).unwrap();
+        let mut canvas = Canvas::new(
+            &a,
+            &grid(2, 1, 8, 2),
+            &Limits::default(),
+            &led(&Limits::default()),
+        )
+        .unwrap();
         canvas.paste(&a, 0, 0).unwrap();
         let narrow = frame(2, 2, 2, 20);
         assert!(matches!(
@@ -470,21 +513,26 @@ mod tests {
         let a = frame(4, 2, 1, 10);
         let l = Limits::default();
         assert!(matches!(
-            Canvas::new(&a, &grid(2, 1, 9, 2), &l),
+            Canvas::new(&a, &grid(2, 1, 9, 2), &l, &led(&l)),
             Err(Error::Invalid(_))
         ));
         assert!(matches!(
-            Canvas::new(&a, &grid(2, 1, 0, 2), &l),
+            Canvas::new(&a, &grid(2, 1, 0, 2), &l, &led(&l)),
+            Err(Error::Invalid(_))
+        ));
+        // The second tile would lie wholly outside a 4 wide output.
+        assert!(matches!(
+            Canvas::new(&a, &grid(2, 1, 4, 2), &l, &led(&l)),
             Err(Error::Invalid(_))
         ));
         let small = Limits { max_alloc: 8, ..l };
         assert!(matches!(
-            Canvas::new(&a, &grid(2, 1, 8, 2), &small),
+            Canvas::new(&a, &grid(2, 1, 8, 2), &small, &led(&small)),
             Err(Error::AllocLimit)
         ));
         let narrow = Limits { max_width: 7, ..l };
         assert!(matches!(
-            Canvas::new(&a, &grid(2, 1, 8, 2), &narrow),
+            Canvas::new(&a, &grid(2, 1, 8, 2), &narrow, &led(&narrow)),
             Err(Error::WidthLimit)
         ));
     }

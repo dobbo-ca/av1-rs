@@ -118,6 +118,9 @@ pub struct Decoder {
     metadata_bytes: usize,
     /// Output frames of the current temporal unit, before the layer selection.
     ready: Vec<Frame>,
+    /// Ledger bytes held by the planes built for `ready` (and by a frame that failed half-built),
+    /// given back when the unit's frames are handed out.
+    ready_bytes: usize,
     infos: Vec<FrameInfo>,
 }
 
@@ -158,6 +161,7 @@ impl Decoder {
             metadata: Vec::new(),
             metadata_bytes: 0,
             ready: Vec::new(),
+            ready_bytes: 0,
             infos: Vec::new(),
         }
     }
@@ -185,6 +189,7 @@ impl Decoder {
         cancel: &AtomicBool,
     ) -> Result<Vec<Frame>, Error> {
         self.ready.clear();
+        self.release_ready();
         self.metadata.clear();
         self.metadata_bytes = 0;
         for obu in ObuIter::new(data, format) {
@@ -194,6 +199,20 @@ impl Decoder {
             self.handle_obu(data, obu?, cancel)?;
         }
         Ok(self.select_output())
+    }
+
+    /// Gives back the ledger bytes held by the unit's output planes.
+    fn release_ready(&mut self) {
+        self.ledger.release(std::mem::take(&mut self.ready_bytes));
+    }
+
+    /// Books the samples of `frames` (returned by this decoder) on its ledger until the decoder
+    /// drops: [`crate::decode`] keeps every frame of the call, so they count against `max_alloc`.
+    pub(crate) fn hold_output(&self, frames: &[Frame]) -> Result<(), Error> {
+        for f in frames {
+            self.ledger.reserve(crate::avif::frame_bytes(f))?;
+        }
+        Ok(())
     }
 
     /// The frames of the current temporal unit that were output before an error stopped it.
@@ -211,6 +230,7 @@ impl Decoder {
     /// stream has layers.
     fn select_output(&mut self) -> Vec<Frame> {
         let frames = std::mem::take(&mut self.ready);
+        self.release_ready();
         let layered = self
             .seq
             .as_ref()
@@ -469,7 +489,7 @@ impl Decoder {
             tiles,
             cancel,
         )?;
-        fs.lr_frame = wrapup(&mut fs, seq, h)?;
+        fs.lr_frame = wrapup(&mut fs, seq, h, cancel)?;
         self.state = Some(fs);
         Ok(())
     }
@@ -479,6 +499,10 @@ impl Decoder {
     fn metadata_obu(&mut self, payload: &[u8]) -> Result<(), Error> {
         if !self.options.keep_metadata {
             return Ok(());
+        }
+        // An OBU larger than the whole limit is refused before it is copied.
+        if payload.len() > self.limits.max_metadata {
+            return Err(Error::MetadataLimit);
         }
         let m = parse_metadata(payload)?;
         let cost = m.payload.len() + size_of::<Metadata>();
@@ -549,14 +573,14 @@ impl Decoder {
                 let o0 = it.next().unwrap_or_default();
                 let o1 = it.next().unwrap_or_default();
                 let o2 = it.next().unwrap_or_default();
-                apply_film_grain(&h.film_grain, &input, [o0, o1, o2]);
+                apply_film_grain(&h.film_grain, &input, [o0, o1, o2], &self.ledger)?;
             }
             for (g, p) in grained.iter().zip(planes) {
-                out.push(self.to_public(g, p.width, p.height, s.bit_depth)?);
+                out.push(self.public_plane(g, p.width, p.height, s.bit_depth)?);
             }
         } else {
             for p in planes {
-                out.push(self.to_public(p, p.width, p.height, s.bit_depth)?);
+                out.push(self.public_plane(p, p.width, p.height, s.bit_depth)?);
             }
         }
         let metadata = std::mem::take(&mut self.metadata);
@@ -582,8 +606,8 @@ impl Decoder {
 
     /// Copies the visible `width` x `height` samples of `p` into an output plane, `u8` for 8-bit
     /// frames and `u16` otherwise. `width` and `height` are within the plane.
-    fn to_public(
-        &self,
+    fn public_plane(
+        &mut self,
         p: &WorkPlane,
         width: usize,
         height: usize,
@@ -595,7 +619,10 @@ impl Decoder {
         } else {
             n.saturating_mul(2)
         };
-        let _held = self.ledger.charge(bytes)?;
+        // Held until the unit's frames are handed out (`release_ready`), so frames waiting in
+        // `ready` count against `max_alloc`.
+        self.ledger.reserve(bytes)?;
+        self.ready_bytes += bytes;
         let data = if bit_depth == 8 {
             let mut v: Vec<u8> = Vec::new();
             v.try_reserve_exact(n).map_err(|_| Error::OutOfMemory)?;
@@ -711,6 +738,14 @@ fn exact_planes(fs: &FrameState, src: Option<&[WorkPlane]>) -> Result<Vec<WorkPl
     Ok(out)
 }
 
+/// `Err(Cancelled)` once the flag is set. The wrapup filters check it between stages only.
+fn check_cancel(cancel: &AtomicBool) -> Result<(), Error> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(Error::Cancelled);
+    }
+    Ok(())
+}
+
 /// The frame wrapup of spec 7.4 after the last tile: deblocking (7.14), CDEF (7.15), superres
 /// (7.16) on the CDEF output and, for loop restoration, on the deblocked frame, then loop
 /// restoration (7.17). Returns `LrFrame`.
@@ -718,9 +753,12 @@ fn wrapup(
     fs: &mut FrameState,
     seq: &SequenceHeader,
     h: &FrameHeader,
+    cancel: &AtomicBool,
 ) -> Result<Vec<WorkPlane>, Error> {
     loop_filter_frame(fs, seq, h);
+    check_cancel(cancel)?;
     let cdef = cdef_alloc(fs, seq, h)?;
+    check_cancel(cancel)?;
     let (up_cdef, up_curr) = if h.frame_width != h.upscaled_width {
         let mut up_cdef = exact_planes(fs, None)?;
         upscale(&cdef, fs, seq, h, &mut up_cdef);
@@ -736,6 +774,7 @@ fn wrapup(
     } else {
         (exact_planes(fs, Some(cdef.as_slice()))?, None)
     };
+    check_cancel(cancel)?;
     if !h.uses_lr {
         return Ok(up_cdef);
     }
@@ -904,6 +943,7 @@ mod tests {
             let r = d.decode_temporal_unit(&data, Format::Section5, &cancel());
             assert!(d.ledger.peak() <= max_alloc as u64);
             if r.is_err() {
+                d.take_frames(); // hands out (and releases) the planes of a half-built unit
                 assert_eq!(d.ledger.left(), before);
             }
         }

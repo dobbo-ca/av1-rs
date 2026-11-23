@@ -12,9 +12,11 @@ All threading is safe Rust (`std::thread::scope`, a `Mutex`, atomics); the crate
 - **Tiles of an AVIF grid** (`avif.rs`, `decode_grid`). Each grid tile is a coded item with its own
   `Decoder`; they run on `min(max_threads, tiles)` threads and are pasted into the output as they
   finish. Each inner decode gets `max_threads / workers` threads (so one when the grid has at least
-  as many tiles as threads), and all inner decoders share one ledger, so `max_alloc` covers them
-  together. The assembled output image is not in that ledger: as before, it is checked against
-  `max_alloc` when it is sized and not counted once returned.
+  as many tiles as threads), and all inner decoders share one ledger (the one of the whole
+  `decode_avif` call), so `max_alloc` covers them
+  together. The assembled canvas, the temporal-unit copy of each item and the primary image held
+  while the alpha item decodes are charged to it too. Item bytes inside `isobmff` and a decoded
+  tile waiting for the canvas lock are not.
 
 Not parallel: the OBU parse, the wrapup, film grain, output. Frames of a stream decode one after
 another (a later frame may reference an earlier one).

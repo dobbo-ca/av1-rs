@@ -70,8 +70,11 @@ full() {
   # directory, so dav1d and aomdec check the AV1 decode of each item (examples/avifx.rs).
   ls $W/in/*.avif >/dev/null 2>&1 && { av1-avifx $W/in $W/in/*.avif > "$REP/avifx.log" 2>&1 || bad=1; }
   n=$(ls $W/in | wc -l)
-  # 240 libaom vectors + 49 dav1d-test-data streams: a mount that did not arrive must fail.
-  [ "$n" -ge 285 ] || { echo "corpus has $n streams, want at least 285" >&2; bad=1; }
+  # 289 streams (240 libaom + 49 dav1d-test-data) and 151 AVIF files: a mount that did not arrive
+  # must fail. The extracted AVIF items count as streams here, so the stream floor is loose.
+  nav=$(ls $W/in/*.avif 2>/dev/null | wc -l)
+  [ "$nav" -ge 151 ] || { echo "corpus has $nav AVIF files, want at least 151" >&2; bad=1; }
+  [ "$((n - nav))" -ge 289 ] || { echo "corpus has $((n - nav)) streams, want at least 289" >&2; bad=1; }
   flag=; [ "$MODE" = info ] && flag=--info
   av1-oracle $flag --threads 1 $W/in $W/r1 || bad=1
   av1-oracle $flag $W/in $W/rn || bad=1
@@ -157,6 +160,9 @@ full() {
         ;;
     esac
   done
+  # Floors: a gate that compared (almost) nothing must not pass. Pin these from a green run.
+  [ "$cmpd" -ge 280 ] || echo "only $cmpd streams compared against dav1d, want at least 280" >> $W/d-err
+  [ "$avifd" -ge 100 ] || echo "only $avifd AVIF files compared against avifdec, want at least 100" >> $W/d-err
   diff -r $W/r1 $W/rn > $W/d-threads
   {
     echo "## av1-rs parity ($MODE)"
@@ -192,6 +198,7 @@ arm() {
   inputs $W/in "$SUBSET"
   flag=; [ "$MODE" = info ] && flag=--info
   qemu-aarch64 -L /usr/aarch64-linux-gnu "$(command -v av1-oracle-arm64)" $flag --threads 1 $W/in $W/arm || exit 1
+  [ "$(ls $W/in | wc -l)" -ge 50 ] || { echo "arm64 subset has only $(ls $W/in | wc -l) streams, want at least 50" >&2; exit 1; }
   diff -r "$1" $W/arm && echo "arm64 matches x86_64 on $(ls $W/in | wc -l) streams"
 }
 
@@ -199,7 +206,11 @@ seeds() {
   rm -rf $W; mkdir -p $W/in "$1"
   inputs $W/in
   for p in $W/in/*; do
-    cp "$p" "$1/$(basename "$p")" && printf '\0' >> "$1/$(basename "$p")"
+    b=$(basename "$p")
+    # Option byte: bit 0 Annex B, bit 1 two threads (the parallel tile and grid paths).
+    o=0; case $b in *.annexb) o=1 ;; esac
+    cp "$p" "$1/$b" && printf "\\$(printf %03o $o)" >> "$1/$b"
+    cp "$p" "$1/t2-$b" && printf "\\$(printf %03o $((o + 2)))" >> "$1/t2-$b"
   done
   echo "$(ls "$1" | wc -l) seeds"
 }

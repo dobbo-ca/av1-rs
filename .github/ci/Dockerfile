@@ -118,7 +118,7 @@ RUN rustup toolchain install nightly --profile minimal \
     && cargo install cargo-fuzz --locked --version 0.13.1
 ENV CARGO_NET_OFFLINE=true
 
-# Seeds: the corpus streams (as Section 5 temporal units, see run.sh seeds), each with one option
+# Seeds: the raw corpus files (see run.sh seeds), each with one option
 # byte at the end (the targets read their options from the last byte).
 FROM fuzz-tools AS fuzz
 COPY . .

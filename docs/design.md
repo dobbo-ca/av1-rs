@@ -136,4 +136,6 @@ against `Limits` and its planes against `max_alloc` before allocation, the cance
 between tiles, and `isobmff` errors are `Error::Container` with the `isobmff` error class.
 
 Transforms (`clap`, `irot`, `imir`), the `colr` properties and the premultiplied flag are passed
-through raw in `AvifImage`; nothing is applied.
+through raw in `AvifImage`; nothing is applied. Exif, XMP, gain map, depth and thumbnail items are
+not returned and there is no option for them yet (a known gap against the owner metadata rule);
+callers can use the re-exported `isobmff::parse` on the same file.

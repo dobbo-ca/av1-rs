@@ -26,9 +26,13 @@
 //! Every entry point takes a [`Limits`]. The sizes in the bitstream are untrusted: a frame wider
 //! than `max_width`, taller than `max_height` or with more than `max_pixels` luma samples is
 //! refused before anything is allocated ([`Error::WidthLimit`], [`Error::HeightLimit`],
-//! [`Error::PixelLimit`]). The working memory of a decoder (frame buffers, the reference slots,
-//! the planes of an output frame) is charged against `max_alloc` before it is allocated
-//! ([`Error::AllocLimit`]); `max_metadata` bounds the metadata OBUs kept with a frame
+//! [`Error::PixelLimit`]). The working memory of a decoder, or of one `decode_avif` call, all
+//! threads together (frame buffers, film grain buffers, the reference slots, the AVIF canvas,
+//! the output frames of a temporal unit until it returns) is charged against `max_alloc` before
+//! it is allocated
+//! ([`Error::AllocLimit`], [`Error::OutOfMemory`] when the system refuses); returned frames are
+//! not counted ([`decode`] counts the frames it collects until it returns). `max_metadata`
+//! bounds the metadata OBUs kept with a frame, on top of `max_alloc`
 //! ([`Error::MetadataLimit`]). `max_threads` caps the worker threads of one call (1 spawns
 //! none).
 //!
@@ -237,6 +241,8 @@ pub struct Probe {
 ///
 /// Decoding stops at the first inter frame with [`Error::InterFrame`] and the frames before it
 /// are not returned: use [`Decoder`] to keep them.
+/// The frames it collects stay charged against `max_alloc` until it returns, so a stream whose
+/// output is larger than `max_alloc` is `AllocLimit`: use [`Decoder`] to stream it.
 ///
 /// # Errors
 /// `Truncated` or `Invalid` for a broken stream, `Unsupported` for a feature this decoder does
@@ -253,7 +259,10 @@ pub fn decode(
     let mut decoder = Decoder::new(options.clone(), *limits);
     let mut frames = Vec::new();
     for unit in split_temporal_units(data, format)? {
-        frames.extend(decoder.decode_temporal_unit(unit, format, cancel)?);
+        let out = decoder.decode_temporal_unit(unit, format, cancel)?;
+        // Every frame collected so far stays booked: the output of the call counts too.
+        decoder.hold_output(&out)?;
+        frames.extend(out);
     }
     Ok(frames)
 }
