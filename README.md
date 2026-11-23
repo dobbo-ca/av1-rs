@@ -20,6 +20,8 @@ let frames = av1::decode(&data, Format::Section5, &Options::default(), &limits, 
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+AVIF stills are decoded with `av1::decode_avif` (the primary image and its alpha image, grids assembled).
+
 ## Resource limits
 
 | Field | Default | Error |

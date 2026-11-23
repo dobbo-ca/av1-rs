@@ -17,6 +17,9 @@ a corpus stream fails the gate. The gate also compares `--threads 1` with the de
 8-bit as bytes and higher depths as little-endian u16; the dav1d `.yuv` layout), `<stem>.frames`
 (one line per frame: `W H bitdepth layout`) and `<stem>.err` (the error class).
 
+`examples/oracle.rs` also takes `.avif` files (`av1::decode_avif`; the alpha image goes to `<stem>.alpha.yuv`).
+`examples/avifx.rs` is a CI-only extraction tool, not part of the library: `avifx <out-dir> <file.avif>...` writes every AV1 coded item reachable from the primary image (itself, its grid tiles, its alpha item and the alpha's tiles) as `<out-dir>/<stem>.item<id>.obu`, the `av1C` configOBUs followed by the item data, a Section 5 stream that dav1d and aomdec read.
+
 ## Modes
 
 `tests/parity/mode` holds the gate mode. `info` (phase 1, headers only): the frame size and
@@ -49,3 +52,15 @@ Filled per phase from the `parity` job on `main`.
 - Superres floor: like libaom and dav1d, the coded width is never below Min(16, UpscaledWidth),
   and superres applies only when the coded and upscaled widths differ (dav1d issue 322; the spec
   text has no floor).
+- AVIF (`avifdec` is libavif 0.11.1 from bookworm): `sofa_grid1x5_420_reversed_dimg_order`
+  is not compared with avifdec, because libavif before 1.1.1 ignores the `dimg` order (HEIF says
+  the `dimg` order is the tile order; av1-rs follows it). `color_grid_alpha_grid_tile_shared_in_dimg`
+  uses one tile item twice in `dimg`; av1-rs refuses it, as libavif 1.1.1 and later do. The
+  libavif `poc_*` files are security reproducers: fuzz seeds, not compared. When an image has
+  alpha, avifdec's y4m holds the color planes then the alpha plane, so the gate compares it with
+  `.yuv` followed by `.alpha.yuv`.
+- The Xiph AVIF files are layered (`a1lx`, 2 or 3 spatial layers in one item): as with the
+  `svc-L2*` streams, av1-rs and dav1d output the base layer and aomdec the top layer, so these
+  items are compared with dav1d only. `animated_alpha_sample_without_shown_frame`: its alpha item
+  has no shown frame; av1-rs returns no alpha plane and libavif 0.11 outputs one, so the file is
+  compared through its items only.

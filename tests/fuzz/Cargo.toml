@@ -27,3 +27,10 @@ path = "fuzz_targets/decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "avif"
+path = "fuzz_targets/avif.rs"
+test = false
+doc = false
+bench = false

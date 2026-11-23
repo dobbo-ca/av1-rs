@@ -116,3 +116,21 @@ pads with zeros; a read past the end of a tile is an error after the tile, as th
 trailing check). Non-test code denies unwrap/expect/panic and indexing that can fail on input
 values is guarded by earlier validation (sizes, mi bounds). Arithmetic on input values uses
 checked or saturating forms where the spec does not bound it.
+
+## AVIF layer
+
+`src/avif.rs` joins the container parser `isobmff` (our crate, the only dependency) with the
+decoder. `decode_avif` parses the file with `isobmff::Limits` taken from ours (`max_alloc`,
+`max_threads`, `max_pixels`) and decodes the primary image and its alpha image the same way. A
+coded `av01` item is one Section 5 temporal unit, the `av1C` configOBUs followed by the item
+data, decoded by a fresh `Decoder`; the last output frame is the image (`Options::operating_point`
+picks the layer of a layered item). A grid decodes its tiles one after another and pastes each
+into the output at `col * tile_w`, `row * tile_h` (chroma positions scaled by the subsampling),
+clipped to the grid width and height; the tiles must agree on size, bit depth and subsampling,
+and the output cannot be larger than `columns * tile_w` x `rows * tile_h`. An identity image is
+its input; overlays and other item types are `Error::Unsupported`. The output size is checked
+against `Limits` and its planes against `max_alloc` before allocation, the cancel flag is checked
+between tiles, and `isobmff` errors are `Error::Container` with the `isobmff` error class.
+
+Transforms (`clap`, `irot`, `imir`), the `colr` properties and the premultiplied flag are passed
+through raw in `AvifImage`; nothing is applied.

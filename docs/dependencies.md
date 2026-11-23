@@ -1,6 +1,6 @@
 # Dependencies
 
-The crate has no dependencies (std only). The fuzz crate (`tests/fuzz`) uses `libfuzzer-sys`.
+The crate depends on `isobmff` (our container parser, pinned by rev) and otherwise on std only. The fuzz crate (`tests/fuzz`) uses `libfuzzer-sys`.
 
 ## Sources used as guides
 

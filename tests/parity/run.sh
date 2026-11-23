@@ -64,16 +64,19 @@ fsize() {
 
 full() {
   REP=$1 bad=0
-  rm -rf $W; mkdir -p "$REP" $W/in $W/r1 $W/rn $W/dav $W/aom
+  rm -rf $W; mkdir -p "$REP" $W/in $W/r1 $W/rn $W/dav $W/aom $W/avd
   inputs $W/in
+  # AVIF: every coded item (av1C config OBUs + item bytes) becomes a Section 5 stream in the same
+  # directory, so dav1d and aomdec check the AV1 decode of each item (examples/avifx.rs).
+  ls $W/in/*.avif >/dev/null 2>&1 && { av1-avifx $W/in $W/in/*.avif > "$REP/avifx.log" 2>&1 || bad=1; }
   n=$(ls $W/in | wc -l)
   # 240 libaom vectors + 49 dav1d-test-data streams: a mount that did not arrive must fail.
   [ "$n" -ge 285 ] || { echo "corpus has $n streams, want at least 285" >&2; bad=1; }
   flag=; [ "$MODE" = info ] && flag=--info
   av1-oracle $flag --threads 1 $W/in $W/r1 || bad=1
   av1-oracle $flag $W/in $W/rn || bad=1
-  : > $W/d-dav1d; : > $W/d-aom; : > $W/d-md5; : > $W/d-err
-  frames=0 cmpd=0 aomd=0 md5d=0
+  : > $W/d-dav1d; : > $W/d-aom; : > $W/d-md5; : > $W/d-err; : > $W/d-avif
+  frames=0 cmpd=0 aomd=0 md5d=0 avifd=0
   for p in $W/in/*; do
     f=$(basename "$p"); s=$(stem "$f")
     if [ "$MODE" = info ]; then out=$W/r1/$s.info; else out=$W/r1/$s.frames; fi
@@ -84,10 +87,34 @@ full() {
     else
       N=$(wc -l < "$out")
     fi
+    # Known oracle differences (docs/parity.md, "Known oracle differences"):
+    # - libavif poc_* files are security reproducers (hostile input): fuzz seeds, no oracle.
+    # - *_tile_shared_in_dimg: an item used twice in dimg; av1-rs refuses it, as libavif >= 1.1.1.
+    # - *_reversed_dimg_order: libavif 0.11 ignores the dimg order (fixed in 1.1.1).
+    case $f in libavif__poc_*) continue ;; esac
+    # - animated_alpha_sample_without_shown_frame: the alpha item has no shown frame; av1-rs
+    #   returns no alpha, libavif 0.11 outputs one: compared through its items only.
     if [ -f $W/r1/$s.err ] && [ "$(cat $W/r1/$s.err)" != inter ]; then
-      echo "$f: av1-rs error $(cat $W/r1/$s.err) ($(cat $W/r1/$s.why 2>/dev/null)) after $N frames" >> $W/d-err
+      case $f in
+        *_tile_shared_in_dimg.avif) ;;
+        *) echo "$f: av1-rs error $(cat $W/r1/$s.err) ($(cat $W/r1/$s.why 2>/dev/null)) after $N frames" >> $W/d-err ;;
+      esac
     fi
     [ "$N" -gt 0 ] || continue
+    # The whole AVIF image (grid assembled, before irot/imir/clap) against avifdec (libavif with
+    # dav1d); its y4m minus the header and the one FRAME line is the same layout as .yuv, plus
+    # the alpha plane when there is one.
+    case $f in *.avif)
+      case $f in *_reversed_dimg_order.avif|*animated_alpha_sample_without_shown_frame.avif) continue ;; esac
+      avifdec --jobs 1 "$p" $W/avd/$s.y4m >/dev/null 2>&1 || { echo "$f" >> "$REP/avifdec-failed.txt"; continue; }
+      hl=$(head -n 1 $W/avd/$s.y4m | wc -c)
+      tail -c +$((hl + 7)) $W/avd/$s.y4m > $W/avd/$s.yuv
+      cat $W/r1/$s.yuv $W/r1/$s.alpha.yuv > $W/avd/$s.ours 2>/dev/null
+      cmp -s $W/avd/$s.yuv $W/r1/$s.yuv || cmp -s $W/avd/$s.yuv $W/avd/$s.ours \
+        || echo "$f: differs from avifdec: $(mismatch $W/avd/$s.yuv $W/r1/$s.yuv $W/r1/$s.frames)" >> $W/d-avif
+      avifd=$((avifd + 1))
+      continue ;;
+    esac
     frames=$((frames + N))
     if [ "$MODE" = info ]; then
       dav1d -q --threads 1 --limit "$N" -i "$p" -o $W/dav/$s.y4m 2>/dev/null || { echo "$f: dav1d failed" >> $W/d-dav1d; continue; }
@@ -100,18 +127,18 @@ full() {
       cmpd=$((cmpd + 1))
       continue
     fi
-    dav1d -q --threads 1 --filmgrain 1 --limit "$N" -i "$p" -o $W/dav/$s.yuv 2>/dev/null \
-      || echo "$f: dav1d failed" >> $W/d-dav1d
+    dav1d -q --threads 1 --filmgrain 1 --limit "$N" -i "$p" -o $W/dav/$s.yuv 2>$W/stderr \
+      || echo "$f: dav1d failed: $(head -c 160 $W/stderr | tr '\n' ' ')" >> $W/d-dav1d
     cmp -s $W/dav/$s.yuv $W/r1/$s.yuv || echo "$f: differs from dav1d ($N frames): $(mismatch $W/dav/$s.yuv $W/r1/$s.yuv $W/r1/$s.frames)" >> $W/d-dav1d
     cmpd=$((cmpd + 1))
     case $f in
       # Two spatial layers: the upper layer is an inter frame (it predicts from the base), so
       # av1-rs and dav1d (all layers) output the base layer, while libaom outputs the upper
       # layer. Checked against dav1d only (docs/parity.md).
-      *svc-L2*) ;;
+      *svc-L2*|av1-avif__Xiph__*) ;;
       *)
         ab=; case $f in *.annexb) ab=--annexb ;; esac
-        aomdec $ab --rawvideo --limit="$N" -o $W/aom/$s.yuv "$p" 2>/dev/null || echo "$f: aomdec failed" >> $W/d-aom
+        aomdec $ab --rawvideo --limit="$N" -o $W/aom/$s.yuv "$p" 2>$W/stderr || echo "$f: aomdec failed: $(head -c 160 $W/stderr | tr '\n' ' ')" >> $W/d-aom
         cmp -s $W/aom/$s.yuv $W/r1/$s.yuv || echo "$f: differs from aomdec ($N frames): $(mismatch $W/aom/$s.yuv $W/r1/$s.yuv $W/r1/$s.frames)" >> $W/d-aom
         aomd=$((aomd + 1))
         # The published per-frame md5 (always 3 planes, so monochrome is checked by aomdec only).
@@ -134,17 +161,18 @@ full() {
   {
     echo "## av1-rs parity ($MODE)"
     echo
-    echo "$n streams, $frames frames compared; $cmpd streams vs dav1d, $aomd vs aomdec, $md5d vs the published md5."
+    echo "$n inputs (streams, AVIF files and their extracted items), $frames frames compared; $cmpd streams vs dav1d, $aomd vs aomdec, $md5d vs the published md5, $avifd AVIF files vs avifdec."
     echo
     echo "| gate | result |"
     echo "|---|---|"
   } > "$REP/summary.md"
-  for g in err dav1d aom md5 threads; do
+  for g in err dav1d aom md5 avif threads; do
     l=$(wc -l < $W/d-$g)
     if [ "$l" -eq 0 ]; then echo "| $g | ok |" >> "$REP/summary.md"
     else echo "| $g | FAIL, $l lines |" >> "$REP/summary.md"; bad=1; head -n 300 $W/d-$g > "$REP/$g.diff"; fi
   done
   echo >> "$REP/summary.md"
+  [ -f "$REP/avifdec-failed.txt" ] && echo "avifdec (libavif 0.11) could not decode $(wc -l < "$REP/avifdec-failed.txt") AVIF files; av1-rs output for them is checked through their items only (avifdec-failed.txt)." >> "$REP/summary.md"
   echo "Stop classes (av1-rs .err, one thread): $(for e in $W/r1/*.err; do [ -f "$e" ] && printf '%s\n' "$(cat "$e")"; done | sort | uniq -c | tr -s ' \n' ' ')" >> "$REP/summary.md"
   cat "$REP/summary.md"
   return $bad

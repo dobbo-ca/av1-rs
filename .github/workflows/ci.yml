@@ -7,7 +7,8 @@ concurrency:
   cancel-in-progress: true
 jobs:
   # The checks run inside .github/ci/Dockerfile on the in-cluster BuildKit, so the Rust image and the
-  # build cache stay in the cluster. av1-rs has no private dependencies, so the jobs need no token.
+  # build cache stay in the cluster. isobmff-rs is private: the dobbo-ca-ci-read GitHub App mints a
+  # read-only token for it, and it reaches the build only as a BuildKit secret.
   # The layers are also saved to the Actions cache (one scope per job), so a restart of buildkitd does not throw them away.
   # A PR needs only `test`; arm64, parity and parity-arm64 run on main and on workflow_dispatch.
   test:
@@ -16,6 +17,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { lfs: false }
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.CI_READ_APP_ID }}
+          private-key: ${{ secrets.CI_READ_APP_KEY }}
+          owner: dobbo-ca
+          repositories: isobmff-rs
+          permission-contents: read
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           driver: remote
@@ -31,6 +40,8 @@ jobs:
           # Only main and dispatch runs export: a PR's cache is scoped to its ref, so no other PR
           # could read it, and the export takes about two minutes.
           cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max,scope=av1-rs-test' || '' }}
+          secrets: |
+            gh_token=${{ steps.app.outputs.token }}
 
   # The library tests on aarch64 under qemu-user (the NEON kernel tests join when SIMD lands).
   arm64:
@@ -40,6 +51,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { lfs: false }
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.CI_READ_APP_ID }}
+          private-key: ${{ secrets.CI_READ_APP_KEY }}
+          owner: dobbo-ca
+          repositories: isobmff-rs
+          permission-contents: read
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           driver: remote
@@ -53,6 +72,8 @@ jobs:
           outputs: type=cacheonly
           cache-from: type=gha,scope=av1-rs-arm64
           cache-to: type=gha,mode=max,scope=av1-rs-arm64
+          secrets: |
+            gh_token=${{ steps.app.outputs.token }}
 
   # dav1d, aomdec and examples/oracle.rs decode the same public corpus
   # (tests/parity/corpus.txt); every output plane must be equal (tests/parity/run.sh). The
@@ -65,6 +86,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { lfs: false }
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.CI_READ_APP_ID }}
+          private-key: ${{ secrets.CI_READ_APP_KEY }}
+          owner: dobbo-ca
+          repositories: isobmff-rs
+          permission-contents: read
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           driver: remote
@@ -78,6 +107,8 @@ jobs:
           outputs: type=local,dest=parity-out
           cache-from: type=gha,scope=av1-rs-parity
           cache-to: type=gha,mode=max,scope=av1-rs-parity
+          secrets: |
+            gh_token=${{ steps.app.outputs.token }}
       - if: always()
         run: '[ ! -f parity-out/summary.md ] || cat parity-out/summary.md >> "$GITHUB_STEP_SUMMARY"'
       - if: always()
@@ -97,6 +128,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { lfs: false }
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.CI_READ_APP_ID }}
+          private-key: ${{ secrets.CI_READ_APP_KEY }}
+          owner: dobbo-ca
+          repositories: isobmff-rs
+          permission-contents: read
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           driver: remote
@@ -110,3 +149,5 @@ jobs:
           outputs: type=cacheonly
           cache-from: type=gha,scope=av1-rs-parity-arm64
           cache-to: type=gha,mode=max,scope=av1-rs-parity-arm64
+          secrets: |
+            gh_token=${{ steps.app.outputs.token }}
