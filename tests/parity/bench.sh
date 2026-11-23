@@ -58,6 +58,18 @@ table() {
   echo "| all | | | $sd | $sa | $sr | $sv | $(ratio $sr $sd) | $(ratio $sv $sd) | $(ratio $sr $sa) |"
 }
 
+# tiers: av1-rs with each SIMD tier forced (AV1_SIMD), one thread; which tier wins per class.
+tiers() {
+  echo "| class | scalar ms | avx2 ms | avx512 ms (best) | avx2 / scalar | avx512 / avx2 |"
+  echo "|---|---|---|---|---|---|"
+  for c in $CLASSES; do
+    export AV1_SIMD=scalar; s=$(best rs av1-oracle 1 $c)
+    export AV1_SIMD=avx2; x=$(best rs av1-oracle 1 $c)
+    unset AV1_SIMD; z=$(best rs av1-oracle 1 $c)
+    echo "| $c | $s | $x | $z | $(ratio $x $s) | $(ratio $z $x) |"
+  done
+}
+
 {
   echo "## av1-rs bench (information only)"
   echo
@@ -70,6 +82,10 @@ table() {
   echo "### default threads ($NT)"
   echo
   table $NT 0 $NT
+  echo
+  echo "### SIMD tiers (av1-rs default build, 1 thread)"
+  echo
+  tiers
 } > "$REP/summary.md"
 [ -s "$REP/failures.txt" ] && { echo; echo "WARNING: a command failed, its times are not meaningful:"; sed 's/^/    /' "$REP/failures.txt"; } >> "$REP/summary.md"
 cat "$REP/summary.md"
