@@ -1,0 +1,3 @@
+libavif__alpha_noispe.avif
+libavif__color_grid_alpha_grid_shared_tiles.avif
+libavif__sofa_grid1x5_420_dimg_repeat.avif
