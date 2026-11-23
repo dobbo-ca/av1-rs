@@ -13,6 +13,10 @@
 //! transform block, and its chroma derives it from `UVMode`.
 //!
 //! Entry point: `TileDecoder::residual( )`, called by `decode_block` after the mode info.
+//!
+//! The padded levels array behind the `coeff_base` and `coeff_br` contexts is ported from
+//! dav1d's `src/recon_tmpl.c` (`decode_coefs`; Copyright 2018-2019, VideoLAN and dav1d authors,
+//! Copyright 2018-2019, Two Orioles, LLC; BSD-2-Clause, see NOTICE and docs/dependencies.md).
 
 use crate::consts::*;
 use crate::error::Error;
@@ -242,16 +246,24 @@ const COEFF_BASE_CTX_OFFSET: [[[u8; 5]; 5]; TX_SIZES_ALL] = [
     ],
 ];
 
-/// Largest `Quant[ ]` array (spec 5.11.39: `Min( 1024, w * h )`).
-const QUANT_LEN: usize = 1024;
+/// Largest `Quant[ ]` array (spec 5.11.39: `Min( 1024, w * h )`). `TileDecoder::quant` is
+/// laid out `Quant[ i * tw + j ]`, `tw = Min( 32, w )`.
+pub(crate) const QUANT_LEN: usize = 1024;
+
+/// Zero columns right of, and zero rows below, the levels of a transform block in
+/// `TileDecoder::levels` (dav1d's approach): the largest offset of `Sig_Ref_Diff_Offset`
+/// (spec 9.3), so the context reads of `coeff_base_ctx` and `coeff_br_ctx` stay inside the
+/// padded block and read zero where the spec skips a position outside the block.
+const TX_PAD: usize = 4;
+
+/// The padded levels of the largest coded area (32x32).
+pub(crate) const LEVELS_LEN: usize = (32 + TX_PAD) * (32 + TX_PAD);
 
 /// `SegQMLevel` value that disables the quantizer matrix (`NUM_QM_LEVELS - 1`).
 const QM_LEVEL_FLAT: usize = 15;
 
 /// Values that live across the transform blocks of one `residual( )` call.
 struct ResidualScratch {
-    /// `Quant[ ]`, laid out `Quant[ i * tw + j ]`, `tw = Min( 32, w )`.
-    quant: [i32; QUANT_LEN],
     /// `MaxLumaW` and `MaxLumaH` (spec 5.11.35).
     max_luma_w: usize,
     max_luma_h: usize,
@@ -298,22 +310,21 @@ fn coeff_base_eob_ctx(tx_sz: usize, c: usize) -> usize {
 }
 
 /// `get_coeff_base_ctx( txSz, plane, x4, y4, pos, c, 0 )` (spec 9.3, `coeff_base`) for a
-/// transform class `tx_class`. `quant` holds the levels decoded so far.
-fn coeff_base_ctx(quant: &[i32], tx_sz: usize, tx_class: usize, pos: usize) -> usize {
-    let adj = ADJUSTED_TX_SIZE[tx_sz];
-    let bwl = TX_WIDTH_LOG2[adj];
-    let width = 1usize << bwl;
-    let height = TX_HEIGHT[adj];
-    let row = pos >> bwl;
-    let col = pos - (row << bwl);
-    let mut mag = 0usize;
-    for off in &SIG_REF_DIFF_OFFSET[tx_class] {
-        let ref_row = row + off[0];
-        let ref_col = col + off[1];
-        if ref_row < height && ref_col < width {
-            mag += quant[(ref_row << bwl) + ref_col].unsigned_abs().min(3) as usize;
-        }
-    }
+/// transform class `tx_class` at (`row`, `col`). `levels` holds the levels decoded so far,
+/// padded (row stride `stride`, see [`TX_PAD`]).
+fn coeff_base_ctx(
+    levels: &[u8],
+    stride: usize,
+    tx_sz: usize,
+    tx_class: usize,
+    row: usize,
+    col: usize,
+) -> usize {
+    let i = row * stride + col;
+    let mag: usize = SIG_REF_DIFF_OFFSET[tx_class]
+        .iter()
+        .map(|off| usize::from(levels[i + off[0] * stride + off[1]].min(3)))
+        .sum();
     let ctx = ((mag + 1) >> 1).min(4);
     if tx_class == TX_CLASS_2D {
         if row == 0 && col == 0 {
@@ -325,25 +336,21 @@ fn coeff_base_ctx(quant: &[i32], tx_sz: usize, tx_class: usize, pos: usize) -> u
     ctx + COEFF_BASE_POS_CTX_OFFSET[idx.min(2)]
 }
 
-/// The `ctx` of `coeff_br` (spec 9.3).
-fn coeff_br_ctx(quant: &[i32], tx_sz: usize, tx_class: usize, pos: usize) -> usize {
-    let adj = ADJUSTED_TX_SIZE[tx_sz];
-    let bwl = TX_WIDTH_LOG2[adj];
-    let txw = TX_WIDTH[adj];
-    let txh = TX_HEIGHT[adj];
-    let row = pos >> bwl;
-    let col = pos - (row << bwl);
-    let mut mag = 0usize;
-    for off in &MAG_REF_OFFSET_WITH_TX_CLASS[tx_class] {
-        let ref_row = row + off[0];
-        let ref_col = col + off[1];
-        if ref_row < txh && ref_col < (1 << bwl) {
-            mag += quant[ref_row * txw + ref_col]
-                .min((COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1) as i32) as usize;
-        }
-    }
+/// The `ctx` of `coeff_br` (spec 9.3) at (`row`, `col`), from the padded `levels` as for
+/// [`coeff_base_ctx`].
+fn coeff_br_ctx(levels: &[u8], stride: usize, tx_class: usize, row: usize, col: usize) -> usize {
+    let i = row * stride + col;
+    let mag: usize = MAG_REF_OFFSET_WITH_TX_CLASS[tx_class]
+        .iter()
+        .map(|off| {
+            usize::from(
+                levels[i + off[0] * stride + off[1]]
+                    .min((COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1) as u8),
+            )
+        })
+        .sum();
     let mag = ((mag + 1) >> 1).min(6);
-    if pos == 0 {
+    if row == 0 && col == 0 {
         mag
     } else if tx_class == TX_CLASS_2D {
         if row < 2 && col < 2 {
@@ -392,7 +399,6 @@ impl TileDecoder<'_> {
             }
         }
         let mut s = ResidualScratch {
-            quant: [0; QUANT_LEN],
             max_luma_w: 0,
             max_luma_h: 0,
         };
@@ -651,9 +657,9 @@ impl TileDecoder<'_> {
         }
 
         if !self.skip {
-            let (eob, plane_tx_type) = self.coeffs(plane, start_x, start_y, tx_sz, &mut s.quant)?;
+            let (eob, plane_tx_type) = self.coeffs(plane, start_x, start_y, tx_sz)?;
             if eob > 0 {
-                self.reconstruct_block(plane, start_x, start_y, tx_sz, plane_tx_type, &s.quant);
+                self.reconstruct_block(plane, start_x, start_y, tx_sz, plane_tx_type);
             }
         }
 
@@ -680,7 +686,7 @@ impl TileDecoder<'_> {
     }
 
     /// The call of the reconstruction process (spec 7.12.3) with `get_dc_quant( plane )` and
-    /// `get_ac_quant( plane )` (spec 7.12.2).
+    /// `get_ac_quant( plane )` (spec 7.12.2), on `self.quant`.
     fn reconstruct_block(
         &mut self,
         plane: usize,
@@ -688,7 +694,6 @@ impl TileDecoder<'_> {
         start_y: usize,
         tx_sz: usize,
         plane_tx_type: usize,
-        quant: &[i32; QUANT_LEN],
     ) {
         let fh = self.fh;
         let bit_depth = u32::from(self.seq.bit_depth);
@@ -720,7 +725,7 @@ impl TileDecoder<'_> {
             start_x,
             start_y,
             &p,
-            quant,
+            &self.quant[..],
             &mut self.itx,
             crate::simd::best(),
         );
@@ -1019,8 +1024,8 @@ impl TileDecoder<'_> {
         }
     }
 
-    /// Spec 5.11.39 `coeffs( plane, startX, startY, txSz )`: fills `quant` (the spec's `Quant[ ]`)
-    /// and the above / left level and dc contexts. Returns `eob` and `PlaneTxType`.
+    /// Spec 5.11.39 `coeffs( plane, startX, startY, txSz )`: fills `self.quant` (the spec's
+    /// `Quant[ ]`) and the above / left level and dc contexts. Returns `eob` and `PlaneTxType`.
     ///
     /// # Errors
     /// `Invalid` when `golomb_length_bit` is 0 at `length` 20 (spec 6.10.35 conformance).
@@ -1030,7 +1035,6 @@ impl TileDecoder<'_> {
         start_x: usize,
         start_y: usize,
         tx_sz: usize,
-        quant: &mut [i32; QUANT_LEN],
     ) -> Result<(usize, usize), Error> {
         let x4 = start_x >> 2;
         let y4 = start_y >> 2;
@@ -1038,12 +1042,6 @@ impl TileDecoder<'_> {
         let h4 = TX_HEIGHT[tx_sz] >> 2;
         let tx_sz_ctx = (TX_SIZE_SQR[tx_sz] + TX_SIZE_SQR_UP[tx_sz] + 1) >> 1;
         let ptype = usize::from(plane > 0);
-        let seg_eob = if tx_sz == TX_16X64 || tx_sz == TX_64X16 {
-            512
-        } else {
-            (TX_WIDTH[tx_sz] * TX_HEIGHT[tx_sz]).min(QUANT_LEN)
-        };
-        quant[..seg_eob].fill(0);
 
         let mut eob = 0usize;
         let mut cul_level = 0u32;
@@ -1108,20 +1106,36 @@ impl TileDecoder<'_> {
                 }
             }
 
+            // Quant[ ] is only read by the reconstruction of a block with eob > 0, so it is
+            // cleared only here.
+            let seg_eob = if tx_sz == TX_16X64 || tx_sz == TX_64X16 {
+                512
+            } else {
+                (TX_WIDTH[tx_sz] * TX_HEIGHT[tx_sz]).min(QUANT_LEN)
+            };
+            self.quant[..seg_eob].fill(0);
+            // The coded area, as `Quant[ ]` is laid out, with TX_PAD zero columns and rows.
+            let adj = ADJUSTED_TX_SIZE[tx_sz];
+            let bwl = TX_WIDTH_LOG2[adj];
+            let stride = (1 << bwl) + TX_PAD;
+            self.levels[..(TX_HEIGHT[adj] + TX_PAD) * stride].fill(0);
+
             for c in (0..eob).rev() {
                 let pos = usize::from(*scan.get(c).ok_or(Error::Invalid("eob beyond the scan"))?);
+                let row = pos >> bwl;
+                let col = pos - (row << bwl);
                 let mut level = if c == eob - 1 {
                     let ctx = coeff_base_eob_ctx(tx_sz, c);
                     self.sd
                         .read_symbol(&mut self.cdf.coeff_base_eob_cdf[tx_sz_ctx][ptype][ctx])
                         + 1
                 } else {
-                    let ctx = coeff_base_ctx(&quant[..], tx_sz, tx_class, pos);
+                    let ctx = coeff_base_ctx(&self.levels[..], stride, tx_sz, tx_class, row, col);
                     self.sd
                         .read_symbol(&mut self.cdf.coeff_base_cdf[tx_sz_ctx][ptype][ctx])
                 };
                 if level > NUM_BASE_LEVELS {
-                    let ctx = coeff_br_ctx(&quant[..], tx_sz, tx_class, pos);
+                    let ctx = coeff_br_ctx(&self.levels[..], stride, tx_class, row, col);
                     let br_cdf: &mut [u16] =
                         &mut self.cdf.coeff_br_cdf[tx_sz_ctx.min(TX_32X32)][ptype][ctx];
                     for _ in 0..COEFF_BASE_RANGE / (BR_CDF_SIZE - 1) {
@@ -1132,13 +1146,15 @@ impl TileDecoder<'_> {
                         }
                     }
                 }
-                quant[pos] = level as i32;
+                // At most NUM_BASE_LEVELS + 1 + COEFF_BASE_RANGE = 15.
+                self.levels[row * stride + col] = level as u8;
             }
 
             for c in 0..eob {
                 let pos = usize::from(scan[c]);
+                let mut q = i32::from(self.levels[pos + (pos >> bwl) * TX_PAD]);
                 let mut sign = false;
-                if quant[pos] != 0 {
+                if q != 0 {
                     if c == 0 {
                         let ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
                         sign = self.sd.read_symbol(&mut self.cdf.dc_sign_cdf[ptype][ctx]) != 0;
@@ -1146,7 +1162,7 @@ impl TileDecoder<'_> {
                         sign = self.sd.read_literal(1) != 0;
                     }
                 }
-                if quant[pos] > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
+                if q > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
                     let mut length = 0;
                     loop {
                         length += 1;
@@ -1161,16 +1177,14 @@ impl TileDecoder<'_> {
                     for _ in 0..length - 1 {
                         x = (x << 1) | self.sd.read_literal(1) as i32;
                     }
-                    quant[pos] = x + (COEFF_BASE_RANGE + NUM_BASE_LEVELS) as i32;
+                    q = x + (COEFF_BASE_RANGE + NUM_BASE_LEVELS) as i32;
                 }
-                if pos == 0 && quant[pos] > 0 {
+                if pos == 0 && q > 0 {
                     dc_category = if sign { 1 } else { 2 };
                 }
-                quant[pos] &= 0xFFFFF;
-                cul_level += quant[pos] as u32;
-                if sign {
-                    quant[pos] = -quant[pos];
-                }
+                q &= 0xFFFFF;
+                cul_level += q as u32;
+                self.quant[pos] = if sign { -q } else { q };
             }
             cul_level = cul_level.min(63);
         }
@@ -1187,6 +1201,112 @@ impl TileDecoder<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The bounds-checked contexts that the padded-levels ones replaced: the oracle.
+    /// `get_coeff_base_ctx( txSz, plane, x4, y4, pos, c, 0 )` (spec 9.3, `coeff_base`) for a
+    /// transform class `tx_class`. `quant` holds the levels decoded so far.
+    fn coeff_base_ctx_oracle(quant: &[i32], tx_sz: usize, tx_class: usize, pos: usize) -> usize {
+        let adj = ADJUSTED_TX_SIZE[tx_sz];
+        let bwl = TX_WIDTH_LOG2[adj];
+        let width = 1usize << bwl;
+        let height = TX_HEIGHT[adj];
+        let row = pos >> bwl;
+        let col = pos - (row << bwl);
+        let mut mag = 0usize;
+        for off in &SIG_REF_DIFF_OFFSET[tx_class] {
+            let ref_row = row + off[0];
+            let ref_col = col + off[1];
+            if ref_row < height && ref_col < width {
+                mag += quant[(ref_row << bwl) + ref_col].unsigned_abs().min(3) as usize;
+            }
+        }
+        let ctx = ((mag + 1) >> 1).min(4);
+        if tx_class == TX_CLASS_2D {
+            if row == 0 && col == 0 {
+                return 0;
+            }
+            return ctx + usize::from(COEFF_BASE_CTX_OFFSET[tx_sz][row.min(4)][col.min(4)]);
+        }
+        let idx = if tx_class == TX_CLASS_VERT { row } else { col };
+        ctx + COEFF_BASE_POS_CTX_OFFSET[idx.min(2)]
+    }
+
+    /// The `ctx` of `coeff_br` (spec 9.3).
+    fn coeff_br_ctx_oracle(quant: &[i32], tx_sz: usize, tx_class: usize, pos: usize) -> usize {
+        let adj = ADJUSTED_TX_SIZE[tx_sz];
+        let bwl = TX_WIDTH_LOG2[adj];
+        let txw = TX_WIDTH[adj];
+        let txh = TX_HEIGHT[adj];
+        let row = pos >> bwl;
+        let col = pos - (row << bwl);
+        let mut mag = 0usize;
+        for off in &MAG_REF_OFFSET_WITH_TX_CLASS[tx_class] {
+            let ref_row = row + off[0];
+            let ref_col = col + off[1];
+            if ref_row < txh && ref_col < (1 << bwl) {
+                mag += quant[ref_row * txw + ref_col]
+                    .min((COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1) as i32)
+                    as usize;
+            }
+        }
+        let mag = ((mag + 1) >> 1).min(6);
+        if pos == 0 {
+            mag
+        } else if tx_class == TX_CLASS_2D {
+            if row < 2 && col < 2 {
+                mag + 7
+            } else {
+                mag + 14
+            }
+        } else if tx_class == TX_CLASS_HORIZ {
+            if col == 0 { mag + 7 } else { mag + 14 }
+        } else if row == 0 {
+            mag + 7
+        } else {
+            mag + 14
+        }
+    }
+
+    /// The padded-levels contexts equal these bounds-checked ones on random levels (0..=15),
+    /// for every transform size and class and every position.
+    #[test]
+    fn padded_contexts_match_the_oracle() {
+        let mut rng = crate::symbol::XorShift(11);
+        for tx_sz in 0..TX_SIZES_ALL {
+            let adj = ADJUSTED_TX_SIZE[tx_sz];
+            let bwl = TX_WIDTH_LOG2[adj];
+            let (w, h) = (1usize << bwl, TX_HEIGHT[adj]);
+            let stride = w + TX_PAD;
+            for tx_class in [TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT] {
+                for _ in 0..4 {
+                    let mut q = [0i32; QUANT_LEN];
+                    let mut levels = [0u8; LEVELS_LEN];
+                    for pos in 0..w * h {
+                        let v = match rng.next_u32() % 4 {
+                            0 => 0,
+                            1 => 15,
+                            _ => rng.next_u32() % 16,
+                        };
+                        q[pos] = v as i32;
+                        levels[(pos >> bwl) * stride + (pos & (w - 1))] = v as u8;
+                    }
+                    for pos in 0..w * h {
+                        let (row, col) = (pos >> bwl, pos & (w - 1));
+                        assert_eq!(
+                            coeff_base_ctx(&levels, stride, tx_sz, tx_class, row, col),
+                            coeff_base_ctx_oracle(&q, tx_sz, tx_class, pos),
+                            "tx_sz {tx_sz} class {tx_class} pos {pos}"
+                        );
+                        assert_eq!(
+                            coeff_br_ctx(&levels, stride, tx_class, row, col),
+                            coeff_br_ctx_oracle(&q, tx_sz, tx_class, pos),
+                            "tx_sz {tx_sz} class {tx_class} pos {pos}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn tx_class_of_the_1d_types() {
@@ -1211,17 +1331,17 @@ mod tests {
         let mut q = [0i32; QUANT_LEN];
         // DC position is always context 0.
         q[1] = 3;
-        assert_eq!(coeff_base_ctx(&q, TX_4X4, TX_CLASS_2D, 0), 0);
+        assert_eq!(coeff_base_ctx_oracle(&q, TX_4X4, TX_CLASS_2D, 0), 0);
         // pos 1 (row 0, col 1): neighbours (0,2) (1,1)... all zero, offset 1.
-        assert_eq!(coeff_base_ctx(&q, TX_4X4, TX_CLASS_2D, 1), 1);
+        assert_eq!(coeff_base_ctx_oracle(&q, TX_4X4, TX_CLASS_2D, 1), 1);
         // pos 5 (row 1, col 1): neighbours 6 and 9 hold 3 and 1: mag 4, ctx 2, offset 6.
         q[6] = 3;
         q[9] = 1;
-        assert_eq!(coeff_base_ctx(&q, TX_4X4, TX_CLASS_2D, 5), 8);
+        assert_eq!(coeff_base_ctx_oracle(&q, TX_4X4, TX_CLASS_2D, 5), 8);
         // Horizontal class, pos 1 (col 1): offset SIG_COEF_CONTEXTS_2D + 5 plus the (0,2) etc.
         // neighbours: (0,2) = q[2] = 0, (1,1) = q[5] = 0, (0,3) .. all zero.
         assert_eq!(
-            coeff_base_ctx(&q, TX_4X4, TX_CLASS_HORIZ, 1),
+            coeff_base_ctx_oracle(&q, TX_4X4, TX_CLASS_HORIZ, 1),
             SIG_COEF_CONTEXTS_2D + 5
         );
     }
@@ -1232,11 +1352,11 @@ mod tests {
         q[1] = 40;
         q[4] = 2;
         // DC: mag = min(40, 15) + 2 = 17, (17 + 1) >> 1 = 9, capped at 6.
-        assert_eq!(coeff_br_ctx(&q, TX_4X4, TX_CLASS_2D, 0), 6);
+        assert_eq!(coeff_br_ctx_oracle(&q, TX_4X4, TX_CLASS_2D, 0), 6);
         // pos 1 is in the 2x2 corner: mag from (1,1), (2,0)... all zero except none: 0 + 7.
-        assert_eq!(coeff_br_ctx(&q, TX_4X4, TX_CLASS_2D, 1), 7);
+        assert_eq!(coeff_br_ctx_oracle(&q, TX_4X4, TX_CLASS_2D, 1), 7);
         // pos 10 (row 2, col 2) outside the corner: 14.
-        assert_eq!(coeff_br_ctx(&q, TX_4X4, TX_CLASS_2D, 10), 14);
+        assert_eq!(coeff_br_ctx_oracle(&q, TX_4X4, TX_CLASS_2D, 10), 14);
     }
 
     #[test]

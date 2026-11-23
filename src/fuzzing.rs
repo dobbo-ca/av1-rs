@@ -268,3 +268,40 @@ pub fn itx(data: &[u8]) {
 pub fn threads(data: &[u8]) {
     crate::decoder::check_threads(data, &[2, 3]);
 }
+
+/// `simd_entropy`: the symbol reader against the spec's bit by bit reader
+/// (`symbol::oracle`), with the CDF adaptation of every tier, and the CDF adaptation of every
+/// tier against scalar on rows of any values. The first 8 bytes seed the reads and the CDFs
+/// (bit 0: CDF updates disabled); the rest is the tile data and the rows.
+pub fn entropy(data: &[u8]) {
+    use crate::symbol::{adapt_cdf, check_against_oracle};
+    // The codec seeds are large; 4 KiB of tile data is plenty and keeps each run short.
+    let data = &data[..data.len().min(8 + 4096)];
+    let (seed, stream) = data.split_at(data.len().min(8));
+    let mut s = [0u8; 8];
+    s[..seed.len()].copy_from_slice(seed);
+    let seed = u64::from_le_bytes(s);
+    for &simd in &crate::simd::available() {
+        check_against_oracle(stream, seed & 1 != 0, seed, 64 + 16 * stream.len(), simd);
+    }
+    let values: Vec<u16> = stream
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&b| u16::from_le_bytes(b))
+        .collect();
+    for len in 3..=17 {
+        let Some(row) = values.get(..len) else {
+            break;
+        };
+        for sym in 0..len {
+            let mut want = row.to_vec();
+            adapt_cdf(&mut want, sym);
+            for &simd in &crate::simd::available() {
+                let mut got = row.to_vec();
+                crate::simd::entropy::adapt_cdf(simd, &mut got, sym);
+                assert_eq!(got, want, "{:?} len {len} sym {sym}", simd.tier());
+            }
+        }
+    }
+}

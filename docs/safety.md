@@ -57,6 +57,7 @@ Production code passes `simd::best()`; tests loop over `simd::available()`.
 | `cdef` | `cdef::cdef_direction`, `cdef::cdef_filter` | `direction` (7.15.2, one 8x8 luma block), `filter` (7.15.3, one 8x8, 4x4, 4x8 or 8x4 block), 8/10/12-bit. The filter copies the block and a 2-sample border into a padded 16-bit block with the sentinel `0x8000` for unavailable taps (dav1d's design, see NOTICE), so the kernel has no per-tap check. The dispatch takes the oracle for a block whose premises do not hold (block not fully inside `MiRows` x `MiCols`, a sample of 4096 or more, strengths above 255, a plane too short); decoded frames always meet them (`MiRows` and `MiCols` are even, samples fit the bit depth) | AVX2 (16 lanes), NEON (8 lanes); AVX-512 runs the AVX2 kernels |
 | `ipred` | `src/predict.rs` | Paeth; Smooth, Smooth_V, Smooth_H; directional zone 1 without upsampling; intra edge filter; palette (rows of 8); CFL alpha step | AVX2 (8 x i32), NEON (4 x i32); AVX-512 runs the AVX2 kernels |
 | `itx` | `transform::inverse_transform_add` | 2D inverse transform + add/clip into the samples: DCT 4..64, ADST 4/8/16, identity 4..32, flips, rect scaling, row/column shifts and clamps | AVX2 (8 x i32), NEON (4 x i32); AVX-512 runs the AVX2 kernel (the 16-lane kernel was dropped, see below) |
+| `entropy` | `symbol::adapt_cdf` | `adapt_cdf`: the CDF update of `read_symbol` for 4 to 16 symbols | AVX2, NEON; AVX-512 runs the AVX2 kernel (at most 16 lanes of `u16`, nothing for wider vectors to do) |
 
 Tiers not written:
 
@@ -100,6 +101,12 @@ per-tier vector primitives, written from the spec code (not ported from dav1d).
   (there is no arithmetic of its own: it calls the scalar filters, or whatever tier their own
   families dispatch to, on bands), and it has no `unsafe`. Its "cross-tier" checks compare
   thread counts instead: the unit tests in `decoder.rs` and the fuzz target `simd_threads`.
+
+`entropy` also holds the scalar symbol reader (`src/symbol.rs`, after dav1d's msac: a 64-bit
+window, renormalisation by `leading_zeros`, a branchless symbol search) and the padded levels
+of the coefficient contexts (`src/coef.rs`); neither has a SIMD tier (the reader is serial, one
+symbol at a time). The spec's bit by bit reader stays as `symbol::oracle` (tests and the
+`simd_entropy` fuzz target only).
 
 ## Kernels kept and dropped
 
