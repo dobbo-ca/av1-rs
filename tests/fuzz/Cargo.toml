@@ -34,3 +34,10 @@ path = "fuzz_targets/avif.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "simd_lf"
+path = "fuzz_targets/simd_lf.rs"
+test = false
+doc = false
+bench = false
