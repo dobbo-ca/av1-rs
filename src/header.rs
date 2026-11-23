@@ -256,9 +256,11 @@ impl RefState {
 
     /// The effect of a shown key frame through `show_existing_frame` (the reference frame
     /// loading process of 7.21 followed by the update process with `refresh_frame_flags` equal to
-    /// all frames): every slot becomes a copy of slot `idx`. `idx` is below `NUM_REF_FRAMES`.
+    /// all frames): every slot becomes a copy of slot `idx`, not showable again (spec 6.8.2: a key
+    /// frame is shown through `show_existing_frame` at most once). `idx` is below `NUM_REF_FRAMES`.
     pub(crate) fn refresh_all_from(&mut self, idx: usize) {
-        let src = self.slots[idx].clone();
+        let mut src = self.slots[idx].clone();
+        src.ref_showable_frame = false;
         for slot in self.slots.iter_mut() {
             *slot = src.clone();
         }
@@ -1368,6 +1370,25 @@ pub(crate) mod tests {
         assert!(h.show_existing_frame);
         assert_eq!(h.frame_to_show_map_idx, 2);
         assert_eq!(h.refresh_frame_flags, 0xff);
+    }
+
+    #[test]
+    fn a_key_frame_is_shown_through_show_existing_frame_once() {
+        let mut s = seq(false);
+        s.reduced_still_picture_header = false;
+        let mut w = BitWriter::default();
+        w.put(1, 1); // show_existing_frame
+        w.put(3, 2); // frame_to_show_map_idx
+        let mut refs = RefState::default();
+        refs.slots[2].ref_valid = true;
+        refs.slots[2].ref_showable_frame = true;
+        refs.slots[2].ref_frame_type = KEY_FRAME;
+        let mut r = BitReader::new(&w.bytes);
+        assert!(FrameHeader::parse(&mut r, &s, &mut refs, 0, 0).is_ok());
+        refs.refresh_all_from(2);
+        assert!(refs.slots.iter().all(|slot| !slot.ref_showable_frame));
+        let mut r = BitReader::new(&w.bytes);
+        assert!(FrameHeader::parse(&mut r, &s, &mut refs, 0, 0).is_err());
     }
 
     #[test]

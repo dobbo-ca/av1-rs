@@ -1,0 +1,7 @@
+av1-avif__Link-U__kimono.crop.avif
+av1-avif__Link-U__kimono.mirror-vertical.rotate270.crop.avif
+libavif__alpha_noispe.avif
+libavif__color_grid_alpha_grid_shared_tiles.avif
+libavif__colors-animated-8bpc-audio.avif
+libavif__draw_points_idat_metasize0.avif
+libavif__sofa_grid1x5_420_dimg_repeat.avif

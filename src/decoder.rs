@@ -188,6 +188,8 @@ impl Decoder {
         format: Format,
         cancel: &AtomicBool,
     ) -> Result<Vec<Frame>, Error> {
+        // Tile ranges are offsets into one call's `data`: a frame cannot continue in the next call.
+        self.pending = None;
         self.ready.clear();
         self.release_ready();
         self.metadata.clear();
@@ -326,7 +328,7 @@ impl Decoder {
             if is_frame {
                 return Err(Error::Invalid("show_existing_frame in a frame OBU"));
             }
-            return self.show_existing(h);
+            return self.show_existing(h, cancel);
         }
         self.check_limits(&h)?;
         if self.probe_only {
@@ -364,7 +366,7 @@ impl Decoder {
 
     /// A `show_existing_frame` header: outputs the frame in the slot and, for a key frame, runs
     /// the reference frame loading and update processes (7.21, 7.20), which copy it to every slot.
-    fn show_existing(&mut self, h: FrameHeader) -> Result<(), Error> {
+    fn show_existing(&mut self, h: FrameHeader, cancel: &AtomicBool) -> Result<(), Error> {
         let idx = h.frame_to_show_map_idx;
         let s = Shown::of_slot(&self.refs.slots[idx]);
         if self.probe_only {
@@ -374,7 +376,7 @@ impl Decoder {
             let planes = self.store[idx].clone().ok_or(Error::Invalid(
                 "show_existing_frame of a slot without a decoded frame",
             ))?;
-            let frame = self.make_frame(&s, &h, &planes)?;
+            let frame = self.make_frame(&s, &h, &planes, cancel)?;
             self.ready.push(frame);
         }
         if h.frame_type == KEY_FRAME {
@@ -443,7 +445,7 @@ impl Decoder {
             && let Some(planes) = &stored
         {
             let s = Shown::of_header(&h, &seq);
-            let frame = self.make_frame(&s, &h, planes)?;
+            let frame = self.make_frame(&s, &h, planes, cancel)?;
             self.ready.push(frame);
         }
         Ok(())
@@ -523,6 +525,7 @@ impl Decoder {
         s: &Shown,
         h: &FrameHeader,
         planes: &[WorkPlane],
+        cancel: &AtomicBool,
     ) -> Result<Frame, Error> {
         let seq = self
             .seq
@@ -573,7 +576,7 @@ impl Decoder {
                 let o0 = it.next().unwrap_or_default();
                 let o1 = it.next().unwrap_or_default();
                 let o2 = it.next().unwrap_or_default();
-                apply_film_grain(&h.film_grain, &input, [o0, o1, o2], &self.ledger)?;
+                apply_film_grain(&h.film_grain, &input, [o0, o1, o2], &self.ledger, cancel)?;
             }
             for (g, p) in grained.iter().zip(planes) {
                 out.push(self.public_plane(g, p.width, p.height, s.bit_depth)?);
@@ -738,8 +741,8 @@ fn exact_planes(fs: &FrameState, src: Option<&[WorkPlane]>) -> Result<Vec<WorkPl
     Ok(out)
 }
 
-/// `Err(Cancelled)` once the flag is set. The wrapup filters check it between stages only.
-fn check_cancel(cancel: &AtomicBool) -> Result<(), Error> {
+/// `Err(Cancelled)` once the flag is set. The wrapup filters and film grain check it per row band.
+pub(crate) fn check_cancel(cancel: &AtomicBool) -> Result<(), Error> {
     if cancel.load(Ordering::Relaxed) {
         return Err(Error::Cancelled);
     }
@@ -755,17 +758,15 @@ fn wrapup(
     h: &FrameHeader,
     cancel: &AtomicBool,
 ) -> Result<Vec<WorkPlane>, Error> {
-    loop_filter_frame(fs, seq, h);
-    check_cancel(cancel)?;
-    let cdef = cdef_alloc(fs, seq, h)?;
-    check_cancel(cancel)?;
+    loop_filter_frame(fs, seq, h, cancel)?;
+    let cdef = cdef_alloc(fs, seq, h, cancel)?;
     let (up_cdef, up_curr) = if h.frame_width != h.upscaled_width {
         let mut up_cdef = exact_planes(fs, None)?;
-        upscale(&cdef, fs, seq, h, &mut up_cdef);
+        upscale(&cdef, fs, seq, h, &mut up_cdef, cancel)?;
         drop(cdef);
         let up_curr = if h.uses_lr {
             let mut p = exact_planes(fs, None)?;
-            upscale(&fs.curr_frame, fs, seq, h, &mut p);
+            upscale(&fs.curr_frame, fs, seq, h, &mut p, cancel)?;
             Some(p)
         } else {
             None
@@ -774,14 +775,13 @@ fn wrapup(
     } else {
         (exact_planes(fs, Some(cdef.as_slice()))?, None)
     };
-    check_cancel(cancel)?;
     if !h.uses_lr {
         return Ok(up_cdef);
     }
     let mut out = exact_planes(fs, Some(up_cdef.as_slice()))?;
     match &up_curr {
-        Some(c) => lr_frame(fs, seq, h, &up_cdef, c, &mut out),
-        None => lr_frame(fs, seq, h, &up_cdef, &fs.curr_frame, &mut out),
+        Some(c) => lr_frame(fs, seq, h, &up_cdef, c, &mut out, cancel)?,
+        None => lr_frame(fs, seq, h, &up_cdef, &fs.curr_frame, &mut out, cancel)?,
     }
     Ok(out)
 }

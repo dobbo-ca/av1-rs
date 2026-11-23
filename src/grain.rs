@@ -6,10 +6,12 @@
 #![allow(dead_code)]
 
 use crate::consts::MC_IDENTITY;
+use crate::decoder::check_cancel;
 use crate::error::Error;
 use crate::header::FilmGrainParams;
 use crate::ledger::Ledger;
 use crate::tables::GAUSSIAN_SEQUENCE;
+use std::sync::atomic::AtomicBool;
 
 /// Frame data the film grain process reads (spec 7.18.3 inputs).
 ///
@@ -227,6 +229,7 @@ pub(crate) fn apply_film_grain(
     input: &GrainInput,
     out: [&mut [u16]; 3],
     ledger: &Ledger,
+    cancel: &AtomicBool,
 ) -> Result<(), Error> {
     let bd = input.bit_depth;
     let grain_center = 128i32 << (bd - 8);
@@ -273,6 +276,7 @@ pub(crate) fn apply_film_grain(
     }
     let mut prev: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for (luma_num, _) in (0..h.div_ceil(2)).step_by(16).enumerate() {
+        check_cancel(cancel)?;
         let mut cur: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         for plane in 0..num_planes {
             cur[plane] = zeros(34 * sw)?;
@@ -500,13 +504,20 @@ mod tests {
         );
         let ledger = Ledger::default();
         ledger.reset(1 << 20, 0).unwrap();
-        apply_film_grain(&p, &input, [&mut oy, &mut ou, &mut ov], &ledger).unwrap();
+        let go = AtomicBool::new(false);
+        apply_film_grain(&p, &input, [&mut oy, &mut ou, &mut ov], &ledger, &go).unwrap();
         let tiny = Ledger::default();
         tiny.reset(crate::ledger::SMALL, 0).unwrap();
         let (mut ty, mut tu, mut tv) = (oy.clone(), ou.clone(), ov.clone());
         assert_eq!(
-            apply_film_grain(&p, &input, [&mut ty, &mut tu, &mut tv], &tiny),
+            apply_film_grain(&p, &input, [&mut ty, &mut tu, &mut tv], &tiny, &go),
             Err(Error::AllocLimit)
+        );
+        // A set cancel flag stops the grain before it writes anything.
+        let stop = AtomicBool::new(true);
+        assert_eq!(
+            apply_film_grain(&p, &input, [&mut ty, &mut tu, &mut tv], &ledger, &stop),
+            Err(Error::Cancelled)
         );
         assert_eq!(oy, y);
         assert_eq!(ou, u);

@@ -5,11 +5,13 @@
 
 use crate::bits::floor_log2;
 use crate::consts::{BLOCK_8X8, BLOCK_64X64, MI_SIZE};
+use crate::decoder::check_cancel;
 use crate::error::Error;
 use crate::frame::{FrameState, Plane};
 use crate::header::FrameHeader;
 use crate::seq::SequenceHeader;
 use crate::tables::NUM_4X4_BLOCKS_WIDE;
+use std::sync::atomic::AtomicBool;
 
 /// `Cdef_Uv_Dir[ subsampling_x ][ subsampling_y ][ yDir ]` (spec 7.15.1).
 const CDEF_UV_DIR: [[[u8; 8]; 2]; 2] = [
@@ -47,7 +49,8 @@ pub(crate) fn cdef_frame(
     seq: &SequenceHeader,
     fh: &FrameHeader,
     out: &mut [Plane],
-) {
+    cancel: &AtomicBool,
+) -> Result<(), Error> {
     let num_planes = usize::from(seq.num_planes)
         .min(fs.curr_frame.len())
         .min(out.len());
@@ -58,7 +61,7 @@ pub(crate) fn cdef_frame(
         }
     }
     if !seq.enable_cdef || fh.coded_lossless || fh.allow_intrabc {
-        return;
+        return Ok(());
     }
     let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
     let (sub_x, sub_y) = (
@@ -71,23 +74,26 @@ pub(crate) fn cdef_frame(
         let (cols, rows) = ((mi_cols * MI_SIZE) >> sx, (mi_rows * MI_SIZE) >> sy);
         for p in [&fs.curr_frame[plane], &out[plane]] {
             if p.stride < cols || p.px.len() < p.stride * rows {
-                return;
+                return Ok(());
             }
         }
         if fs.curr_frame[plane].stride != out[plane].stride {
-            return;
+            return Ok(());
         }
     }
     if !mi_rows.is_multiple_of(2)
         || fs.cdef_idx.len() < mi_rows * mi_cols
         || fs.skips.len() < mi_rows * mi_cols
     {
-        return;
+        return Ok(());
     }
     let step4 = NUM_4X4_BLOCKS_WIDE[BLOCK_8X8];
     let cdef_mask4 = !(NUM_4X4_BLOCKS_WIDE[BLOCK_64X64] - 1);
     let coeff_shift = u32::from(seq.bit_depth).saturating_sub(8);
     for r in (0..mi_rows).step_by(step4) {
+        if r.is_multiple_of(16) {
+            check_cancel(cancel)?;
+        }
         for c in (0..mi_cols).step_by(step4) {
             let idx = fs.cdef_idx[(r & cdef_mask4) * mi_cols + (c & cdef_mask4)];
             // idx -1 (not coded): the block stays the copy.
@@ -161,6 +167,7 @@ pub(crate) fn cdef_frame(
             }
         }
     }
+    Ok(())
 }
 
 /// `CdefFrame` as new planes: allocates planes shaped like `fs.curr_frame` (charged to the
@@ -172,6 +179,7 @@ pub(crate) fn cdef_alloc(
     fs: &FrameState,
     seq: &SequenceHeader,
     fh: &FrameHeader,
+    cancel: &AtomicBool,
 ) -> Result<Vec<Plane>, Error> {
     let mut out = Vec::new();
     out.try_reserve_exact(fs.curr_frame.len())
@@ -181,7 +189,7 @@ pub(crate) fn cdef_alloc(
         q.stride = p.stride;
         out.push(q);
     }
-    cdef_frame(fs, seq, fh, &mut out);
+    cdef_frame(fs, seq, fh, &mut out, cancel)?;
     Ok(out)
 }
 

@@ -10,9 +10,12 @@ use crate::consts::{
     FILTER_BITS, RESTORE_NONE, RESTORE_SGRPROJ, RESTORE_WIENER, SGRPROJ_MTABLE_BITS,
     SGRPROJ_PRJ_BITS, SGRPROJ_RECIP_BITS, SGRPROJ_RST_BITS, SGRPROJ_SGR_BITS,
 };
+use crate::decoder::check_cancel;
+use crate::error::Error;
 use crate::frame::{FrameState, Plane};
 use crate::header::FrameHeader;
 use crate::seq::SequenceHeader;
+use std::sync::atomic::AtomicBool;
 
 /// `Sgr_Params` (spec 7.17.3): `{ r0, e0, r1, e1 }` per `lr_sgr_set`.
 pub(crate) const SGR_PARAMS: [[u8; 4]; 16] = [
@@ -273,7 +276,8 @@ pub(crate) fn lr_frame(
     upscaled_cdef: &[Plane],
     upscaled_curr: &[Plane],
     out: &mut [Plane],
-) {
+    cancel: &AtomicBool,
+) -> Result<(), Error> {
     let bd = usize::from(seq.bit_depth);
     let planes = fs
         .num_planes
@@ -316,6 +320,7 @@ pub(crate) fn lr_frame(
         let (end_x, end_y) = (plane_w - 1, plane_h - 1);
         let mut stripe_num = 0usize;
         loop {
+            check_cancel(cancel)?;
             let start = ((stripe_num * 64) as isize - 8) >> sub_y;
             if start > end_y as isize {
                 break;
@@ -367,6 +372,7 @@ pub(crate) fn lr_frame(
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

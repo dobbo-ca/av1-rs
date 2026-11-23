@@ -206,7 +206,7 @@ fn run_file(
     }
     let units: Result<(Format, Vec<&[u8]>), Error> = match kind {
         Kind::Ivf => ivf_frames(&data).map(|u| (Format::Section5, u)),
-        Kind::Obu(format) => split_temporal_units(&data, format).map(|u| (format, u)),
+        Kind::Obu(format) => split_temporal_units(&data, format, limits).map(|u| (format, u)),
         Kind::Avif => return Ok(()),
     };
     let (format, units) = match units {

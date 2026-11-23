@@ -7,6 +7,7 @@ use crate::Metadata;
 use crate::bits::BitReader;
 use crate::consts::*;
 use crate::error::Error;
+use crate::limits::Limits;
 
 /// `obu_header()` and `obu_extension_header()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +181,78 @@ impl<'a> Iterator for ObuIter<'a> {
         }
     }
 }
+/// The temporal units of a stream, one at a time and without allocating (see
+/// [`split_temporal_units`]). After a framing error the iterator is finished.
+pub(crate) struct TemporalUnits<'a> {
+    data: &'a [u8],
+    format: Format,
+    start: usize,
+    pos: usize,
+    failed: bool,
+}
+
+impl<'a> TemporalUnits<'a> {
+    pub(crate) fn new(data: &'a [u8], format: Format) -> Self {
+        TemporalUnits {
+            data,
+            format,
+            start: 0,
+            pos: 0,
+            failed: false,
+        }
+    }
+
+    fn cut(&mut self) -> Result<Option<&'a [u8]>, Error> {
+        let data = self.data;
+        match self.format {
+            Format::Section5 => {
+                while self.pos < data.len() {
+                    let pos = self.pos;
+                    let (obu, used) = read_obu(&data[pos..], pos, None)?;
+                    self.pos += used;
+                    if obu.header.obu_type == OBU_TEMPORAL_DELIMITER && pos > self.start {
+                        let unit = &data[self.start..pos];
+                        self.start = pos;
+                        return Ok(Some(unit));
+                    }
+                }
+                if self.pos > self.start {
+                    let unit = &data[self.start..self.pos];
+                    self.start = self.pos;
+                    return Ok(Some(unit));
+                }
+                Ok(None)
+            }
+            Format::AnnexB => {
+                if self.pos >= data.len() {
+                    return Ok(None);
+                }
+                let mut r = BitReader::new(&data[self.pos..]);
+                let (size, n) = r.leb128()?;
+                let start = self.pos + n;
+                let end = start
+                    .checked_add(size as usize)
+                    .filter(|&e| e <= data.len())
+                    .ok_or(Error::Truncated)?;
+                self.pos = end;
+                Ok(Some(&data[start..end]))
+            }
+        }
+    }
+}
+
+impl<'a> Iterator for TemporalUnits<'a> {
+    type Item = Result<&'a [u8], Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        let unit = self.cut().transpose();
+        self.failed = matches!(unit, Some(Err(_)));
+        unit
+    }
+}
 
 /// Cuts a whole stream into temporal units. In the low-overhead format a unit starts at each
 /// temporal delimiter OBU (bytes before the first one form a unit of their own); in Annex B a
@@ -189,38 +262,21 @@ impl<'a> Iterator for ObuIter<'a> {
 /// # Errors
 /// `Truncated` or `Invalid` when the framing (OBU sizes, Annex B lengths) is broken. The slices
 /// before the broken part are not returned; the streaming `Decoder` users can split by hand.
-pub fn split_temporal_units(data: &[u8], format: Format) -> Result<Vec<&[u8]>, Error> {
+/// `AllocLimit` when the slice list alone would pass `limits.max_alloc`, `OutOfMemory` when it
+/// cannot be allocated.
+pub fn split_temporal_units<'a>(
+    data: &'a [u8],
+    format: Format,
+    limits: &Limits,
+) -> Result<Vec<&'a [u8]>, Error> {
     let mut units = Vec::new();
-    match format {
-        Format::Section5 => {
-            let mut start = 0;
-            let mut pos = 0;
-            while pos < data.len() {
-                let (obu, used) = read_obu(&data[pos..], pos, None)?;
-                if obu.header.obu_type == OBU_TEMPORAL_DELIMITER && pos > start {
-                    units.push(&data[start..pos]);
-                    start = pos;
-                }
-                pos += used;
-            }
-            if pos > start {
-                units.push(&data[start..pos]);
-            }
+    for unit in TemporalUnits::new(data, format) {
+        let unit = unit?;
+        if (units.len() + 1).saturating_mul(size_of::<&[u8]>()) > limits.max_alloc {
+            return Err(Error::AllocLimit);
         }
-        Format::AnnexB => {
-            let mut pos = 0;
-            while pos < data.len() {
-                let mut r = BitReader::new(&data[pos..]);
-                let (size, n) = r.leb128()?;
-                let start = pos + n;
-                let end = start
-                    .checked_add(size as usize)
-                    .filter(|&e| e <= data.len())
-                    .ok_or(Error::Truncated)?;
-                units.push(&data[start..end]);
-                pos = end;
-            }
-        }
+        units.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+        units.push(unit);
     }
     Ok(units)
 }
@@ -328,7 +384,7 @@ mod tests {
         let mut data = td_and_seq();
         let first = data.len();
         data.extend_from_slice(&[0x12, 0x00, 0x7a, 0x01, 0x80]);
-        let units = split_temporal_units(&data, Format::Section5).unwrap();
+        let units = split_temporal_units(&data, Format::Section5, &Limits::default()).unwrap();
         assert_eq!(units.len(), 2);
         assert_eq!(units[0].len(), first);
         assert_eq!(units[1], &[0x12, 0x00, 0x7a, 0x01, 0x80]);
@@ -341,7 +397,7 @@ mod tests {
         let frame_unit = [1u8, 0x10, 3, 0x78, 0xaa, 0xbb];
         let mut stream = vec![(1 + frame_unit.len()) as u8, frame_unit.len() as u8];
         stream.extend_from_slice(&frame_unit);
-        let units = split_temporal_units(&stream, Format::AnnexB).unwrap();
+        let units = split_temporal_units(&stream, Format::AnnexB, &Limits::default()).unwrap();
         assert_eq!(units.len(), 1);
         let obus: Vec<_> = ObuIter::new(units[0], Format::AnnexB)
             .collect::<Result<_, _>>()

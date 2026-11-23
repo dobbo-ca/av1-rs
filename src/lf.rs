@@ -5,17 +5,25 @@
 //! `loop_filter_mode_deltas` / `modeType` branch of 7.14.5 never applies.
 
 use crate::consts::{INTRA_FRAME, MAX_LOOP_FILTER, MI_SIZE, SEG_LVL_ALT_LF_Y_V};
+use crate::decoder::check_cancel;
+use crate::error::Error;
 use crate::frame::FrameState;
 use crate::header::FrameHeader;
 use crate::seq::SequenceHeader;
 use crate::tables::{BLOCK_HEIGHT, BLOCK_WIDTH, SUBSAMPLED_SIZE, TX_HEIGHT, TX_WIDTH};
+use std::sync::atomic::AtomicBool;
 
 /// Spec 7.14.1 (loop filter process), invoked by `decode_frame_wrapup` (spec 7.4) when
 /// `loop_filter_level[ 0 ]` or `loop_filter_level[ 1 ]` is non-zero; otherwise this returns
 /// without touching the frame.
-pub(crate) fn loop_filter_frame(fs: &mut FrameState, _seq: &SequenceHeader, fh: &FrameHeader) {
+pub(crate) fn loop_filter_frame(
+    fs: &mut FrameState,
+    _seq: &SequenceHeader,
+    fh: &FrameHeader,
+    cancel: &AtomicBool,
+) -> Result<(), Error> {
     if fh.loop_filter_level[0] == 0 && fh.loop_filter_level[1] == 0 {
-        return;
+        return Ok(());
     }
     for plane in 0..fs.num_planes {
         if plane == 0 || fh.loop_filter_level[1 + plane] != 0 {
@@ -26,6 +34,9 @@ pub(crate) fn loop_filter_frame(fs: &mut FrameState, _seq: &SequenceHeader, fh: 
                     (1 << fs.subsampling_y, 1 << fs.subsampling_x)
                 };
                 for row in (0..fs.mi_rows).step_by(row_step) {
+                    if row.is_multiple_of(16) {
+                        check_cancel(cancel)?;
+                    }
                     for col in (0..fs.mi_cols).step_by(col_step) {
                         loop_filter_edge(fs, fh, plane, pass, row, col);
                     }
@@ -33,6 +44,7 @@ pub(crate) fn loop_filter_frame(fs: &mut FrameState, _seq: &SequenceHeader, fh: 
             }
         }
     }
+    Ok(())
 }
 
 /// Spec 7.14.2 (edge loop filter process).
@@ -327,7 +339,7 @@ mod tests {
     fn flat_block_is_unchanged() {
         let (mut fs, fh, seq) = setup(100, 100);
         let before = fs.curr_frame[0].px.clone();
-        loop_filter_frame(&mut fs, &seq, &fh);
+        loop_filter_frame(&mut fs, &seq, &fh, &AtomicBool::new(false)).unwrap();
         assert_eq!(fs.curr_frame[0].px, before);
     }
 
@@ -336,7 +348,7 @@ mod tests {
         // Level 32, sharpness 0: limit 32, blimit 100, thresh 2. For p = 100, q = 108 and no hev:
         // filter = 3 * 8 = 24, filter1 = filter2 = 3, outer taps move by Round2( 3, 1 ) = 2.
         let (mut fs, fh, seq) = setup(100, 108);
-        loop_filter_frame(&mut fs, &seq, &fh);
+        loop_filter_frame(&mut fs, &seq, &fh, &AtomicBool::new(false)).unwrap();
         let stride = fs.curr_frame[0].stride;
         for y in 0..32 {
             let r = &fs.curr_frame[0].px[y * stride + 28..y * stride + 36];

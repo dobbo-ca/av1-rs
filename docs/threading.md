@@ -32,7 +32,9 @@ Errors are deterministic: after a failure at index `k` no item above `k` starts,
 running finish, and every item below `k` still runs, so the error of the lowest failing index is
 returned, and a serial run would have stopped at that same item. (`Cancelled` from the
 cancel flag and `AllocLimit` from the shared ledger depend on timing by nature.) The cancel flag is
-checked before every tile and once per superblock row inside a tile, in every worker.
+checked before every tile and once per superblock row inside a tile, in every worker, and on the
+calling thread once per 64-row band in every wrapup stage (loop filter, CDEF, superres, loop
+restoration) and in film grain.
 
 ## Tile decode and the byte-identity argument
 

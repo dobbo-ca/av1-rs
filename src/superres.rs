@@ -5,9 +5,12 @@ use crate::consts::{
     FILTER_BITS, SUPERRES_EXTRA_BITS, SUPERRES_FILTER_OFFSET, SUPERRES_FILTER_SHIFTS,
     SUPERRES_FILTER_TAPS, SUPERRES_SCALE_BITS, SUPERRES_SCALE_MASK,
 };
+use crate::decoder::check_cancel;
+use crate::error::Error;
 use crate::frame::{FrameState, Plane};
 use crate::header::FrameHeader;
 use crate::seq::SequenceHeader;
+use std::sync::atomic::AtomicBool;
 
 /// `Upscale_Filter` (spec 7.16).
 pub(crate) const UPSCALE_FILTER: [[i32; SUPERRES_FILTER_TAPS]; SUPERRES_FILTER_SHIFTS] = [
@@ -113,7 +116,8 @@ pub(crate) fn upscale(
     seq: &SequenceHeader,
     fh: &FrameHeader,
     out: &mut [Plane],
-) {
+    cancel: &AtomicBool,
+) -> Result<(), Error> {
     let max_val = (1i64 << seq.bit_depth) - 1;
     let planes = fs.num_planes.min(input.len()).min(out.len());
     for plane in 0..planes {
@@ -148,11 +152,15 @@ pub(crate) fn upscale(
         let out_w = (upscaled_plane_w as usize).min(dst.width);
         let rows = plane_h.min(inp.height).min(dst.height);
         for y in 0..rows {
+            if y.is_multiple_of(64) {
+                check_cancel(cancel)?;
+            }
             let src_row = &inp.px[y * inp.stride..y * inp.stride + inp.width];
             let dst_row = &mut dst.px[y * dst.stride..y * dst.stride + out_w];
             upscale_row(src_row, dst_row, initial_subpel_x, step_x, max_x, max_val);
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
