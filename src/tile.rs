@@ -981,11 +981,8 @@ impl<'a> TileDecoder<'a> {
         self.read_delta_qindex();
         self.read_delta_lf();
         self.read_deltas = false;
-        self.use_intrabc = if self.fh.allow_intrabc {
-            self.sd.read_symbol(&mut self.cdf.intrabc_cdf) != 0
-        } else {
-            false
-        };
+        self.use_intrabc =
+            self.fh.allow_intrabc && self.sd.read_symbol(&mut self.cdf.intrabc_cdf) != 0;
         if self.use_intrabc {
             return Err(Error::Unsupported("intrabc"));
         }
@@ -1600,9 +1597,8 @@ impl<'a> TileDecoder<'a> {
             let unit_size = usize::from(self.fh.loop_restoration_size[plane]).max(1);
             let unit_rows = self.fs.lr_unit_rows[plane];
             let unit_cols = self.fs.lr_unit_cols[plane];
-            let unit_row_start = (r * (MI_SIZE >> sub_y) + unit_size - 1) / unit_size;
-            let unit_row_end =
-                unit_rows.min(((r + h) * (MI_SIZE >> sub_y) + unit_size - 1) / unit_size);
+            let unit_row_start = (r * (MI_SIZE >> sub_y)).div_ceil(unit_size);
+            let unit_row_end = unit_rows.min(((r + h) * (MI_SIZE >> sub_y)).div_ceil(unit_size));
             let (numerator, denominator) = if self.fh.use_superres {
                 (
                     (MI_SIZE >> sub_x) * self.fh.superres_denom as usize,
@@ -1611,8 +1607,8 @@ impl<'a> TileDecoder<'a> {
             } else {
                 (MI_SIZE >> sub_x, unit_size)
             };
-            let unit_col_start = (c * numerator + denominator - 1) / denominator;
-            let unit_col_end = unit_cols.min(((c + w) * numerator + denominator - 1) / denominator);
+            let unit_col_start = (c * numerator).div_ceil(denominator);
+            let unit_col_end = unit_cols.min(((c + w) * numerator).div_ceil(denominator));
             for unit_row in unit_row_start..unit_row_end {
                 for unit_col in unit_col_start..unit_col_end {
                     self.read_lr_unit(plane, unit_row, unit_col)?;

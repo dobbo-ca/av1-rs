@@ -92,6 +92,16 @@ OBUs -> seq header -> frame header -> tile groups -> (per tile) blocks:
      -> reference update (7.20) -> output (7.18) [-> film grain, optional]
 ```
 
+Tiles decode serially (`TileDecoder`, one per tile, in tile group order); the frame CDFs are the
+defaults for `base_q_idx` (an intra frame has `primary_ref_frame == NONE`), and the tile CDFs
+the exit process returns are dropped: only a later frame that loads them would need the frame
+end update, and no intra frame does. The wrapup (`decoder.rs`) runs `loop_filter_frame` on
+`CurrFrame` in place, `cdef_alloc` into `CdefFrame`, then, with `use_superres`, `upscale` of
+`CdefFrame` (and of the deblocked `CurrFrame` when `UsesLr`), then `lr_frame`. `LrFrame` is
+allocated exactly `UpscaledWidth` x `FrameHeight` (chroma `(size + ss) >> ss`) and is what the
+reference slots store and the output reads; film grain runs at output on a copy. Intra block
+copy and large scale tile are `Error::Unsupported`.
+
 Frames that are not KEY_FRAME or INTRA_ONLY_FRAME stop the decode with `Error::InterFrame`;
 frames decoded before it are returned by the streaming `Decoder`.
 
