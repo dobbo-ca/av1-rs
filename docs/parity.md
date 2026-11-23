@@ -50,7 +50,7 @@ no Matroska input; dav1d-test-data has the same streams as IVF).
 
 Last green run on `main` (a5cb385, 2026-11-23): 679 inputs, 604 frames; 289 streams and 238 AVIF items bit-exact against dav1d, 518 inputs against aomdec, 236 libaom vectors against the published md5, 133 AVIF files against avifdec; every gate green, `--threads 1` equal to the default threads, aarch64 equal to x86_64 on the subset.
 
-The `parity` job on `main` gates: 289 streams (240 libaom + 49 dav1d-test-data) against dav1d, and against aomdec and the published md5 where those apply, and 151 AVIF files against avifdec and avifdec-new (a file an avifdec cannot decode must be listed in `tests/parity/avifdec-known-failures.txt` or `tests/parity/avifdec-new-known-failures.txt`, and a listed file that decodes fails the gate as a stale entry) plus every coded item against dav1d and aomdec. `run.sh` fails the job if fewer than 289 streams or 151 AVIF files are present, or if fewer than 289 streams, 238 extracted AVIF items, 604 frames, 133 AVIF files against avifdec or 133 against avifdec-new were actually compared (items are counted apart from streams). The avifdec-new floor of 133 is provisional (the floor of avifdec 0.11): raise it to the count of the first green run. The exact counts of compared frames, streams and files are the first lines of the job `summary.md`; the known differences are listed below. Pin the floors in `run.sh` from the latest green run.
+The `parity` job on `main` gates: 289 streams (240 libaom + 49 dav1d-test-data) against dav1d, and against aomdec and the published md5 where those apply, and 151 AVIF files against avifdec and avifdec-new (a file an avifdec cannot decode must be listed in `tests/parity/avifdec-known-failures.txt` or `tests/parity/avifdec-new-known-failures.txt`, and a listed file that decodes fails the gate as a stale entry) plus every coded item against dav1d and aomdec. `run.sh` fails the job if fewer than 289 streams or 151 AVIF files are present, or if fewer than 289 streams, 238 extracted AVIF items, 604 frames, 133 AVIF files against avifdec or 134 against avifdec-new were actually compared (items are counted apart from streams). The exact counts of compared frames, streams and files are the first lines of the job `summary.md`; the known differences are listed below. Pin the floors in `run.sh` from the latest green run.
 
 ## Known oracle differences
 
@@ -71,7 +71,13 @@ The `parity` job on `main` gates: 289 streams (240 libaom + 49 dav1d-test-data) 
   `.yuv` followed by `.alpha.yuv`. Files an avifdec refuses and av1-rs decodes are listed in
   `tests/parity/avifdec-known-failures.txt` (0.11.1) and `tests/parity/avifdec-new-known-failures.txt`
   (1.4.2: `alpha_noispe`, refused by libavif's strict mode; `color_grid_alpha_grid_shared_tiles`,
-  a tile shared by two grids; `sofa_grid1x5_420_dimg_repeat`, a tile repeated in one grid).
+  a tile shared by two grids; `sofa_grid1x5_420_dimg_repeat`, a tile repeated in one grid; and
+  `clap_irot_imir_non_essential`, `pyramid_pymd`, `seine_sdr_gainmap_gammazero` and
+  `supported_gainmap_writer_version_with_extra_bytes`, which the corpus pin (libavif main, newer
+  than 1.4.2) has and 1.4.2 refuses; avifdec 0.11.1 decodes and matches them).
+  `color_grid_alpha_nogrid` has its alpha items on the grid tiles, not on the grid: libavif >= 1.0
+  assembles them into an alpha plane, av1-rs (isobmff-rs `Image::alpha`) and avifdec 0.11.1 return
+  none, so against avifdec-new only its color planes are compared.
 - The Xiph AVIF files are layered (`a1lx`, 2 or 3 spatial layers in one item): as with the
   `svc-L2*` streams, av1-rs and dav1d output the base layer and aomdec the top layer, so these
   items are compared with dav1d only. `animated_alpha_sample_without_shown_frame`: the second

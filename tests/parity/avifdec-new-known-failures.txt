@@ -1,3 +1,7 @@
 libavif__alpha_noispe.avif
+libavif__clap_irot_imir_non_essential.avif
 libavif__color_grid_alpha_grid_shared_tiles.avif
+libavif__pyramid_pymd.avif
+libavif__seine_sdr_gainmap_gammazero.avif
 libavif__sofa_grid1x5_420_dimg_repeat.avif
+libavif__supported_gainmap_writer_version_with_extra_bytes.avif
