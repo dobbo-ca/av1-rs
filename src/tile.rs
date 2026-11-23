@@ -646,7 +646,9 @@ impl<'a> TileDecoder<'a> {
         };
         let sub_size = PARTITION_SUBSIZE[partition][b_size];
         let split_size = PARTITION_SUBSIZE[PARTITION_SPLIT][b_size];
-        if sub_size >= BLOCK_SIZES || split_size >= BLOCK_SIZES {
+        // An 8x8 split decodes four BLOCK_4X4 partitions (always PARTITION_NONE): their split
+        // size is BLOCK_INVALID but unused.
+        if sub_size >= BLOCK_SIZES || (partition != PARTITION_NONE && split_size >= BLOCK_SIZES) {
             return Err(Error::Invalid("partition not allowed for this block size"));
         }
         let (h, q) = (half_block4x4, quarter_block4x4);
