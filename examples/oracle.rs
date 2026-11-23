@@ -142,6 +142,15 @@ fn append_planes(yuv: &mut Vec<u8>, f: &Frame) {
     }
 }
 
+/// `<stem>.<ext>`. Not `Path::with_extension`, which would replace a dot part of the stem
+/// (`fox.yuv420` or `x.item1`).
+fn out(stem: &Path, ext: &str) -> PathBuf {
+    let mut s = stem.as_os_str().to_owned();
+    s.push(".");
+    s.push(ext);
+    PathBuf::from(s)
+}
+
 fn write_frames(frames: &[Frame], stem: &Path) -> std::io::Result<()> {
     let mut yuv = Vec::new();
     let mut lines = String::new();
@@ -150,13 +159,13 @@ fn write_frames(frames: &[Frame], stem: &Path) -> std::io::Result<()> {
         let l = layout(f.mono_chrome, f.subsampling_x, f.subsampling_y);
         let _ = writeln!(lines, "{} {} {} {}", f.width, f.height, f.bit_depth, l);
     }
-    fs::write(stem.with_extension("yuv"), yuv)?;
-    fs::write(stem.with_extension("frames"), lines)
+    fs::write(out(stem, "yuv"), yuv)?;
+    fs::write(out(stem, "frames"), lines)
 }
 
 fn write_err(stem: &Path, e: &Error) -> std::io::Result<()> {
-    fs::write(stem.with_extension("why"), e.to_string())?;
-    fs::write(stem.with_extension("err"), e.class())
+    fs::write(out(stem, "why"), e.to_string())?;
+    fs::write(out(stem, "err"), e.class())
 }
 
 /// Decodes or probes one file; only I/O errors are returned, decode errors go to `.err`.
@@ -185,7 +194,7 @@ fn run_file(
                 if let Some(alpha) = &avif.alpha {
                     let mut yuv = Vec::new();
                     append_planes(&mut yuv, alpha);
-                    fs::write(stem.with_extension("alpha.yuv"), yuv)?;
+                    fs::write(out(&stem, "alpha.yuv"), yuv)?;
                 }
                 Ok(())
             }
@@ -204,7 +213,7 @@ fn run_file(
         Ok(u) => u,
         Err(e) => {
             if args.info {
-                fs::write(stem.with_extension("info"), "")?;
+                fs::write(out(&stem, "info"), "")?;
             } else {
                 write_frames(&[], &stem)?;
             }
@@ -237,7 +246,7 @@ fn run_file(
             }
             Err(e) => Some(e),
         };
-        fs::write(stem.with_extension("info"), text)?;
+        fs::write(out(&stem, "info"), text)?;
         return match stopped {
             Some(e) => write_err(&stem, &e),
             None => Ok(()),

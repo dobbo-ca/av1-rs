@@ -94,7 +94,7 @@ full() {
     # The whole AVIF image (grid assembled, before irot/imir/clap) against avifdec (libavif with
     # dav1d); its y4m minus the header and the one FRAME line is the same layout as .yuv.
     case $f in *.avif)
-      avifdec --jobs 1 "$p" $W/avd/$s.y4m >/dev/null 2>&1 || { echo "$f: avifdec failed" >> $W/d-avif; continue; }
+      avifdec --jobs 1 "$p" $W/avd/$s.y4m >/dev/null 2>&1 || { echo "$f" >> "$REP/avifdec-failed.txt"; continue; }
       hl=$(head -n 1 $W/avd/$s.y4m | wc -c)
       tail -c +$((hl + 7)) $W/avd/$s.y4m > $W/avd/$s.yuv
       cmp -s $W/avd/$s.yuv $W/r1/$s.yuv || echo "$f: differs from avifdec: $(mismatch $W/avd/$s.yuv $W/r1/$s.yuv $W/r1/$s.frames)" >> $W/d-avif
@@ -158,6 +158,7 @@ full() {
     else echo "| $g | FAIL, $l lines |" >> "$REP/summary.md"; bad=1; head -n 300 $W/d-$g > "$REP/$g.diff"; fi
   done
   echo >> "$REP/summary.md"
+  [ -f "$REP/avifdec-failed.txt" ] && echo "avifdec (libavif 0.11) could not decode $(wc -l < "$REP/avifdec-failed.txt") AVIF files; av1-rs output for them is checked through their items only (avifdec-failed.txt)." >> "$REP/summary.md"
   echo "Stop classes (av1-rs .err, one thread): $(for e in $W/r1/*.err; do [ -f "$e" ] && printf '%s\n' "$(cat "$e")"; done | sort | uniq -c | tr -s ' \n' ' ')" >> "$REP/summary.md"
   cat "$REP/summary.md"
   return $bad
