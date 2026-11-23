@@ -16,6 +16,7 @@
 pub(crate) mod arm;
 pub(crate) mod grain;
 pub(crate) mod lf;
+pub(crate) mod lr;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86;
 

@@ -30,6 +30,10 @@ temporal unit returns; `decode` keeps every frame it collects charged until it r
 ledger per `decode_avif` call covers every item decoder, the grid canvas, the item copy and the
 primary image (docs/threading.md).
 
+Not charged, because their size does not depend on the input: the loop restoration source window
+(at most 70 x 70 `i32`, one per `lr_frame` call, reused for every block) and the stack buffers
+of the loop restoration SIMD kernels (about 70 KB).
+
 ## Compute is not limited
 
 No limit bounds the work of a call. Tile data past the end of an OBU reads as zeros, so a few

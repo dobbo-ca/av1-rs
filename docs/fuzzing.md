@@ -11,6 +11,7 @@ its temporal units. Seeds: the parity corpus (`run.sh seeds`).
 | `decode` | `Decoder::decode_temporal_unit` on every temporal unit (option bits: Annex B, 2 threads, no film grain) |
 | `simd_lf` | `av1::fuzzing::lf`: one loop filter edge run, every SIMD tier against scalar |
 | `simd_grain` | `av1::fuzzing::grain`: the film grain blend kernels (`simd::grain`), every tier against scalar |
+| `simd_lr` | `av1::fuzzing::lr`: one loop restoration block (bit depth, size, taps, self guided set and weights, window), every tier against scalar |
 
 Each SIMD kernel family adds a cross-tier target `simd_<family>`: it calls
 `av1::fuzzing::<family>` (feature `fuzzing`, enabled only by the fuzz crate), which builds kernel

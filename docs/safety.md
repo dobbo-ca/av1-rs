@@ -53,6 +53,7 @@ Production code passes `simd::best()`; tests loop over `simd::available()`.
 |---|---|---|---|
 | `lf` | `lf::sample_filter` | One run of samples along an edge (7.14.6): masks, narrow filter, 6/8/16 wide filters, vertical and horizontal, 8/10/12-bit; lanes along the edge, the samples across it gathered into a 14-row buffer in safe code | AVX2 (16 lanes), NEON (8 lanes); AVX-512 runs the AVX2 kernel |
 | `grain` | `grain::blend_luma_row`, `grain::blend_chroma_row` | `blend_luma`, `blend_chroma`: the film grain noise blend of one row (scaling lookup, `round2( scale * noise, ScalingShift )`, clip, chroma merge and chroma scaling from luma), 8/10/12-bit, all subsamplings. The scale is looked up in `grain::scale_table` (`scale_lut` at every sample value), so the high bit depth interpolation is exact by construction; the x86 helper `gather256_i32` masks every index to the 4096-entry table before the gather. The grain template generation (auto-regression) and the stripe building stay scalar (once per frame, and a copy) | AVX2 (8 lanes), NEON (4 lanes); AVX-512 runs the AVX2 kernel |
+| `lr` | `lr::wiener_filter`, `lr::self_guided_filter` | `wiener`, `self_guided`: loop restoration of one block of at most 64 x 64 samples inside one stripe, from the source window that `lr::source_window` gathers (stripe edge rules unchanged): the Wiener filter and the self guided filter (box sums r = 1 and r = 2, the a/b computation, the weighted combination). The arithmetic is in 32-bit lanes; the module doc gives the bounds that make it exact. Blocks narrower than one vector use the oracle | AVX2 (8 x i32), NEON (4 x i32); AVX-512 runs the AVX2 kernel |
 
 Tiers not written:
 
@@ -61,6 +62,9 @@ Tiers not written:
   at either width.
 - `grain` AVX-512: the 8-lane gather of the scale bounds the loop, and a 16-lane gather is not
   faster per sample.
+- `lr` AVX-512: a block row is at most 64 samples, so 16-lane vectors would save at most half of
+  the vector ops while the fixed per-block work (window gather, the stack buffers) stays; it is
+  worth writing only if the bench shows loop restoration still high in the profile after AVX2.
 
 ## Kernels kept and dropped
 
