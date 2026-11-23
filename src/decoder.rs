@@ -6,25 +6,25 @@
 #![allow(dead_code)]
 
 use crate::bits::BitReader;
-use crate::cdef::cdef_alloc;
+use crate::cdef::{cdef_alloc, cdef_frame, cdef_on, cdef_planes, cdef_rows};
 use crate::cdf::CdfContext;
 use crate::consts::*;
 use crate::error::Error;
-use crate::frame::{FrameState, Plane as WorkPlane};
+use crate::frame::{FrameState, Plane as WorkPlane, View};
 use crate::grain::{GrainInput, apply_film_grain};
 use crate::header::{FrameHeader, RefInfo, RefState, TileRange, parse_tile_group};
 use crate::ledger::Ledger;
-use crate::lf::loop_filter_frame;
+use crate::lf::{lf_on, lf_plane_on, loop_filter_frame, loop_filter_rows};
 use crate::limits::Limits;
-use crate::lr::lr_frame;
+use crate::lr::{lr_frame, lr_plane, lr_stripe};
 use crate::obu::{Obu, ObuIter, parse_metadata};
-use crate::parallel::run_parallel;
+use crate::parallel::{Team, with_team};
 use crate::seq::SequenceHeader;
-use crate::superres::upscale;
+use crate::superres::{upscale, upscale_rows};
 use crate::tile::TileDecoder;
 use crate::{ColorInfo, Format, Frame, FrameInfo, Metadata, Options, Plane, PlaneData};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// A frame whose header was read and whose tile groups are still coming.
 #[derive(Debug)]
@@ -460,10 +460,10 @@ impl Decoder {
     /// `UpscaledWidth` x `FrameHeight` (chroma subsampled, rounded up) in size.
     ///
     /// `data` is the temporal unit; `tiles` are byte ranges into it, in tile order. `self.state`
-    /// holds the allocated `CurrFrame`. Tiles decode on up to `Limits::max_threads` threads (one
-    /// scope per frame, see docs/threading.md), serially for `max_threads` 1, a single tile or
-    /// an `allow_intrabc` frame; `cancel` is checked before every tile and by every tile once per
-    /// superblock row.
+    /// holds the allocated `CurrFrame`. The tiles and the filters run on up to
+    /// `Limits::max_threads` threads (one scope per frame, see [`decode_frame`] and
+    /// docs/threading.md); `cancel` is checked before every tile, by every tile once per
+    /// superblock row and by every filter item.
     ///
     /// The frame CDFs are the defaults for `base_q_idx` (`primary_ref_frame` is `NONE` in an
     /// intra frame). The tile CDFs the exit process returns are dropped: the frame end update
@@ -484,7 +484,7 @@ impl Decoder {
             .state
             .take()
             .ok_or(Error::Invalid("frame decode without a frame state"))?;
-        let mut fs = decode_tiles(
+        let fs = decode_frame(
             fs,
             &self.ledger,
             self.limits.max_threads,
@@ -494,7 +494,6 @@ impl Decoder {
             tiles,
             cancel,
         )?;
-        fs.lr_frame = wrapup(&mut fs, seq, h, cancel)?;
         self.state = Some(fs);
         Ok(())
     }
@@ -673,17 +672,20 @@ impl Decoder {
     }
 }
 
-/// The tile phase of a frame: `decode_tile()` of every tile of `tiles` into `fs` (spec 5.11.1).
+/// The pixel work of a frame: `decode_tile()` of every tile of `tiles` into `fs` (spec 5.11.1),
+/// then the wrapup of 7.4 (loop filter, CDEF, superres, loop restoration); returns `fs` with
+/// `LrFrame` in `lr_frame`.
 ///
-/// With `max_threads` above 1 and more than one tile, the tiles decode on up to
-/// `min( max_threads, tiles )` threads of one scope (the calling thread is one of them). A worker
-/// decodes a tile into its own tile-sized [`FrameState::new_tile`] state, which the same tile
-/// decode fills as it does the frame state, and merges it into `fs` (tiles are disjoint, so the
-/// order of the merges does not matter). Otherwise the tiles decode in order straight into `fs`.
-/// A frame with `allow_intrabc` is always the second case: intra block copy reads samples and
-/// mode info of other tiles. The result is the same for every `max_threads` (docs/threading.md).
-fn decode_tiles(
-    mut fs: FrameState,
+/// With one thread ([`team_size`]) the tiles decode in order straight into `fs` and
+/// [`wrapup`] runs on the whole frame, spawning nothing. Otherwise one team of threads
+/// ([`with_team`], one scope per frame) runs the stages of [`Wrap::lead`]: the tiles (each
+/// into its own tile-sized [`FrameState::new_tile`] state, merged into `fs`; an `allow_intrabc`
+/// frame decodes them in order on the calling thread, since intra block copy reads other
+/// tiles), then each filter in row bands, column strips or stripes. Every stage writes disjoint
+/// samples and keeps the spec order where it matters, so the result is the same for every
+/// `max_threads` (docs/threading.md).
+fn decode_frame(
+    fs: FrameState,
     ledger: &Arc<Ledger>,
     max_threads: usize,
     h: &FrameHeader,
@@ -695,46 +697,519 @@ fn decode_tiles(
     let mut frame_cdf = CdfContext::new_boxed();
     frame_cdf.init_non_coeff_cdfs();
     frame_cdf.init_coeff_cdfs(h.base_q_idx);
-    let tile_cols = h.tile_info.tile_cols.max(1);
-    let decode =
-        |fs: &mut FrameState, t: &TileRange, row: usize, col: usize| -> Result<(), Error> {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(Error::Cancelled);
-            }
-            let bytes = data
-                .get(t.start..t.end)
-                .ok_or(Error::Invalid("tile data outside the temporal unit"))?;
-            TileDecoder::new(bytes, row, col, &frame_cdf, fs, h, seq)?.decode_tile(cancel)?;
-            Ok(())
-        };
-    let threads = if h.allow_intrabc { 1 } else { max_threads };
-    if threads.max(1).min(tiles.len()) <= 1 {
+    let threads = team_size(max_threads, &fs, tiles.len());
+    if threads <= 1 {
+        let mut fs = fs;
+        let tile_cols = h.tile_info.tile_cols.max(1);
         for t in tiles {
-            decode(&mut fs, t, t.tile_num / tile_cols, t.tile_num % tile_cols)?;
+            let (row, col) = (t.tile_num / tile_cols, t.tile_num % tile_cols);
+            decode_tile(&mut fs, &frame_cdf, data, t, row, col, h, seq, cancel)?;
         }
+        fs.lr_frame = wrapup(&mut fs, seq, h, cancel)?;
         return Ok(fs);
     }
-    let sb_size = if seq.use_128x128_superblock { 128 } else { 64 };
-    let frame = Mutex::new(fs);
-    run_parallel(tiles.len(), threads, |i| {
-        let t = tiles
+    let w = Wrap {
+        h,
+        seq,
+        data,
+        tiles,
+        cancel,
+        ledger,
+        frame_cdf,
+        threads,
+        tiles_fs: Mutex::new(Some(fs)),
+        fs: OnceLock::new(),
+        curr: RwLock::new(Vec::new()),
+        cdef: RwLock::new(Vec::new()),
+        up_cdef: RwLock::new(Vec::new()),
+        up_curr: RwLock::new(Vec::new()),
+        out: Mutex::new(Vec::new()),
+    };
+    let item: &(dyn Fn(Job, usize) -> Result<(), Error> + Sync) = &|job, i| w.item(job, i);
+    let planes = with_team(threads, item, |team| w.lead(team))?;
+    let mut fs =
+        w.fs.into_inner()
+            .ok_or(Error::Invalid("frame decode left no state"))?;
+    fs.curr_frame = w.curr.into_inner().unwrap_or_else(|e| e.into_inner());
+    fs.lr_frame = planes;
+    Ok(fs)
+}
+
+/// The threads of a frame decode: `max_threads` (0 counts as 1), but no more than its largest
+/// stage has items (the tiles, or the 64-row bands of all planes).
+fn team_size(max_threads: usize, fs: &FrameState, tiles: usize) -> usize {
+    let bands = fs.mi_rows.div_ceil(16) * fs.num_planes;
+    max_threads.max(1).min(tiles.max(bands))
+}
+
+/// `decode_tile()` of tile `t` (tile row `row`, column `col` of `fs`'s tiling) into `fs`.
+fn decode_tile(
+    fs: &mut FrameState,
+    frame_cdf: &CdfContext,
+    data: &[u8],
+    t: &TileRange,
+    row: usize,
+    col: usize,
+    h: &FrameHeader,
+    seq: &SequenceHeader,
+    cancel: &AtomicBool,
+) -> Result<(), Error> {
+    check_cancel(cancel)?;
+    let bytes = data
+        .get(t.start..t.end)
+        .ok_or(Error::Invalid("tile data outside the temporal unit"))?;
+    TileDecoder::new(bytes, row, col, frame_cdf, fs, h, seq)?.decode_tile(cancel)?;
+    Ok(())
+}
+
+/// A stage of the threaded frame decode; its items are listed at [`Wrap::item`].
+#[derive(Debug, Clone, Copy)]
+enum Job {
+    Tile,
+    LfRows,
+    LfCols,
+    Cdef,
+    UpCdef,
+    UpCurr,
+    Lr,
+}
+
+/// The shared state of a threaded frame decode ([`decode_frame`]). Each buffer is written in
+/// one stage and read in later ones. Readers hold a read lock for a whole item; writers fill a
+/// private band (charged to the ledger) and copy it in under the lock, so threads only wait for
+/// each other's copies. The calling thread holds no lock while it runs a stage.
+struct Wrap<'a> {
+    h: &'a FrameHeader,
+    seq: &'a SequenceHeader,
+    data: &'a [u8],
+    tiles: &'a [TileRange],
+    cancel: &'a AtomicBool,
+    ledger: &'a Arc<Ledger>,
+    frame_cdf: Box<CdfContext>,
+    threads: usize,
+    /// The frame state while the tiles merge into it.
+    tiles_fs: Mutex<Option<FrameState>>,
+    /// The frame state after the tiles: mode info, read only. Its `curr_frame` is in `curr`.
+    fs: OnceLock<FrameState>,
+    /// `CurrFrame`, loop filtered in place.
+    curr: RwLock<Vec<WorkPlane>>,
+    /// `CdefFrame`.
+    cdef: RwLock<Vec<WorkPlane>>,
+    /// `UpscaledCdefFrame` (exact size; a copy of `CdefFrame` without superres).
+    up_cdef: RwLock<Vec<WorkPlane>>,
+    /// `UpscaledCurrFrame` (superres with loop restoration only).
+    up_curr: RwLock<Vec<WorkPlane>>,
+    /// `LrFrame` (loop restoration only).
+    out: Mutex<Vec<WorkPlane>>,
+}
+
+impl Wrap<'_> {
+    /// The stages, in the order of [`wrapup`] and with its allocations in the same order (the
+    /// private bands of the items come on top). Returns `LrFrame`.
+    fn lead(&self, team: &Team<'_, Job>) -> Result<Vec<WorkPlane>, Error> {
+        let (h, seq, cancel) = (self.h, self.seq, self.cancel);
+        if h.allow_intrabc || self.tiles.len() <= 1 {
+            let mut g = lock(&self.tiles_fs);
+            let fs = g
+                .as_mut()
+                .ok_or(Error::Invalid("frame decode without a frame state"))?;
+            let tile_cols = h.tile_info.tile_cols.max(1);
+            for t in self.tiles {
+                let (row, col) = (t.tile_num / tile_cols, t.tile_num % tile_cols);
+                decode_tile(fs, &self.frame_cdf, self.data, t, row, col, h, seq, cancel)?;
+            }
+        } else {
+            team.run(Job::Tile, self.tiles.len())?;
+        }
+        let mut fs = lock(&self.tiles_fs)
+            .take()
+            .ok_or(Error::Invalid("frame decode without a frame state"))?;
+        *write_lock(&self.curr) = std::mem::take(&mut fs.curr_frame);
+        let fs = self.fs.get_or_init(|| fs);
+        let bands = fs.mi_rows.div_ceil(16);
+        if lf_on(h) {
+            team.run(Job::LfRows, fs.num_planes * bands)?;
+            team.run(Job::LfCols, fs.num_planes * self.strips(fs))?;
+        }
+        let mut cdef = cdef_planes(&read_lock(&self.curr), self.ledger)?;
+        let on = cdef_on(fs, &read_lock(&self.curr), seq, h, &cdef);
+        if !on {
+            // CDEF off: `CdefFrame` is a copy of `CurrFrame`.
+            cdef_frame(fs, &read_lock(&self.curr), seq, h, &mut cdef, cancel)?;
+        }
+        *write_lock(&self.cdef) = cdef;
+        if on {
+            team.run(Job::Cdef, bands)?;
+        }
+        let row_bands = fs.num_planes * fs.frame_height.div_ceil(64);
+        if h.frame_width != h.upscaled_width {
+            *write_lock(&self.up_cdef) = exact_planes(fs, None)?;
+            team.run(Job::UpCdef, row_bands)?;
+            write_lock(&self.cdef).clear();
+            if h.uses_lr {
+                *write_lock(&self.up_curr) = exact_planes(fs, None)?;
+                team.run(Job::UpCurr, row_bands)?;
+            }
+        } else {
+            *write_lock(&self.up_cdef) = exact_planes(fs, Some(read_lock(&self.cdef).as_slice()))?;
+        }
+        if !h.uses_lr {
+            return Ok(std::mem::take(&mut *write_lock(&self.up_cdef)));
+        }
+        *lock(&self.out) = exact_planes(fs, Some(read_lock(&self.up_cdef).as_slice()))?;
+        team.run(Job::Lr, fs.num_planes.min(3) * stripes(fs))?;
+        Ok(std::mem::take(&mut *lock(&self.out)))
+    }
+
+    /// Item `i` of stage `job`:
+    /// - `Tile`: tile `i` of `tiles`.
+    /// - `LfRows`: the vertical edges of plane `i / bands`, row band `i % bands` (16 mode info
+    ///   rows; the last band runs to the plane end).
+    /// - `LfCols`: the horizontal edges of plane `i / strips`, column strip `i % strips`.
+    /// - `Cdef`: row band `i` of every plane.
+    /// - `UpCdef`, `UpCurr`: plane `i / bands`, 64-row band `i % bands` of the plane.
+    /// - `Lr`: plane `i / stripes`, stripe `i % stripes`.
+    ///
+    /// An index past the bands of its plane does nothing.
+    fn item(&self, job: Job, i: usize) -> Result<(), Error> {
+        match job {
+            Job::Tile => self.tile(i),
+            Job::LfRows => self.lf_rows(i),
+            Job::LfCols => self.lf_cols(i),
+            Job::Cdef => self.cdef_band(i),
+            Job::UpCdef => self.upscale_band(&self.cdef, &self.up_cdef, i),
+            Job::UpCurr => self.upscale_band(&self.curr, &self.up_curr, i),
+            Job::Lr => self.lr_band(i),
+        }
+    }
+
+    /// The frame state after the tile stage.
+    fn state(&self) -> Result<&FrameState, Error> {
+        self.fs
+            .get()
+            .ok_or(Error::Invalid("frame filters before the tiles"))
+    }
+
+    /// Column strips of the horizontal edges: one per thread, whole 16-unit columns each.
+    fn strips(&self, fs: &FrameState) -> usize {
+        self.threads.min(fs.mi_cols.div_ceil(16)).max(1)
+    }
+
+    fn tile(&self, i: usize) -> Result<(), Error> {
+        let (h, seq) = (self.h, self.seq);
+        let t = self
+            .tiles
             .get(i)
             .ok_or(Error::Invalid("tile index out of range"))?;
-        let mut local = FrameState::new_tile(
+        let tile_cols = h.tile_info.tile_cols.max(1);
+        let (row, col) = (t.tile_num / tile_cols, t.tile_num % tile_cols);
+        let mut local = FrameState::new_tile(h, seq, self.ledger, row, col)?;
+        decode_tile(
+            &mut local,
+            &self.frame_cdf,
+            self.data,
+            t,
+            0,
+            0,
             h,
             seq,
-            ledger,
-            t.tile_num / tile_cols,
-            t.tile_num % tile_cols,
+            self.cancel,
         )?;
-        decode(&mut local, t, 0, 0)?;
-        frame
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .merge_tile(&local, sb_size);
+        let sb_size = if seq.use_128x128_superblock { 128 } else { 64 };
+        if let Some(fs) = lock(&self.tiles_fs).as_mut() {
+            fs.merge_tile(&local, sb_size);
+        }
         Ok(())
-    })?;
-    Ok(frame.into_inner().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Vertical edges of one row band: each edge filters samples of its own rows only.
+    fn lf_rows(&self, i: usize) -> Result<(), Error> {
+        let fs = self.state()?;
+        let bands = fs.mi_rows.div_ceil(16).max(1);
+        let (plane, b) = (i / bands, i % bands);
+        if plane >= fs.num_planes || !lf_plane_on(self.h, plane) {
+            return Ok(());
+        }
+        let (_, sy) = subsampling(fs, plane);
+        let (mut buf, y0, y1) = {
+            let curr = read_lock(&self.curr);
+            let p = curr.get(plane).ok_or(Error::Invalid("plane missing"))?;
+            let (y0, y1) = band_rows(b, bands, sy, p.height);
+            let mut buf = WorkPlane::new(p.stride, y1 - y0, self.ledger)?;
+            buf.px.copy_from_slice(rows_of(p, y0, y1)?);
+            (buf, y0, y1)
+        };
+        let rows = 16 * b..(16 * b + 16).min(fs.mi_rows);
+        let mut v = View {
+            stride: buf.stride,
+            px: buf.px.as_mut_slice(),
+            x0: 0,
+            y0,
+        };
+        loop_filter_rows(
+            fs,
+            self.h,
+            plane,
+            0,
+            rows,
+            0..fs.mi_cols,
+            &mut v,
+            self.cancel,
+        )?;
+        let mut curr = write_lock(&self.curr);
+        let p = curr.get_mut(plane).ok_or(Error::Invalid("plane missing"))?;
+        rows_of_mut(p, y0, y1)?.copy_from_slice(&buf.px);
+        Ok(())
+    }
+
+    /// Horizontal edges of one column strip: each edge filters samples of its own columns only.
+    fn lf_cols(&self, i: usize) -> Result<(), Error> {
+        let fs = self.state()?;
+        let strips = self.strips(fs);
+        let (plane, s) = (i / strips, i % strips);
+        if plane >= fs.num_planes || !lf_plane_on(self.h, plane) {
+            return Ok(());
+        }
+        let (sx, _) = subsampling(fs, plane);
+        // Strip `s` has the mode info columns of units `units * s / strips` up to the next
+        // strip's, 16 columns a unit; the last strip runs to the plane end.
+        let units = fs.mi_cols.div_ceil(16);
+        let c0 = 16 * (s * units / strips);
+        let c1 = (16 * ((s + 1) * units / strips)).min(fs.mi_cols);
+        if c0 >= c1 {
+            return Ok(());
+        }
+        let (mut buf, x0, x1, height) = {
+            let curr = read_lock(&self.curr);
+            let p = curr.get(plane).ok_or(Error::Invalid("plane missing"))?;
+            let x0 = ((c0 * MI_SIZE) >> sx).min(p.stride);
+            let x1 = if s + 1 == strips {
+                p.stride
+            } else {
+                ((c1 * MI_SIZE) >> sx).clamp(x0, p.stride)
+            };
+            let w = x1 - x0;
+            let mut buf = WorkPlane::new(w, p.height, self.ledger)?;
+            for (y, row) in buf.px.chunks_exact_mut(w.max(1)).enumerate() {
+                let start = y * p.stride;
+                row.copy_from_slice(
+                    p.px.get(start + x0..start + x1)
+                        .ok_or(Error::Invalid("plane smaller than its size"))?,
+                );
+            }
+            (buf, x0, x1, p.height)
+        };
+        let mut v = View {
+            stride: buf.stride,
+            px: buf.px.as_mut_slice(),
+            x0,
+            y0: 0,
+        };
+        loop_filter_rows(
+            fs,
+            self.h,
+            plane,
+            1,
+            0..fs.mi_rows,
+            c0..c1,
+            &mut v,
+            self.cancel,
+        )?;
+        let mut curr = write_lock(&self.curr);
+        let p = curr.get_mut(plane).ok_or(Error::Invalid("plane missing"))?;
+        let w = x1 - x0;
+        for y in 0..height {
+            let start = y * p.stride;
+            p.px.get_mut(start + x0..start + x1)
+                .ok_or(Error::Invalid("plane smaller than its size"))?
+                .copy_from_slice(&buf.px[y * w..(y + 1) * w]);
+        }
+        Ok(())
+    }
+
+    /// CDEF of one row band of 8x8 blocks, every plane: reads `CurrFrame` (also outside the
+    /// band), writes the band's rows of `CdefFrame`.
+    fn cdef_band(&self, b: usize) -> Result<(), Error> {
+        let fs = self.state()?;
+        let (h, seq) = (self.h, self.seq);
+        let bands = fs.mi_rows.div_ceil(16).max(1);
+        let curr = read_lock(&self.curr);
+        // `CdefFrame` has a plane per `CurrFrame` plane, same sizes.
+        let num_planes = usize::from(seq.num_planes).min(curr.len());
+        let mut bufs = Vec::with_capacity(num_planes);
+        for (plane, p) in curr.iter().enumerate().take(num_planes) {
+            let (_, sy) = subsampling(fs, plane);
+            let (y0, y1) = band_rows(b, bands, sy, p.height);
+            // The band starts as the copy of `CurrFrame` that unfiltered blocks keep.
+            let mut buf = WorkPlane::new(p.stride, y1 - y0, self.ledger)?;
+            buf.px.copy_from_slice(rows_of(p, y0, y1)?);
+            bufs.push((buf, y0, y1));
+        }
+        {
+            let mut views: Vec<View<'_>> = bufs
+                .iter_mut()
+                .map(|(buf, y0, _)| View {
+                    stride: buf.stride,
+                    px: buf.px.as_mut_slice(),
+                    x0: 0,
+                    y0: *y0,
+                })
+                .collect();
+            let rows = 16 * b..(16 * b + 16).min(fs.mi_rows);
+            cdef_rows(fs, &curr, seq, h, rows, &mut views, self.cancel)?;
+        }
+        drop(curr);
+        let mut out = write_lock(&self.cdef);
+        for (plane, (buf, y0, y1)) in bufs.iter().enumerate() {
+            let p = out.get_mut(plane).ok_or(Error::Invalid("plane missing"))?;
+            rows_of_mut(p, *y0, *y1)?.copy_from_slice(&buf.px);
+        }
+        Ok(())
+    }
+
+    /// Superres of one 64-row band of one plane, from `src` into the exact-size planes `dst`.
+    fn upscale_band(
+        &self,
+        src: &RwLock<Vec<WorkPlane>>,
+        dst: &RwLock<Vec<WorkPlane>>,
+        i: usize,
+    ) -> Result<(), Error> {
+        let fs = self.state()?;
+        let bands = fs.frame_height.div_ceil(64).max(1);
+        let (plane, b) = (i / bands, i % bands);
+        let input = read_lock(src);
+        // `dst` has `num_planes` planes of `exact_size`.
+        if plane >= fs.num_planes.min(input.len()) {
+            return Ok(());
+        }
+        let (w, ht) = exact_size(fs, plane);
+        let (y0, y1) = ((64 * b).min(ht), (64 * b + 64).min(ht));
+        if y0 == y1 {
+            return Ok(());
+        }
+        let mut buf = WorkPlane::new(w, y1 - y0, self.ledger)?;
+        let mut v = View {
+            stride: w,
+            px: buf.px.as_mut_slice(),
+            x0: 0,
+            y0,
+        };
+        let (seq, h) = (self.seq, self.h);
+        upscale_rows(
+            &input[plane],
+            plane,
+            seq,
+            h,
+            (w, ht),
+            y0..y1,
+            &mut v,
+            self.cancel,
+        )?;
+        drop(input);
+        let mut out = write_lock(dst);
+        let p = out.get_mut(plane).ok_or(Error::Invalid("plane missing"))?;
+        rows_of_mut(p, y0, y1)?.copy_from_slice(&buf.px);
+        Ok(())
+    }
+
+    /// Loop restoration of one stripe of one plane: reads `UpscaledCdefFrame` and
+    /// `UpscaledCurrFrame` (also outside the stripe), writes the stripe's rows of `LrFrame`.
+    fn lr_band(&self, i: usize) -> Result<(), Error> {
+        check_cancel(self.cancel)?;
+        let fs = self.state()?;
+        let ns = stripes(fs);
+        let (plane, n) = (i / ns, i % ns);
+        let cdef = read_lock(&self.up_cdef);
+        let curr = if self.h.frame_width != self.h.upscaled_width {
+            read_lock(&self.up_curr)
+        } else {
+            read_lock(&self.curr)
+        };
+        // `LrFrame` has `num_planes` planes of `exact_size`.
+        if plane >= fs.num_planes.min(3).min(cdef.len()).min(curr.len()) {
+            return Ok(());
+        }
+        let (w, ht) = exact_size(fs, plane);
+        let (c, u) = (&cdef[plane], &curr[plane]);
+        let Some(g) = lr_plane(fs, self.seq, self.h, plane, [c, u], (w, ht)) else {
+            return Ok(());
+        };
+        let Some((y0, y1)) = g.stripe_rows(n) else {
+            return Ok(());
+        };
+        // `LrFrame` starts as `UpscaledCdefFrame` (exact size too).
+        let mut buf = WorkPlane::new(w, y1 + 1 - y0, self.ledger)?;
+        buf.px.copy_from_slice(rows_of(c, y0, y1 + 1)?);
+        let mut v = View {
+            stride: w,
+            px: buf.px.as_mut_slice(),
+            x0: 0,
+            y0,
+        };
+        lr_stripe(fs, self.seq, &g, n, c, u, &mut v);
+        drop((cdef, curr));
+        let mut out = lock(&self.out);
+        let p = out.get_mut(plane).ok_or(Error::Invalid("plane missing"))?;
+        rows_of_mut(p, y0, y1 + 1)?.copy_from_slice(&buf.px);
+        Ok(())
+    }
+}
+
+/// Loop restoration stripes of a frame's planes, at most (64 luma rows each, offset by 8).
+fn stripes(fs: &FrameState) -> usize {
+    fs.frame_height.div_ceil(64) + 1
+}
+
+/// `(subsampling_x, subsampling_y)` of plane `plane`.
+fn subsampling(fs: &FrameState, plane: usize) -> (usize, usize) {
+    if plane == 0 {
+        (0, 0)
+    } else {
+        (fs.subsampling_x, fs.subsampling_y)
+    }
+}
+
+/// The plane rows `y0..y1` of row band `b` of `bands` (16 mode info rows, 64 luma rows, each):
+/// the last band runs to the plane end, `height` rows.
+fn band_rows(b: usize, bands: usize, sy: usize, height: usize) -> (usize, usize) {
+    let y0 = ((64 * b) >> sy).min(height);
+    let y1 = if b + 1 >= bands {
+        height
+    } else {
+        ((64 * (b + 1)) >> sy).min(height)
+    };
+    (y0, y1.max(y0))
+}
+
+/// The samples of rows `y0..y1` of `p`.
+fn rows_of(p: &WorkPlane, y0: usize, y1: usize) -> Result<&[u16], Error> {
+    p.px.get(y0 * p.stride..y1 * p.stride)
+        .ok_or(Error::Invalid("plane smaller than its size"))
+}
+
+/// The samples of rows `y0..y1` of `p`, to write.
+fn rows_of_mut(p: &mut WorkPlane, y0: usize, y1: usize) -> Result<&mut [u16], Error> {
+    p.px.get_mut(y0 * p.stride..y1 * p.stride)
+        .ok_or(Error::Invalid("plane smaller than its size"))
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn read_lock<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write_lock<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The size of plane `plane` of `LrFrame`: `UpscaledWidth` x `FrameHeight`, chroma
+/// `(size + ss) >> ss`.
+fn exact_size(fs: &FrameState, plane: usize) -> (usize, usize) {
+    let (sx, sy) = subsampling(fs, plane);
+    ((fs.upscaled_width + sx) >> sx, (fs.frame_height + sy) >> sy)
 }
 
 /// Output planes of exactly `UpscaledWidth` x `FrameHeight` (chroma `(size + ss) >> ss`), each a
@@ -744,13 +1219,7 @@ fn exact_planes(fs: &FrameState, src: Option<&[WorkPlane]>) -> Result<Vec<WorkPl
     out.try_reserve_exact(fs.num_planes)
         .map_err(|_| Error::OutOfMemory)?;
     for i in 0..fs.num_planes {
-        let (sx, sy) = if i == 0 {
-            (0, 0)
-        } else {
-            (fs.subsampling_x, fs.subsampling_y)
-        };
-        let w = (fs.upscaled_width + sx) >> sx;
-        let ht = (fs.frame_height + sy) >> sy;
+        let (w, ht) = exact_size(fs, i);
         let mut p = WorkPlane::new(w, ht, &fs.ledger)?;
         if let Some(s) = src.and_then(|s| s.get(i)) {
             for y in 0..ht {
@@ -834,6 +1303,180 @@ fn frame_info(s: &Shown, h: &FrameHeader, mono_chrome: bool) -> FrameInfo {
         subsampling_y: s.subsampling_y != 0,
         temporal_id: h.temporal_id,
         spatial_id: h.spatial_id,
+    }
+}
+
+/// The payload of a reduced still picture sequence header (64x32, 8-bit 4:2:0, CDEF and loop
+/// restoration on), for [`wrapup_frame`] (`seq::tests::still_sequence_header` writes the same).
+#[cfg(any(test, feature = "fuzzing"))]
+const STILL_SEQUENCE_HEADER: [u8; 6] = [0x19, 0x1d, 0x8f, 0xcf, 0xb6, 0x01];
+
+/// A frame whose tiles are done, drawn from `data`, through [`decode_frame`] with `threads`
+/// threads and `max_alloc`; the ledger is returned to read its peak. `data[ 0 ]` picks the
+/// format (4:2:0, 4:2:2, 4:4:4, mono), `data[ 1 ]` the bit depth (8, 10, 12), `data[ 2 ]`
+/// superres off or on; a hash of all of `data` seeds the rest: the size (up to 200x200), loop
+/// filter, CDEF and loop restoration parameters, the mode info and the `CurrFrame` samples
+/// (8x8 blocks of a level plus noise, so the filters have edges to work on). The mode info is
+/// random, not the result of a decode: the wrapup must not rely on it being consistent.
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn wrapup_frame(
+    data: &[u8],
+    threads: usize,
+    max_alloc: usize,
+) -> (Result<FrameState, Error>, Arc<Ledger>) {
+    let ledger = Arc::new(Ledger::default());
+    let _ = ledger.reset(max_alloc, 0);
+    let sel = |i: usize| u64::from(data.get(i).copied().unwrap_or(0));
+    let mut x = data.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    }) | 1;
+    // A value in 0..n.
+    let mut next = move |n: u64| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x % n
+    };
+    let Ok(mut seq) = SequenceHeader::parse(&STILL_SEQUENCE_HEADER, 0) else {
+        return (Err(Error::Invalid("sequence header")), ledger);
+    };
+    seq.bit_depth = [8, 10, 12][(sel(1) % 3) as usize];
+    (
+        seq.mono_chrome,
+        seq.num_planes,
+        seq.subsampling_x,
+        seq.subsampling_y,
+    ) = match sel(0) % 4 {
+        0 => (false, 3, 1, 1),
+        1 => (false, 3, 1, 0),
+        2 => (false, 3, 0, 0),
+        _ => (true, 1, 1, 1),
+    };
+    seq.enable_superres = true;
+    seq.enable_cdef = next(8) != 0;
+    let upscaled = 16 + next(185) as u32;
+    let height = 8 + next(193) as u32;
+    let denom = if sel(2) % 2 == 1 {
+        9 + next(8) as u32
+    } else {
+        8
+    };
+    let width = (upscaled * 8 + denom / 2) / denom;
+    let mut h = FrameHeader {
+        frame_width: width,
+        frame_height: height,
+        upscaled_width: upscaled,
+        use_superres: denom != 8,
+        superres_denom: denom,
+        mi_cols: 2 * ((width + 7) >> 3),
+        mi_rows: 2 * ((height + 7) >> 3),
+        loop_filter_sharpness: next(8) as u8,
+        loop_filter_delta_enabled: next(2) == 1,
+        delta_lf_multi: next(2) == 1,
+        cdef_damping: 3 + next(4) as u8,
+        cdef_bits: 3,
+        ..FrameHeader::default()
+    };
+    for l in h.loop_filter_level.iter_mut() {
+        *l = next(64) as u8;
+    }
+    for d in h.loop_filter_ref_deltas.iter_mut() {
+        *d = next(127) as i8 - 63;
+    }
+    for i in 0..8 {
+        h.cdef_y_pri_strength[i] = next(16) as u8;
+        h.cdef_y_sec_strength[i] = [0, 1, 2, 4][next(4) as usize];
+        h.cdef_uv_pri_strength[i] = next(16) as u8;
+        h.cdef_uv_sec_strength[i] = [0, 1, 2, 4][next(4) as usize];
+    }
+    let lr_size = [64u16, 128, 256][next(3) as usize];
+    let uv_shift = if seq.subsampling_x == 1 && seq.subsampling_y == 1 {
+        next(2) as u16
+    } else {
+        0
+    };
+    for plane in 0..usize::from(seq.num_planes) {
+        h.frame_restoration_type[plane] = next(4) as u8;
+        h.loop_restoration_size[plane] = if plane == 0 {
+            lr_size
+        } else {
+            lr_size >> uv_shift
+        };
+    }
+    h.uses_lr = h.frame_restoration_type.iter().any(|&t| t != RESTORE_NONE);
+    let mut fs = match FrameState::new(&h, &seq, &ledger) {
+        Ok(fs) => fs,
+        Err(e) => return (Err(e), ledger),
+    };
+    for i in 0..fs.mi_rows * fs.mi_cols {
+        fs.mi_sizes[i] = next(BLOCK_SIZES as u64) as u8;
+        fs.skips[i] = next(2) == 1;
+        fs.cdef_idx[i] = next(9) as i8 - 1;
+        for d in fs.delta_lfs[i].iter_mut() {
+            *d = next(33) as i8 - 16;
+        }
+        for plane in 0..fs.num_planes {
+            fs.loopfilter_tx_sizes[plane][i] = next(TX_SIZES_ALL as u64) as u8;
+        }
+    }
+    for plane in 0..3 {
+        for u in 0..fs.lr_type[plane].len() {
+            fs.lr_type[plane][u] = next(3) as u8;
+            for pass in 0..2 {
+                fs.lr_wiener[plane][u][pass] =
+                    [next(16) as i8 - 5, next(32) as i8 - 23, next(64) as i8 - 17];
+            }
+            fs.lr_sgr_set[plane][u] = next(16) as u8;
+            fs.lr_sgr_xqd[plane][u] = [next(128) as i8 - 96, next(128) as i8 - 32];
+        }
+    }
+    let max = (1u64 << seq.bit_depth) - 1;
+    let noise = 4u64 << (seq.bit_depth - 8);
+    for p in fs.curr_frame.iter_mut() {
+        let mut levels = vec![0u64; p.width.div_ceil(8)];
+        for y in 0..p.height {
+            if y.is_multiple_of(8) {
+                levels.iter_mut().for_each(|l| *l = next(max + 1));
+            }
+            for (x, v) in p.px[y * p.stride..y * p.stride + p.width]
+                .iter_mut()
+                .enumerate()
+            {
+                *v = (levels[x / 8] + next(noise)).min(max) as u16;
+            }
+        }
+    }
+    let r = decode_frame(
+        fs,
+        &ledger,
+        threads,
+        &h,
+        &seq,
+        &[],
+        &[],
+        &AtomicBool::new(false),
+    );
+    (r, ledger)
+}
+
+/// [`wrapup_frame`] of `data` with each of `threads` against one thread: the same error, or
+/// the same `LrFrame` and loop filtered `CurrFrame`.
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn check_threads(data: &[u8], threads: &[usize]) {
+    let (serial, _) = wrapup_frame(data, 1, 64 << 20);
+    for &t in threads {
+        let (par, _) = wrapup_frame(data, t, 64 << 20);
+        match (&serial, &par) {
+            (Ok(a), Ok(b)) => {
+                for (p, q) in [(&a.lr_frame, &b.lr_frame), (&a.curr_frame, &b.curr_frame)] {
+                    assert_eq!(p.len(), q.len());
+                    for (pp, qq) in p.iter().zip(q.iter()) {
+                        assert!(pp.px == qq.px, "{t} threads differ from 1");
+                    }
+                }
+            }
+            _ => assert_eq!(serial.as_ref().err(), par.as_ref().err()),
+        }
     }
 }
 
@@ -1112,7 +1755,7 @@ mod tests {
         (h, data, tiles)
     }
 
-    /// The tile phase of `six_tiles( seed )` with `threads` threads and `max_alloc`; the ledger is
+    /// The tiles and the wrapup of `six_tiles( seed )` with `threads` threads and `max_alloc`; the ledger is
     /// returned to read its peak.
     fn run_tiles(
         seed: u64,
@@ -1124,7 +1767,7 @@ mod tests {
         let ledger = Arc::new(Ledger::default());
         ledger.reset(max_alloc, 0).unwrap();
         let r = FrameState::new(&h, &seq, &ledger)
-            .and_then(|fs| decode_tiles(fs, &ledger, threads, &h, &seq, &data, &tiles, &cancel()));
+            .and_then(|fs| decode_frame(fs, &ledger, threads, &h, &seq, &data, &tiles, &cancel()));
         (r, ledger)
     }
 
@@ -1145,9 +1788,11 @@ mod tests {
         assert_eq!(a.lr_wiener, b.lr_wiener);
         assert_eq!(a.lr_sgr_set, b.lr_sgr_set);
         assert_eq!(a.lr_sgr_xqd, b.lr_sgr_xqd);
-        assert_eq!(a.curr_frame.len(), b.curr_frame.len());
-        for (p, q) in a.curr_frame.iter().zip(&b.curr_frame) {
-            assert_eq!(p.px, q.px);
+        for (x, y) in [(&a.curr_frame, &b.curr_frame), (&a.lr_frame, &b.lr_frame)] {
+            assert_eq!(x.len(), y.len());
+            for (p, q) in x.iter().zip(y) {
+                assert_eq!(p.px, q.px);
+            }
         }
     }
 
@@ -1186,6 +1831,81 @@ mod tests {
                     max_alloc.saturating_sub(crate::ledger::SMALL)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn still_sequence_header_constant_matches_the_writer() {
+        assert_eq!(STILL_SEQUENCE_HEADER.as_slice(), still_sequence_header());
+    }
+
+    /// Every format (4:2:0, 4:2:2, 4:4:4, mono) and bit depth, superres off and on, with the
+    /// loop filter, CDEF and loop restoration drawn per seed: 2, 3 and 8 threads give the
+    /// samples of 1 thread.
+    #[test]
+    fn wrapup_is_the_same_for_every_thread_count() {
+        let mut parallel = 0;
+        for format in 0..4u8 {
+            for depth in 0..3u8 {
+                for superres in 0..2u8 {
+                    for seed in 0..2u8 {
+                        let data = [format, depth, superres, seed];
+                        check_threads(&data, &[2, 3, 8]);
+                        // Most frames have more than one band: the threaded path did run.
+                        let (r, _) = wrapup_frame(&data, 1, 64 << 20);
+                        let fs = r.unwrap();
+                        parallel += usize::from(team_size(8, &fs, 0) > 1);
+                    }
+                }
+            }
+        }
+        assert!(parallel > 24);
+    }
+
+    #[test]
+    fn wrapup_threads_stay_within_max_alloc() {
+        // 4:4:4 10-bit with superres: the most buffers.
+        let data = [2u8, 1, 1, 5];
+        let mut fitted = 0;
+        for max_alloc in [1024, 64 << 10, 256 << 10, 512 << 10, 1 << 20, 4 << 20] {
+            for threads in [1, 2, 3, 8] {
+                let (r, ledger) = wrapup_frame(&data, threads, max_alloc);
+                assert!(ledger.peak() <= max_alloc as u64);
+                assert!(r.is_ok() || r.as_ref().err() == Some(&Error::AllocLimit));
+                fitted += usize::from(r.is_ok());
+                drop(r);
+                assert_eq!(
+                    ledger.left(),
+                    max_alloc.saturating_sub(crate::ledger::SMALL)
+                );
+            }
+        }
+        assert!(fitted >= 4);
+    }
+
+    #[test]
+    fn team_size_stays_within_max_threads() {
+        let (r, _) = wrapup_frame(&[0, 0, 0, 0], 1, 64 << 20);
+        let fs = r.unwrap();
+        for max_threads in [0, 1, 2, 3, 8, 64] {
+            for tiles in [0, 1, 6, 100] {
+                let n = team_size(max_threads, &fs, tiles);
+                assert!(n >= 1 && n <= max_threads.max(1));
+            }
+        }
+    }
+
+    #[test]
+    fn wrapup_threads_honour_the_cancel_flag() {
+        let seq = SequenceHeader::parse(&still_sequence_header(), 0).unwrap();
+        let (h, data, tiles) = six_tiles(3);
+        let ledger = Arc::new(Ledger::default());
+        ledger.reset(64 << 20, 0).unwrap();
+        for threads in [1, 3] {
+            let fs = FrameState::new(&h, &seq, &ledger).unwrap();
+            let stop = AtomicBool::new(true);
+            let r = decode_frame(fs, &ledger, threads, &h, &seq, &data, &tiles, &stop);
+            assert_eq!(r.err(), Some(Error::Cancelled));
         }
     }
 }

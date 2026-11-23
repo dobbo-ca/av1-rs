@@ -1,10 +1,12 @@
-//! The work scheduler of one call: `n` independent items run on at most `max_threads` threads,
-//! the calling thread included, from one `std::thread::scope`. Used by the tile decode of a
-//! frame (`decoder.rs`) and by the AVIF grid (`avif.rs`).
+//! The work schedulers of one call, both from one `std::thread::scope` and within
+//! `max_threads` threads, the calling thread included: [`run_parallel`] runs `n` independent
+//! items (the AVIF grid, `avif.rs`); [`with_team`] keeps a team of threads for a sequence of
+//! stages, each a set of independent items (the tiles and the in-loop filters of a frame,
+//! `decoder.rs`).
 
 use crate::error::Error;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 /// Runs `f( 0 )` .. `f( n - 1 )` on `min( max_threads, n )` threads (0 counts as 1) and returns
 /// the results in item order. With one thread (`max_threads == 1` or `n <= 1`) nothing is
@@ -60,6 +62,189 @@ pub(crate) fn run_parallel<T: Send>(
         }
     }
     Ok(out)
+}
+
+/// The threads of one call, shared by its stages (docs/threading.md): made by [`with_team`],
+/// which spawns them once in one `std::thread::scope`; each [`Team::run`] hands them the items
+/// of one stage and returns when the stage is done.
+pub(crate) struct Team<'a, J> {
+    /// `item( job, i )` runs item `i` of the stage `job`.
+    item: &'a (dyn Fn(J, usize) -> Result<(), Error> + Sync),
+    /// Threads of the team, the calling thread included.
+    threads: usize,
+    state: Mutex<TeamState<J>>,
+    /// Signalled when a stage starts or the team stops.
+    wake: Condvar,
+    /// Signalled when the last thread leaves a stage.
+    idle: Condvar,
+    /// The next item of the current stage.
+    next: AtomicUsize,
+    /// The lowest item of the current stage that failed so far.
+    failed: AtomicUsize,
+}
+
+struct TeamState<J> {
+    /// The current stage and its item count; `None` between stages.
+    job: Option<(J, usize)>,
+    /// Counts the stages, so a worker joins each stage at most once.
+    stage: u64,
+    /// Threads working on the current stage.
+    busy: usize,
+    /// The lowest failing item of the current stage and its error.
+    error: Option<(usize, Error)>,
+    quit: bool,
+}
+
+/// Runs `lead( team )` with a team of `threads` threads (0 counts as 1), the calling thread
+/// included: the others are spawned once, in one `std::thread::scope`, and wait for the stages
+/// `lead` runs with [`Team::run`]. With one thread nothing is spawned and every stage runs on
+/// the calling thread. A thread that cannot be spawned is not an error: the others take its
+/// items.
+pub(crate) fn with_team<J: Copy + Send, R>(
+    threads: usize,
+    item: &(dyn Fn(J, usize) -> Result<(), Error> + Sync),
+    lead: impl FnOnce(&Team<'_, J>) -> R,
+) -> R {
+    let team = Team {
+        item,
+        threads: threads.max(1),
+        state: Mutex::new(TeamState {
+            job: None,
+            stage: 0,
+            busy: 0,
+            error: None,
+            quit: false,
+        }),
+        wake: Condvar::new(),
+        idle: Condvar::new(),
+        next: AtomicUsize::new(0),
+        failed: AtomicUsize::new(usize::MAX),
+    };
+    if team.threads == 1 {
+        return lead(&team);
+    }
+    std::thread::scope(|s| {
+        for _ in 1..team.threads {
+            let _ = std::thread::Builder::new().spawn_scoped(s, || team.serve());
+        }
+        // Stops the workers when `lead` returns (or unwinds), so the scope can join them.
+        let stop = Stop(&team);
+        let r = lead(&team);
+        drop(stop);
+        r
+    })
+}
+
+impl<J: Copy> Team<'_, J> {
+    /// Runs `item( job, 0 )` .. `item( job, n - 1 )` on the team and returns when all have
+    /// finished, with the same error rule as [`run_parallel`]: items are taken in increasing
+    /// order, none above a failed one starts, and the error of the lowest failing item is
+    /// returned. With one thread, or one item, they run in order on the calling thread.
+    ///
+    /// # Errors
+    /// The error of the lowest failing item.
+    pub(crate) fn run(&self, job: J, n: usize) -> Result<(), Error> {
+        if self.threads == 1 || n <= 1 {
+            for i in 0..n {
+                (self.item)(job, i)?;
+            }
+            return Ok(());
+        }
+        {
+            // No thread is inside `work` here: the last run waited for `busy == 0`.
+            let mut st = lock(&self.state);
+            self.next.store(0, Ordering::Relaxed);
+            self.failed.store(usize::MAX, Ordering::Relaxed);
+            st.error = None;
+            st.job = Some((job, n));
+            st.stage = st.stage.wrapping_add(1);
+            st.busy += 1;
+        }
+        self.wake.notify_all();
+        {
+            let _busy = Busy(self);
+            self.work(job, n);
+        }
+        let mut st = lock(&self.state);
+        while st.busy > 0 {
+            st = self.idle.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        st.job = None;
+        match st.error.take() {
+            Some((_, e)) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// The loop of a spawned thread: joins every stage it sees until the team stops.
+    fn serve(&self) {
+        let mut seen = 0;
+        loop {
+            let (job, n) = {
+                let mut st = lock(&self.state);
+                loop {
+                    if st.quit {
+                        return;
+                    }
+                    if st.stage != seen {
+                        seen = st.stage;
+                        if let Some(j) = st.job {
+                            st.busy += 1;
+                            break j;
+                        }
+                    }
+                    st = self.wake.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            let _busy = Busy(self);
+            self.work(job, n);
+        }
+    }
+
+    /// Takes items of the current stage until none is left (or one below failed).
+    fn work(&self, job: J, n: usize) {
+        loop {
+            let i = self.next.fetch_add(1, Ordering::Relaxed);
+            if i >= n || i > self.failed.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Err(e) = (self.item)(job, i) {
+                self.failed.fetch_min(i, Ordering::Relaxed);
+                let mut st = lock(&self.state);
+                if st.error.as_ref().is_none_or(|(k, _)| i < *k) {
+                    st.error = Some((i, e));
+                }
+            }
+        }
+    }
+}
+
+/// A thread's place in the current stage, given back on drop (also when an item panics, so
+/// [`Team::run`] never waits for a thread that is gone).
+struct Busy<'t, 'a, J>(&'t Team<'a, J>);
+
+impl<J> Drop for Busy<'_, '_, J> {
+    fn drop(&mut self) {
+        let mut st = lock(&self.0.state);
+        st.busy -= 1;
+        if st.busy == 0 {
+            self.0.idle.notify_all();
+        }
+    }
+}
+
+/// Stops the spawned threads of a team when dropped.
+struct Stop<'t, 'a, J>(&'t Team<'a, J>);
+
+impl<J> Drop for Stop<'_, '_, J> {
+    fn drop(&mut self) {
+        lock(&self.0.state).quit = true;
+        self.0.wake.notify_all();
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
@@ -162,5 +347,73 @@ mod tests {
         assert!(book(SMALL + 1000).is_ok());
         assert_eq!(book(SMALL + 50).unwrap_err(), Error::AllocLimit);
         assert_eq!(book(SMALL).unwrap_err(), Error::AllocLimit);
+    }
+
+    #[test]
+    fn team_stages_run_every_item_once_within_max_threads() {
+        for threads in [1, 2, 3, 8] {
+            let live = AtomicUsize::new(0);
+            let peak = AtomicUsize::new(0);
+            let ids: Mutex<HashSet<ThreadId>> = Mutex::new(HashSet::new());
+            let done: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+            let item: &(dyn Fn(usize, usize) -> Result<(), Error> + Sync) = &|stage, i| {
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                ids.lock().unwrap().insert(std::thread::current().id());
+                std::thread::sleep(Duration::from_millis(2));
+                done.lock().unwrap().push((stage, i));
+                live.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            };
+            with_team(threads, item, |team| {
+                for stage in 0..4 {
+                    team.run(stage, 7).unwrap();
+                    // A stage is over when `run` returns: all its items, none of the next.
+                    let mut d = done.lock().unwrap().clone();
+                    d.sort_unstable();
+                    let want: Vec<_> = (0..=stage)
+                        .flat_map(|s| (0..7).map(move |i| (s, i)))
+                        .collect();
+                    assert_eq!(d, want);
+                }
+            });
+            assert!(peak.load(Ordering::SeqCst) <= threads);
+            assert!(ids.lock().unwrap().len() <= threads);
+        }
+    }
+
+    #[test]
+    fn team_of_one_runs_on_the_calling_thread() {
+        let me = std::thread::current().id();
+        let item: &(dyn Fn((), usize) -> Result<(), Error> + Sync) = &|_, _| {
+            assert_eq!(std::thread::current().id(), me);
+            Ok(())
+        };
+        for threads in [0, 1] {
+            with_team(threads, item, |team| team.run((), 5)).unwrap();
+        }
+    }
+
+    #[test]
+    fn team_returns_the_lowest_failing_item_and_goes_on() {
+        for threads in [1, 2, 3, 8] {
+            let item: &(dyn Fn(usize, usize) -> Result<(), Error> + Sync) = &|stage, i| {
+                match (stage, i) {
+                    // The later failure comes first in time.
+                    (0, 2) => {
+                        std::thread::sleep(Duration::from_millis(30));
+                        Err(Error::Invalid("two"))
+                    }
+                    (0, 5) => Err(Error::Truncated),
+                    _ => Ok(()),
+                }
+            };
+            with_team(threads, item, |team| {
+                assert_eq!(team.run(0, 8), Err(Error::Invalid("two")));
+                // The next stage starts clean.
+                assert_eq!(team.run(1, 8), Ok(()));
+                assert_eq!(team.run(1, 0), Ok(()));
+            });
+        }
     }
 }

@@ -95,6 +95,12 @@ blocks only). The DC-only DCT_DCT fast path (`transform::dc_only`, used by `reco
 and tier-independent. The 1D transforms of all tiers come from one macro (`itx_kernels!`) over
 per-tier vector primitives, written from the spec code (not ported from dav1d).
 
+- `threads` (speed round S): not a SIMD kernel family. It runs the frame wrapup (loop filter,
+  CDEF, superres, loop restoration) in parallel bands (docs/threading.md); no tier is written
+  (there is no arithmetic of its own: it calls the scalar filters, or whatever tier their own
+  families dispatch to, on bands), and it has no `unsafe`. Its "cross-tier" checks compare
+  thread counts instead: the unit tests in `decoder.rs` and the fuzz target `simd_threads`.
+
 ## Kernels kept and dropped
 
 A kernel stays only when the bench (docs/benchmarks.md) shows that it wins. Kernels and tiers

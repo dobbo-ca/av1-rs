@@ -37,7 +37,8 @@ AVIF stills are decoded with `av1::decode_avif` (the primary image and its alpha
 threads included: frame buffers, film grain buffers and the output frames of a temporal unit
 (and every frame `decode` collects) are charged before allocation and released on drop. Not
 counted: frames already returned by `Decoder`, the item bytes inside `isobmff`; `max_metadata`
-is on top. `max_threads = 1` spawns no thread; otherwise the tiles of a frame and the tiles of
+is on top. `max_threads = 1` spawns no thread; otherwise the tiles and in-loop filters of a frame
+(one scope of threads per frame, no pool kept between calls) and the tiles of
 an AVIF grid decode on up to `max_threads` threads, and film grain runs in bands of 32 rows on
 up to `max_threads` threads, with the same output. A frame size is
 checked before anything is allocated. The cancel flag returns `Error::Cancelled` at the next

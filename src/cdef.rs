@@ -8,11 +8,14 @@ use crate::bits::floor_log2;
 use crate::consts::{BLOCK_8X8, BLOCK_64X64, MI_SIZE};
 use crate::decoder::check_cancel;
 use crate::error::Error;
-use crate::frame::{FrameState, Plane};
+use crate::frame::{FrameState, Plane, View};
 use crate::header::FrameHeader;
+use crate::ledger::Ledger;
 use crate::seq::SequenceHeader;
 use crate::simd;
 use crate::tables::NUM_4X4_BLOCKS_WIDE;
+use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 /// `Cdef_Uv_Dir[ subsampling_x ][ subsampling_y ][ yDir ]` (spec 7.15.1).
@@ -42,29 +45,45 @@ pub(crate) const CDEF_DIRECTIONS: [[[i32; 2]; 2]; 8] = [
     [[1, 0], [2, -1]],
 ];
 
-/// The CDEF process (spec 7.15): reads `fs.curr_frame`, writes `CdefFrame` into `out`, which
-/// must have the same planes, widths, heights and strides as `fs.curr_frame` (a plane that does
+/// The CDEF process (spec 7.15): reads `curr` (`CurrFrame`), writes `CdefFrame` into `out`,
+/// which must have the same planes, widths, heights and strides as `curr` (a plane that does
 /// not match is left untouched). `out` is first a copy of the input; with `enable_cdef` off,
 /// `coded_lossless` or `allow_intrabc` it stays that copy.
 pub(crate) fn cdef_frame(
     fs: &FrameState,
+    curr: &[Plane],
     seq: &SequenceHeader,
     fh: &FrameHeader,
     out: &mut [Plane],
     cancel: &AtomicBool,
 ) -> Result<(), Error> {
-    let num_planes = usize::from(seq.num_planes)
-        .min(fs.curr_frame.len())
-        .min(out.len());
+    let num_planes = usize::from(seq.num_planes).min(curr.len()).min(out.len());
     for plane in 0..num_planes {
-        let (src, dst) = (&fs.curr_frame[plane], &mut out[plane]);
+        let (src, dst) = (&curr[plane], &mut out[plane]);
         if src.stride == dst.stride && src.px.len() == dst.px.len() {
             dst.px.copy_from_slice(&src.px);
         }
     }
-    if !seq.enable_cdef || fh.coded_lossless || fh.allow_intrabc {
+    if !cdef_on(fs, curr, seq, fh, out) {
         return Ok(());
     }
+    let mut views: Vec<View<'_>> = out.iter_mut().take(num_planes).map(View::of).collect();
+    cdef_rows(fs, curr, seq, fh, 0..fs.mi_rows, &mut views, cancel)
+}
+
+/// True when [`cdef_frame`] filters (it copies otherwise): CDEF is on for the frame, and every
+/// plane of `curr` and `out` holds the 8x8 blocks of the mode info grid with equal strides.
+pub(crate) fn cdef_on(
+    fs: &FrameState,
+    curr: &[Plane],
+    seq: &SequenceHeader,
+    fh: &FrameHeader,
+    out: &[Plane],
+) -> bool {
+    if !seq.enable_cdef || fh.coded_lossless || fh.allow_intrabc {
+        return false;
+    }
+    let num_planes = usize::from(seq.num_planes).min(curr.len()).min(out.len());
     let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
     let (sub_x, sub_y) = (
         usize::from(seq.subsampling_x),
@@ -74,26 +93,44 @@ pub(crate) fn cdef_frame(
     for plane in 0..num_planes {
         let (sx, sy) = if plane == 0 { (0, 0) } else { (sub_x, sub_y) };
         let (cols, rows) = ((mi_cols * MI_SIZE) >> sx, (mi_rows * MI_SIZE) >> sy);
-        for p in [&fs.curr_frame[plane], &out[plane]] {
+        for p in [&curr[plane], &out[plane]] {
             if p.stride < cols || p.px.len() < p.stride * rows {
-                return Ok(());
+                return false;
             }
         }
-        if fs.curr_frame[plane].stride != out[plane].stride {
-            return Ok(());
+        if curr[plane].stride != out[plane].stride {
+            return false;
         }
     }
-    if !mi_rows.is_multiple_of(2)
-        || fs.cdef_idx.len() < mi_rows * mi_cols
-        || fs.skips.len() < mi_rows * mi_cols
-    {
-        return Ok(());
-    }
+    mi_rows.is_multiple_of(2)
+        && fs.cdef_idx.len() >= mi_rows * mi_cols
+        && fs.skips.len() >= mi_rows * mi_cols
+}
+
+/// The CDEF of the 8x8 blocks at mode info rows `rows` (`rows.start` a multiple of 16, or 0),
+/// for a frame where [`cdef_on`] holds: reads `curr`, writes plane `p` of the blocks into
+/// `out[ p ]`, whole rows of that `CdefFrame` plane (same stride) holding at least the blocks'
+/// rows and already holding the `curr` samples. The cancel flag is checked every 16 rows.
+pub(crate) fn cdef_rows(
+    fs: &FrameState,
+    curr: &[Plane],
+    seq: &SequenceHeader,
+    fh: &FrameHeader,
+    rows: Range<usize>,
+    out: &mut [View<'_>],
+    cancel: &AtomicBool,
+) -> Result<(), Error> {
+    let num_planes = usize::from(seq.num_planes).min(curr.len()).min(out.len());
+    let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+    let (sub_x, sub_y) = (
+        usize::from(seq.subsampling_x),
+        usize::from(seq.subsampling_y),
+    );
     let step4 = NUM_4X4_BLOCKS_WIDE[BLOCK_8X8];
     let cdef_mask4 = !(NUM_4X4_BLOCKS_WIDE[BLOCK_64X64] - 1);
     let coeff_shift = u32::from(seq.bit_depth).saturating_sub(8);
     let best = simd::best();
-    for r in (0..mi_rows).step_by(step4) {
+    for r in rows.step_by(step4) {
         if r.is_multiple_of(16) {
             check_cancel(cancel)?;
         }
@@ -112,7 +149,7 @@ pub(crate) fn cdef_frame(
                 continue;
             }
             let (y_dir, var) =
-                simd::cdef::direction(best, &fs.curr_frame[0], r, c, u32::from(seq.bit_depth));
+                simd::cdef::direction(best, &curr[0], r, c, u32::from(seq.bit_depth));
             let mut pri_str = i32::from(fh.cdef_y_pri_strength[idx]) << coeff_shift;
             let sec_str = i32::from(fh.cdef_y_sec_strength[idx]) << coeff_shift;
             let dir = if pri_str == 0 { 0 } else { y_dir };
@@ -135,7 +172,7 @@ pub(crate) fn cdef_frame(
             simd::cdef::filter(
                 best,
                 &ctx,
-                &fs.curr_frame[0],
+                &curr[0],
                 &mut out[0],
                 0,
                 (sub_x, sub_y),
@@ -160,7 +197,7 @@ pub(crate) fn cdef_frame(
                 simd::cdef::filter(
                     best,
                     &ctx,
-                    &fs.curr_frame[plane],
+                    &curr[plane],
                     &mut out[plane],
                     plane,
                     (sub_x, sub_y),
@@ -187,15 +224,24 @@ pub(crate) fn cdef_alloc(
     fh: &FrameHeader,
     cancel: &AtomicBool,
 ) -> Result<Vec<Plane>, Error> {
+    let mut out = cdef_planes(&fs.curr_frame, &fs.ledger)?;
+    cdef_frame(fs, &fs.curr_frame, seq, fh, &mut out, cancel)?;
+    Ok(out)
+}
+
+/// Zeroed planes shaped like `curr` (sizes and strides), charged to `ledger`.
+///
+/// # Errors
+/// `AllocLimit` or `OutOfMemory` from the plane allocations.
+pub(crate) fn cdef_planes(curr: &[Plane], ledger: &Arc<Ledger>) -> Result<Vec<Plane>, Error> {
     let mut out = Vec::new();
-    out.try_reserve_exact(fs.curr_frame.len())
+    out.try_reserve_exact(curr.len())
         .map_err(|_| Error::OutOfMemory)?;
-    for p in &fs.curr_frame {
-        let mut q = Plane::new(p.width, p.height, &fs.ledger)?;
+    for p in curr {
+        let mut q = Plane::new(p.width, p.height, ledger)?;
         q.stride = p.stride;
         out.push(q);
     }
-    cdef_frame(fs, seq, fh, &mut out, cancel)?;
     Ok(out)
 }
 
@@ -278,13 +324,14 @@ fn constrain(diff: i32, threshold: i32, damping: i32) -> i32 {
 }
 
 /// CDEF filter process (spec 7.15.3) for one plane of the 8x8 luma block at (`r`, `c`): reads
-/// `src` (`CurrFrame`), writes `dst` (`CdefFrame`). `sub` is `(subsampling_x, subsampling_y)`,
-/// `strengths` is `(priStr, secStr)`. `is_inside_filter_region` is the whole frame, so a tap is
+/// `src` (`CurrFrame`), writes `dst` (whole rows of `CdefFrame`, the block's rows among them).
+/// `sub` is `(subsampling_x, subsampling_y)`, `strengths` is `(priStr, secStr)`.
+/// `is_inside_filter_region` is the whole frame, so a tap is
 /// available when its sample lies inside the `MiRows` x `MiCols` area.
 pub(crate) fn cdef_filter(
     ctx: &FilterCtx,
     src: &Plane,
-    dst: &mut Plane,
+    dst: &mut View<'_>,
     plane: usize,
     sub: (usize, usize),
     r: usize,
@@ -311,6 +358,10 @@ pub(crate) fn cdef_filter(
             .map(|&v| i32::from(v))
     };
     for i in 0..h as i32 {
+        // The block row in `dst`, which starts at plane row `dst.y0`.
+        let Some(row) = ((y0 + i) as usize).checked_sub(dst.y0) else {
+            continue;
+        };
         for j in 0..w as i32 {
             let x = at(y0 + i, x0 + j).unwrap_or(0);
             let (mut sum, mut max, mut min) = (0, x, x);
@@ -335,7 +386,7 @@ pub(crate) fn cdef_filter(
                 }
             }
             let v = (x + ((8 + sum - i32::from(sum < 0)) >> 4)).clamp(min, max);
-            let idx = (y0 + i) as usize * dst.stride + (x0 + j) as usize;
+            let idx = row * dst.stride + (x0 + j) as usize;
             if let Some(d) = dst.px.get_mut(idx) {
                 *d = v as u16;
             }
@@ -346,8 +397,6 @@ pub(crate) fn cdef_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::Ledger;
-    use std::sync::Arc;
 
     fn plane(w: usize, h: usize, f: impl Fn(usize, usize) -> u16) -> Plane {
         let ledger = Arc::new(Ledger::default());
@@ -399,8 +448,30 @@ mod tests {
             coeff_shift: 0,
         };
         for dir in 0..8 {
-            cdef_filter(&ctx, &src, &mut dst, 0, (1, 1), 0, 0, (15, 4), 6, dir);
-            cdef_filter(&ctx, &src, &mut dst, 1, (1, 1), 0, 0, (7, 2), 5, dir);
+            cdef_filter(
+                &ctx,
+                &src,
+                &mut View::of(&mut dst),
+                0,
+                (1, 1),
+                0,
+                0,
+                (15, 4),
+                6,
+                dir,
+            );
+            cdef_filter(
+                &ctx,
+                &src,
+                &mut View::of(&mut dst),
+                1,
+                (1, 1),
+                0,
+                0,
+                (7, 2),
+                5,
+                dir,
+            );
             assert!(dst.px.iter().all(|&v| v == 100));
         }
     }

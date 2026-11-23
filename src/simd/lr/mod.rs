@@ -15,7 +15,7 @@
 
 use super::{Simd, Tier};
 use crate::consts::{FILTER_BITS, SGRPROJ_MTABLE_BITS, SGRPROJ_PRJ_BITS, SGRPROJ_RECIP_BITS};
-use crate::frame::Plane;
+use crate::frame::View;
 use crate::lr::{BLOCK_W, SGR_PARAMS, self_guided_filter, wiener_coefficients, wiener_filter};
 
 #[cfg(target_arch = "x86_64")]
@@ -138,7 +138,7 @@ fn block_out<'a>(
     h: usize,
     bd: usize,
     lanes: usize,
-    dst: &'a mut Plane,
+    dst: &'a mut View<'_>,
     x: usize,
     y: usize,
 ) -> Option<&'a mut [u16]> {
@@ -165,7 +165,7 @@ pub(crate) fn wiener(
     h: usize,
     bd: usize,
     coef: &[[i8; 3]; 2],
-    dst: &mut Plane,
+    dst: &mut View<'_>,
     x: usize,
     y: usize,
 ) {
@@ -208,7 +208,7 @@ pub(crate) fn self_guided(
     bd: usize,
     set: usize,
     xqd: &[i8; 2],
-    dst: &mut Plane,
+    dst: &mut View<'_>,
     x: usize,
     y: usize,
 ) {
@@ -256,6 +256,7 @@ pub(crate) fn cross_check(
     xqd: &[i8; 2],
     x: usize,
 ) {
+    use crate::frame::Plane;
     use crate::ledger::Ledger;
     use std::sync::Arc;
     let ledger = Arc::new(Ledger::default());
@@ -271,9 +272,9 @@ pub(crate) fn cross_check(
         let run = |simd: Simd, p: &mut Plane| {
             p.px.fill(0x5555);
             if sgr {
-                self_guided(simd, win, w, h, bd, set, xqd, p, x, 0);
+                self_guided(simd, win, w, h, bd, set, xqd, &mut View::of(p), x, 0);
             } else {
-                wiener(simd, win, w, h, bd, coef, p, x, 0);
+                wiener(simd, win, w, h, bd, coef, &mut View::of(p), x, 0);
             }
         };
         run(Simd::scalar(), &mut want);

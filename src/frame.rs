@@ -48,6 +48,30 @@ impl Drop for Plane {
     }
 }
 
+/// The part of a plane a filter stage writes: whole rows (a row band) or a column strip. `px`
+/// holds rows `stride` samples apart and its first sample is sample (`x0`, `y0`) of the plane.
+/// A view of the whole plane ([`View::of`]) has origin (0, 0); a band or strip is a copy the
+/// threaded wrapup gives one worker (docs/threading.md).
+#[derive(Debug)]
+pub(crate) struct View<'a> {
+    pub px: &'a mut [u16],
+    pub stride: usize,
+    pub x0: usize,
+    pub y0: usize,
+}
+
+impl<'a> View<'a> {
+    /// All of `p`.
+    pub(crate) fn of(p: &'a mut Plane) -> View<'a> {
+        View {
+            stride: p.stride,
+            px: p.px.as_mut_slice(),
+            x0: 0,
+            y0: 0,
+        }
+    }
+}
+
 /// Bytes of the per-mode-info and loop restoration arrays of a [`FrameState`], booked in the
 /// ledger and released when the state drops (a separate field, so the state's other fields can
 /// still be moved out of it).

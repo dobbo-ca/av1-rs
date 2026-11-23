@@ -15,6 +15,7 @@ its temporal units. Seeds: the parity corpus (`run.sh seeds`).
 | `simd_cdef` | `av1::fuzzing::cdef`: CDEF direction and filter kernels, every tier against scalar |
 | `simd_ipred` | `av1::fuzzing::ipred`: intra prediction, palette, CFL and the intra edge filter on every SIMD tier against scalar (first byte picks the kernel) |
 | `simd_itx` | `av1::fuzzing::itx`: one inverse transform + add block (size, type, bit depth, coded region, coefficients, samples) on every tier against scalar |
+| `simd_threads` | `av1::fuzzing::threads`: the threaded frame wrapup on a frame built from the input (format, bit depth, superres, filter parameters, mode info, samples) with 1, 2 and 3 threads; the outputs must be equal |
 
 Each SIMD kernel family adds a cross-tier target `simd_<family>`: it calls
 `av1::fuzzing::<family>` (feature `fuzzing`, enabled only by the fuzz crate), which builds kernel

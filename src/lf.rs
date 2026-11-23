@@ -1,5 +1,5 @@
-//! Deblocking loop filter, spec 7.14. Filters `fs.curr_frame` in place: for each plane all
-//! vertical edges of the frame, then all horizontal edges.
+//! Deblocking loop filter, spec 7.14. Filters `CurrFrame` in place: for each plane all vertical
+//! edges of the frame, then all horizontal edges.
 //!
 //! Only intra frames are decoded, so `RefFrames[ row ][ col ][ 0 ]` is always `INTRA_FRAME` and the
 //! `loop_filter_mode_deltas` / `modeType` branch of 7.14.5 never applies.
@@ -10,15 +10,20 @@
 //! one sample column, so taking vertical edges column by column within a strip of 16 mode info
 //! rows (instead of in raster order) keeps the order of the filters on every sample row: the
 //! output is the same.
+//!
+//! For the same reason the threaded wrapup (docs/threading.md) filters the vertical edges of a
+//! plane in row bands and then its horizontal edges in column strips, each with
+//! [`loop_filter_rows`], and gets the samples of the whole-frame order.
 
 use crate::consts::{INTRA_FRAME, MAX_LOOP_FILTER, MI_SIZE, SEG_LVL_ALT_LF_Y_V};
 use crate::decoder::check_cancel;
 use crate::error::Error;
-use crate::frame::FrameState;
+use crate::frame::{FrameState, Plane, View};
 use crate::header::FrameHeader;
 use crate::seq::SequenceHeader;
 use crate::simd::{self, Simd};
 use crate::tables::{BLOCK_HEIGHT, BLOCK_WIDTH, SUBSAMPLED_SIZE, TX_HEIGHT, TX_WIDTH};
+use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 
 /// Spec 7.14.1 (loop filter process), invoked by `decode_frame_wrapup` (spec 7.4) when
@@ -30,37 +35,80 @@ pub(crate) fn loop_filter_frame(
     fh: &FrameHeader,
     cancel: &AtomicBool,
 ) -> Result<(), Error> {
-    if fh.loop_filter_level[0] == 0 && fh.loop_filter_level[1] == 0 {
+    if !lf_on(fh) {
         return Ok(());
     }
-    let simd = simd::best();
-    let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
-    for plane in 0..fs.num_planes {
-        if plane == 0 || fh.loop_filter_level[1 + plane] != 0 {
-            let (row_step, col_step) = if plane == 0 {
-                (1, 1)
-            } else {
-                (1 << fs.subsampling_y, 1 << fs.subsampling_x)
-            };
+    // The planes are filtered through views, apart from the mode info they read.
+    let mut curr = std::mem::take(&mut fs.curr_frame);
+    let r = filter_planes(fs, fh, &mut curr, cancel);
+    fs.curr_frame = curr;
+    r
+}
+
+/// True when the frame is loop filtered: `loop_filter_level[ 0 ]` or `[ 1 ]` is non-zero.
+pub(crate) fn lf_on(fh: &FrameHeader) -> bool {
+    fh.loop_filter_level[0] != 0 || fh.loop_filter_level[1] != 0
+}
+
+/// True when plane `plane` (0 to 2) of a loop filtered frame is filtered.
+pub(crate) fn lf_plane_on(fh: &FrameHeader, plane: usize) -> bool {
+    plane == 0 || fh.loop_filter_level[1 + plane] != 0
+}
+
+/// The loop filter of the whole frame on `curr` (`CurrFrame`), plane by plane.
+fn filter_planes(
+    fs: &FrameState,
+    fh: &FrameHeader,
+    curr: &mut [Plane],
+    cancel: &AtomicBool,
+) -> Result<(), Error> {
+    for (plane, p) in curr.iter_mut().enumerate().take(fs.num_planes) {
+        if lf_plane_on(fh, plane) {
             for pass in 0..2 {
-                // Strips of 16 mode info rows (a 64x64 superblock row).
-                for strip in (0..mi_rows).step_by(16) {
-                    check_cancel(cancel)?;
-                    let rows = (strip..mi_rows.min(strip + 16)).step_by(row_step);
-                    if pass == 0 {
-                        // Vertical edges: a run goes down one column of the strip.
-                        for col in (0..mi_cols).step_by(col_step) {
-                            let edges = rows.clone().map(move |row| (row, col));
-                            filter_line(fs, fh, simd, plane, pass, edges);
-                        }
-                    } else {
-                        // Horizontal edges: a run goes along one row.
-                        for row in rows {
-                            let edges = (0..mi_cols).step_by(col_step).map(move |col| (row, col));
-                            filter_line(fs, fh, simd, plane, pass, edges);
-                        }
-                    }
-                }
+                let (rows, cols) = (0..fs.mi_rows, 0..fs.mi_cols);
+                loop_filter_rows(fs, fh, plane, pass, rows, cols, &mut View::of(p), cancel)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The edges of pass `pass` (0: vertical edges, 1: horizontal edges) of plane `plane` at mode
+/// info rows `rows` and columns `cols`, on the samples in `v`. `rows.start` and `cols.start` are
+/// multiples of 16 (or 0). The edges' samples must all be in `v`: the rows of `rows` across the
+/// full plane width for pass 0, the columns of `cols` down the full plane height for pass 1. The
+/// cancel flag is checked every 16 rows.
+pub(crate) fn loop_filter_rows(
+    fs: &FrameState,
+    fh: &FrameHeader,
+    plane: usize,
+    pass: usize,
+    rows: Range<usize>,
+    cols: Range<usize>,
+    v: &mut View<'_>,
+    cancel: &AtomicBool,
+) -> Result<(), Error> {
+    let simd = simd::best();
+    let (row_step, col_step) = if plane == 0 {
+        (1, 1)
+    } else {
+        (1 << fs.subsampling_y, 1 << fs.subsampling_x)
+    };
+    // Strips of 16 mode info rows (a 64x64 superblock row).
+    for strip in rows.clone().step_by(16) {
+        check_cancel(cancel)?;
+        let strip_rows = (strip..rows.end.min(strip + 16)).step_by(row_step);
+        if pass == 0 {
+            // Vertical edges: a run goes down one column of the strip.
+            for col in cols.clone().step_by(col_step) {
+                let edges = strip_rows.clone().map(move |row| (row, col));
+                filter_line(fs, fh, simd, plane, pass, edges, v);
+            }
+        } else {
+            // Horizontal edges: a run goes along one row.
+            for row in strip_rows {
+                let edges = cols.clone().step_by(col_step).map(move |col| (row, col));
+                filter_line(fs, fh, simd, plane, pass, edges, v);
             }
         }
     }
@@ -78,14 +126,16 @@ struct EdgeParams {
 }
 
 /// Filters the 4x4 edges `edges` (`(row, col)` in mode info units, adjacent along one edge
-/// line, in order), one kernel call per run of edges with the same size and level.
+/// line, in order) on the samples in `v`, one kernel call per run of edges with the same size
+/// and level.
 fn filter_line(
-    fs: &mut FrameState,
+    fs: &FrameState,
     fh: &FrameHeader,
     simd: Simd,
     plane: usize,
     pass: usize,
     edges: impl Iterator<Item = (usize, usize)>,
+    v: &mut View<'_>,
 ) {
     let mut run: Option<(EdgeParams, usize)> = None;
     for (row, col) in edges {
@@ -101,30 +151,35 @@ fn filter_line(
             continue;
         }
         if let Some((r, count)) = run {
-            filter_run(fs, fh, simd, plane, pass, r, count);
+            filter_run(fs, fh, simd, plane, pass, r, count, v);
         }
         run = e.map(|e| (e, 1));
     }
     if let Some((r, count)) = run {
-        filter_run(fs, fh, simd, plane, pass, r, count);
+        filter_run(fs, fh, simd, plane, pass, r, count, v);
     }
 }
 
-/// Filters `count` adjacent 4x4 edges starting at `r`, all with `r`'s size and level.
+/// Filters `count` adjacent 4x4 edges starting at `r`, all with `r`'s size and level, on the
+/// samples in `v`.
 fn filter_run(
-    fs: &mut FrameState,
+    fs: &FrameState,
     fh: &FrameHeader,
     simd: Simd,
     plane: usize,
     pass: usize,
     r: EdgeParams,
     count: usize,
+    v: &mut View<'_>,
 ) {
-    let stride = fs.curr_frame[plane].stride;
+    let (Some(x), Some(y)) = (r.x.checked_sub(v.x0), r.y.checked_sub(v.y0)) else {
+        return;
+    };
+    let stride = v.stride;
     // Across the edge, and from one sample to the next along it.
     let (step, along) = if pass == 0 { (1, stride) } else { (stride, 1) };
     let edge = simd::lf::Edge {
-        pos: r.y * stride + r.x,
+        pos: y * stride + x,
         step,
         along,
         n: count * MI_SIZE,
@@ -133,7 +188,7 @@ fn filter_run(
         lims: limits(r.lvl, fh.loop_filter_sharpness),
         filter_size: r.size,
     };
-    simd::lf::filter_edge(simd, &mut fs.curr_frame[plane].px, &edge);
+    simd::lf::filter_edge(simd, v.px, &edge);
 }
 
 /// Spec 7.14.2 (edge loop filter process) up to the sample loop: `None` when the 4x4 edge at
