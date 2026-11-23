@@ -27,3 +27,12 @@ charged while grain is applied. The output planes are charged from when they are
 temporal unit returns; `decode` keeps every frame it collects charged until it returns. AVIF: one
 ledger per `decode_avif` call covers every item decoder, the grid canvas, the item copy and the
 primary image (docs/threading.md).
+
+## Compute is not limited
+
+No limit bounds the work of a call. Tile data past the end of an OBU reads as zeros, so a few
+bytes per `OBU_FRAME` (hidden frames included) can make the decoder run the full tile decode and
+wrapup of a frame up to the size limits, and one temporal unit may hold any number of them. The
+work is bounded by the input length times the cost of one maximum-size frame. The only stop is
+the `cancel` flag, checked per OBU, per superblock row of a tile, and per row band in each wrapup
+stage and in film grain. A caller that decodes untrusted data needs a watchdog that sets it.

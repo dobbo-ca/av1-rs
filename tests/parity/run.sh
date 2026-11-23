@@ -65,21 +65,23 @@ fsize() {
 full() {
   REP=$1 bad=0
   rm -rf $W; mkdir -p "$REP" $W/in $W/r1 $W/rn $W/dav $W/aom $W/avd
+  rm -f "$REP/avifdec-failed.txt"
   inputs $W/in
   # AVIF: every coded item (av1C config OBUs + item bytes) becomes a Section 5 stream in the same
   # directory, so dav1d and aomdec check the AV1 decode of each item (examples/avifx.rs).
   ls $W/in/*.avif >/dev/null 2>&1 && { av1-avifx $W/in $W/in/*.avif > "$REP/avifx.log" 2>&1 || bad=1; }
   n=$(ls $W/in | wc -l)
   # 289 streams (240 libaom + 49 dav1d-test-data) and 151 AVIF files: a mount that did not arrive
-  # must fail. The extracted AVIF items count as streams here, so the stream floor is loose.
+  # must fail. The streams are counted in the list, before the extracted AVIF items join them.
   nav=$(ls $W/in/*.avif 2>/dev/null | wc -l)
   [ "$nav" -ge 151 ] || { echo "corpus has $nav AVIF files, want at least 151" >&2; bad=1; }
-  [ "$((n - nav))" -ge 289 ] || { echo "corpus has $((n - nav)) streams, want at least 289" >&2; bad=1; }
+  nst=$(grep -vc '\.avif$' /data.list)
+  [ "$nst" -ge 289 ] || { echo "corpus has $nst streams, want at least 289" >&2; bad=1; }
   flag=; [ "$MODE" = info ] && flag=--info
   av1-oracle $flag --threads 1 $W/in $W/r1 || bad=1
   av1-oracle $flag $W/in $W/rn || bad=1
   : > $W/d-dav1d; : > $W/d-aom; : > $W/d-md5; : > $W/d-err; : > $W/d-avif
-  frames=0 cmpd=0 aomd=0 md5d=0 avifd=0
+  frames=0 cmpd=0 itemd=0 aomd=0 md5d=0 avifd=0
   for p in $W/in/*; do
     f=$(basename "$p"); s=$(stem "$f")
     if [ "$MODE" = info ]; then out=$W/r1/$s.info; else out=$W/r1/$s.frames; fi
@@ -109,7 +111,14 @@ full() {
     # the alpha plane when there is one.
     case $f in *.avif)
       case $f in *_reversed_dimg_order.avif|*animated_alpha_sample_without_shown_frame.avif) continue ;; esac
-      avifdec --jobs 1 "$p" $W/avd/$s.y4m >/dev/null 2>&1 || { echo "$f" >> "$REP/avifdec-failed.txt"; continue; }
+      # A failure not in avifdec-known-failures.txt fails the gate, so a libavif update cannot
+      # silently drop files from the comparison.
+      avifdec --jobs 1 "$p" $W/avd/$s.y4m >/dev/null 2>&1 || {
+        echo "$f" >> "$REP/avifdec-failed.txt"
+        grep -qxF "$f" tests/parity/avifdec-known-failures.txt \
+          || echo "$f: avifdec failed, not in avifdec-known-failures.txt" >> $W/d-avif
+        continue
+      }
       hl=$(head -n 1 $W/avd/$s.y4m | wc -c)
       tail -c +$((hl + 7)) $W/avd/$s.y4m > $W/avd/$s.yuv
       cat $W/r1/$s.yuv $W/r1/$s.alpha.yuv > $W/avd/$s.ours 2>/dev/null
@@ -127,13 +136,13 @@ full() {
       got=$((${#hdr} + 1 + N * (6 + $(fsize "$1" "$2" "$3" "$4"))))
       case "$hdr" in *" W$1 H$2 "*) ;; *) echo "$f: y4m '$hdr', av1-rs $1x$2" >> $W/d-dav1d ;; esac
       [ "$want" = "$got" ] || echo "$f: dav1d y4m $want bytes, av1-rs frames give $got" >> $W/d-dav1d
-      cmpd=$((cmpd + 1))
+      case $f in *.item[0-9]*.obu) itemd=$((itemd + 1)) ;; *) cmpd=$((cmpd + 1)) ;; esac
       continue
     fi
     dav1d -q --threads 1 --filmgrain 1 --limit "$N" -i "$p" -o $W/dav/$s.yuv 2>$W/stderr \
       || echo "$f: dav1d failed: $(head -c 160 $W/stderr | tr '\n' ' ')" >> $W/d-dav1d
     cmp -s $W/dav/$s.yuv $W/r1/$s.yuv || echo "$f: differs from dav1d ($N frames): $(mismatch $W/dav/$s.yuv $W/r1/$s.yuv $W/r1/$s.frames)" >> $W/d-dav1d
-    cmpd=$((cmpd + 1))
+    case $f in *.item[0-9]*.obu) itemd=$((itemd + 1)) ;; *) cmpd=$((cmpd + 1)) ;; esac
     case $f in
       # Two spatial layers: the upper layer is an inter frame (it predicts from the base), so
       # av1-rs and dav1d (all layers) output the base layer, while libaom outputs the upper
@@ -161,13 +170,22 @@ full() {
     esac
   done
   # Floors: a gate that compared (almost) nothing must not pass. Pin these from a green run.
-  [ "$cmpd" -ge 280 ] || echo "only $cmpd streams compared against dav1d, want at least 280" >> $W/d-err
-  [ "$avifd" -ge 100 ] || echo "only $avifd AVIF files compared against avifdec, want at least 100" >> $W/d-err
+  # A listed avifdec failure that decoded after all is a stale entry.
+  while IFS= read -r k; do
+    grep -qxF "$k" "$REP/avifdec-failed.txt" 2>/dev/null \
+      || echo "$k: listed in avifdec-known-failures.txt but avifdec decoded it" >> $W/d-avif
+  done < tests/parity/avifdec-known-failures.txt
+  # Every real stream outputs at least its first key frame; the extracted AVIF items are counted
+  # apart, so they cannot make up for missing streams.
+  [ "$cmpd" -ge 289 ] || echo "only $cmpd streams compared against dav1d, want at least 289" >> $W/d-err
+  [ "$itemd" -ge 238 ] || echo "only $itemd AVIF items compared against dav1d, want at least 238" >> $W/d-err
+  [ "$avifd" -ge 133 ] || echo "only $avifd AVIF files compared against avifdec, want at least 133" >> $W/d-err
+  [ "$frames" -ge 604 ] || echo "only $frames frames compared against dav1d, want at least 604" >> $W/d-err
   diff -r $W/r1 $W/rn > $W/d-threads
   {
     echo "## av1-rs parity ($MODE)"
     echo
-    echo "$n inputs (streams, AVIF files and their extracted items), $frames frames compared; $cmpd streams vs dav1d, $aomd vs aomdec, $md5d vs the published md5, $avifd AVIF files vs avifdec."
+    echo "$n inputs (streams, AVIF files and their extracted items), $frames frames compared; $cmpd streams and $itemd AVIF items vs dav1d, $aomd vs aomdec, $md5d vs the published md5, $avifd AVIF files vs avifdec."
     echo
     echo "| gate | result |"
     echo "|---|---|"

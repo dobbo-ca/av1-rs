@@ -25,30 +25,40 @@ fuzz_target!(|data: &[u8]| {
     };
     let cancel = AtomicBool::new(false);
     let mut dec = av1::Decoder::new(options, limits);
-    let (units, format) = match common::ivf_units(stream) {
-        Some(u) => (u, av1::Format::Section5),
+    let joined;
+    let (units, format, whole): (Vec<&[u8]>, _, &[u8]) = match common::ivf_units(stream) {
+        Some(u) => {
+            joined = u.concat();
+            (u, av1::Format::Section5, &joined)
+        }
         None => {
             let format = common::format(opt);
-            match av1::split_temporal_units(stream, format) {
-                Ok(u) => (u, format),
+            match av1::split_temporal_units(stream, format, &limits) {
+                Ok(u) => (u, format, stream),
                 Err(_) => return,
             }
         }
     };
     // Work budget: tile data past the end reads as zeros, so a few bytes can decode a whole
-    // frame. Stop after 64M output luma samples so one input stays under the timeout.
-    let mut budget: u64 = 64 << 20;
+    // frame. The probe records every frame header (shown, hidden, every layer), so the budget
+    // covers all of them: give up above 64M luma samples so one input stays under the timeout.
+    // Broken framing gives no budget: skip the input rather than decode it unbounded.
+    let Ok(p) = av1::probe(whole, format, &limits) else {
+        return;
+    };
+    {
+        let work: u64 = p
+            .frames
+            .iter()
+            .map(|f| u64::from(f.width) * u64::from(f.height))
+            .sum();
+        if work > 64 << 20 {
+            return;
+        }
+    }
     for u in units {
-        match dec.decode_temporal_unit(u, format, &cancel) {
-            Ok(frames) => {
-                for f in &frames {
-                    budget = budget.saturating_sub(u64::from(f.width) * u64::from(f.height));
-                }
-                if budget == 0 {
-                    break;
-                }
-            }
-            Err(_) => break,
+        if dec.decode_temporal_unit(u, format, &cancel).is_err() {
+            break;
         }
     }
 });

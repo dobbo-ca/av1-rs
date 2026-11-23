@@ -84,6 +84,7 @@ mod tables;
 mod tile;
 mod transform;
 
+use obu::TemporalUnits;
 use std::sync::atomic::AtomicBool;
 
 pub use avif::{AvifImage, decode_avif};
@@ -258,7 +259,12 @@ pub fn decode(
 ) -> Result<Vec<Frame>, Error> {
     let mut decoder = Decoder::new(options.clone(), *limits);
     let mut frames = Vec::new();
-    for unit in split_temporal_units(data, format)? {
+    // Framing is checked up front (without allocating), so a broken stream decodes nothing.
+    for unit in TemporalUnits::new(data, format) {
+        unit?;
+    }
+    for unit in TemporalUnits::new(data, format) {
+        let unit = unit?;
         let out = decoder.decode_temporal_unit(unit, format, cancel)?;
         // Every frame collected so far stays booked: the output of the call counts too.
         decoder.hold_output(&out)?;
@@ -281,11 +287,17 @@ pub fn probe(data: &[u8], format: Format, limits: &Limits) -> Result<Probe, Erro
     let cancel = AtomicBool::new(false);
     let mut decoder = Decoder::probing(*limits);
     let mut stopped = None;
-    for unit in split_temporal_units(data, format)? {
+    let mut units = TemporalUnits::new(data, format);
+    for unit in units.by_ref() {
+        let unit = unit?;
         if let Err(e) = decoder.decode_temporal_unit(unit, format, &cancel) {
             stopped = Some(e);
             break;
         }
+    }
+    // Broken framing after the stop is still an error.
+    for unit in units {
+        unit?;
     }
     Ok(Probe {
         frames: decoder.take_infos(),
