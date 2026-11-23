@@ -528,6 +528,98 @@ pub(crate) fn predict_palette(
     }
 }
 
+/// `Subpel_Filters[ BILINEAR ]` (spec 7.11.3.4): the only filter an intra block copy block uses.
+const SUBPEL_FILTERS_BILINEAR: [[i32; 8]; 16] = [
+    [0, 0, 0, 128, 0, 0, 0, 0],
+    [0, 0, 0, 120, 8, 0, 0, 0],
+    [0, 0, 0, 112, 16, 0, 0, 0],
+    [0, 0, 0, 104, 24, 0, 0, 0],
+    [0, 0, 0, 96, 32, 0, 0, 0],
+    [0, 0, 0, 88, 40, 0, 0, 0],
+    [0, 0, 0, 80, 48, 0, 0, 0],
+    [0, 0, 0, 72, 56, 0, 0, 0],
+    [0, 0, 0, 64, 64, 0, 0, 0],
+    [0, 0, 0, 56, 72, 0, 0, 0],
+    [0, 0, 0, 48, 80, 0, 0, 0],
+    [0, 0, 0, 40, 88, 0, 0, 0],
+    [0, 0, 0, 32, 96, 0, 0, 0],
+    [0, 0, 0, 24, 104, 0, 0, 0],
+    [0, 0, 0, 16, 112, 0, 0, 0],
+    [0, 0, 0, 8, 120, 0, 0, 0],
+];
+
+/// Largest block `predict_intrabc` handles (the largest plane block of a block).
+const IBC_MAX: usize = 128;
+
+/// Spec 7.11.3.4 block inter prediction process for an intra block copy block (`refIdx` -1:
+/// the reference is the current frame, `px` itself, before any loop filter), followed by the
+/// final step of 7.11.3.1: the prediction is not compound, so
+/// `CurrFrame = Clip1( pred )` (`InterPostRound` is 0 for the rounding of 7.11.3.2).
+///
+/// The `w x h` block is written at `(x, y)` of the plane `px` (row `stride`). `start_x` and
+/// `start_y` are the outputs of the motion vector scaling process (7.11.3.3) in 1/1024 sample,
+/// with `xStep` and `yStep` 1024 (an intra block copy reference is never scaled). `last_x` and
+/// `last_y` are the spec's `lastX` and `lastY`: reference positions are clamped to them.
+/// `round0` and `round1` are `InterRound0` and `InterRound1`.
+///
+/// Nothing is written when the block does not fit in `px`, when `w` or `h` exceeds 128 or when
+/// `last_x` / `last_y` are outside `px`. The reads are in `px` too (the clamp), and all of them
+/// are done before the first write, so the block may overlap its own reference.
+pub(crate) fn predict_intrabc(
+    px: &mut [u16],
+    stride: usize,
+    (x, y): (usize, usize),
+    (w, h): (usize, usize),
+    (start_x, start_y): (i64, i64),
+    (last_x, last_y): (usize, usize),
+    (round0, round1): (u32, u32),
+    bit_depth: u32,
+) {
+    if w == 0
+        || h == 0
+        || w > IBC_MAX
+        || h > IBC_MAX
+        || x + w > stride
+        || last_x >= stride
+        || (y + h) * stride > px.len()
+        || (last_y + 1) * stride > px.len()
+    {
+        return;
+    }
+    // intermediateHeight = ( ( ( h - 1 ) * yStep + ( 1 << SCALE_SUBPEL_BITS ) - 1 ) >>
+    // SCALE_SUBPEL_BITS ) + 8, with yStep 1024.
+    let inter_h = h + 7;
+    let mut intermediate = [0i32; (IBC_MAX + 7) * IBC_MAX];
+    for r in 0..inter_h {
+        let ref_y = ((start_y >> 10) + r as i64 - 3).clamp(0, last_y as i64) as usize;
+        let row = &px[ref_y * stride..(ref_y + 1) * stride];
+        for c in 0..w {
+            let p = start_x + 1024 * c as i64;
+            let filter = &SUBPEL_FILTERS_BILINEAR[((p >> 6) & 15) as usize];
+            let mut s = 0i32;
+            for (t, &f) in filter.iter().enumerate() {
+                let ref_x = ((p >> 10) + t as i64 - 3).clamp(0, last_x as i64) as usize;
+                s += f * i32::from(row[ref_x]);
+            }
+            intermediate[r * w + c] = round2(s, round0);
+        }
+    }
+    let max = (1i32 << bit_depth) - 1;
+    for r in 0..h {
+        let p = (start_y & 1023) + 1024 * r as i64;
+        let filter = &SUBPEL_FILTERS_BILINEAR[((p >> 6) & 15) as usize];
+        let base = (p >> 10) as usize;
+        let dst = &mut px[(y + r) * stride + x..][..w];
+        for (c, d) in dst.iter_mut().enumerate() {
+            let mut s = 0i32;
+            for (t, &f) in filter.iter().enumerate() {
+                s += f * intermediate[(base + t) * w + c];
+            }
+            *d = round2(s, round1).clamp(0, max) as u16;
+        }
+    }
+}
+
 /// Spec 7.11.5, run after the DC prediction is in place. `(start_x, start_y)` is the chroma
 /// block position, `max_luma_w` / `max_luma_h` the spec's `MaxLumaW` / `MaxLumaH`. The caller
 /// guarantees the luma samples the spec reads (up to `max_luma_w` x `max_luma_h`) are in `luma`.
@@ -820,5 +912,39 @@ mod tests {
             8,
         );
         assert_eq!(&chroma[..4], &[103, 153, 103, 153]);
+    }
+
+    #[test]
+    fn intrabc_integer_vector_is_a_copy() {
+        let mut px: Vec<u16> = (0..256u16).collect();
+        let src = px.clone();
+        // Block at (8, 8) from (4, 0): mv = (-64, -32) in 1/8 sample, so
+        // start = ( ( (8 << 4) + 2 * mv ) * 64 + 32 ) per axis.
+        predict_intrabc(
+            &mut px,
+            16,
+            (8, 8),
+            (4, 4),
+            (4128, 32),
+            (15, 15),
+            (3, 11),
+            8,
+        );
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(px[(8 + i) * 16 + 8 + j], src[i * 16 + 4 + j]);
+            }
+        }
+    }
+
+    #[test]
+    fn intrabc_half_sample_vector_averages_two_samples() {
+        let mut px = vec![0u16; 32];
+        for row in px.chunks_mut(8) {
+            row[..4].copy_from_slice(&[10, 20, 31, 40]);
+        }
+        // Row 1, x = 0.5 (filter phase 8): (10 + 20 + 1) >> 1 and (20 + 31 + 1) >> 1.
+        predict_intrabc(&mut px, 8, (4, 1), (2, 1), (544, 1056), (7, 3), (3, 11), 8);
+        assert_eq!(&px[12..14], &[15, 26]);
     }
 }

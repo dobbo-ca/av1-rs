@@ -112,6 +112,17 @@ pub(crate) struct FrameState {
     /// `TxSizes`. In an intra frame `InterTxSizes` holds the same values, so the tx size
     /// context (9.3 `get_above_tx_width`) reads this array too.
     pub tx_sizes: Vec<u8>,
+    /// `InterTxSizes`. Only the intra block copy blocks of a frame with `allow_intrabc` make it
+    /// differ from `tx_sizes`, so it is allocated (and written) only for such a frame; empty
+    /// otherwise.
+    pub inter_tx_sizes: Vec<u8>,
+    /// `Mvs[ row ][ col ][ 0 ]` (`[ row, col ]` component order as in the spec), written for the
+    /// intra block copy blocks only (`RefFrames[ ][ ][ 1 ]` is `NONE` in an intra frame).
+    /// Empty unless `allow_intrabc`.
+    pub mvs: Vec<[i32; 2]>,
+    /// `TxTypes` of the inter (intra block copy) blocks, which chroma and the next transform
+    /// blocks read back. Empty unless `allow_intrabc`.
+    pub tx_types: Vec<u8>,
     /// `PaletteSizes[ plane ]` for plane 0 (Y) and 1 (UV).
     pub palette_sizes: [Vec<u8>; 2],
     /// `PaletteColors[ plane ]` (Y colours; U colours). Empty unless `allow_screen_content_tools`.
@@ -205,6 +216,10 @@ impl FrameState {
         let uv_modes = charged.vec(n)?;
         let ref_frames0 = charged.vec(n)?;
         let tx_sizes = charged.vec(n)?;
+        let ibc_n = if h.allow_intrabc { n } else { 0 };
+        let inter_tx_sizes = charged.vec(ibc_n)?;
+        let mvs = charged.vec(ibc_n)?;
+        let tx_types = charged.vec(ibc_n)?;
         let palette_sizes = [charged.vec(n)?, charged.vec(planes_n(1))?];
         let palette_colors = [
             charged.vec(palette_n)?,
@@ -266,6 +281,9 @@ impl FrameState {
             uv_modes,
             ref_frames0,
             tx_sizes,
+            inter_tx_sizes,
+            mvs,
+            tx_types,
             palette_sizes,
             palette_colors,
             delta_lfs,

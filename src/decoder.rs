@@ -164,7 +164,7 @@ impl Decoder {
     ///
     /// # Errors
     /// `Truncated` or `Invalid` for a broken stream, `Unsupported` for a feature this decoder
-    /// does not handle (large scale tile lists, intra block copy), `InterFrame` at the
+    /// does not handle (large scale tile lists), `InterFrame` at the
     /// first inter frame, `WidthLimit`, `HeightLimit`, `PixelLimit`, `AllocLimit`,
     /// `OutOfMemory` and `MetadataLimit` from the limits, and `Cancelled` when `cancel` is set
     /// (checked before every OBU and by the tile decode). Frames of this temporal unit that were
@@ -434,8 +434,8 @@ impl Decoder {
     /// (7.4) only feeds a later frame that loads them, and no intra frame does.
     ///
     /// # Errors
-    /// `Unsupported` for intra block copy, `Truncated` and `Invalid` from the symbol decoder,
-    /// `Cancelled`, `AllocLimit`, `OutOfMemory`.
+    /// `Truncated` and `Invalid` from the symbol decoder, `Cancelled`, `AllocLimit`,
+    /// `OutOfMemory`.
     fn decode_frame_tiles(
         &mut self,
         h: &FrameHeader,
@@ -444,9 +444,6 @@ impl Decoder {
         tiles: &[TileRange],
         cancel: &AtomicBool,
     ) -> Result<(), Error> {
-        if h.allow_intrabc {
-            return Err(Error::Unsupported("intrabc"));
-        }
         let mut fs = self
             .state
             .take()
