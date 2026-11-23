@@ -125,8 +125,8 @@ full() {
       cmpd=$((cmpd + 1))
       continue
     fi
-    dav1d -q --threads 1 --filmgrain 1 --limit "$N" -i "$p" -o $W/dav/$s.yuv 2>/dev/null \
-      || echo "$f: dav1d failed" >> $W/d-dav1d
+    dav1d -q --threads 1 --filmgrain 1 --limit "$N" -i "$p" -o $W/dav/$s.yuv 2>$W/stderr \
+      || echo "$f: dav1d failed: $(head -c 160 $W/stderr | tr '\n' ' ')" >> $W/d-dav1d
     cmp -s $W/dav/$s.yuv $W/r1/$s.yuv || echo "$f: differs from dav1d ($N frames): $(mismatch $W/dav/$s.yuv $W/r1/$s.yuv $W/r1/$s.frames)" >> $W/d-dav1d
     cmpd=$((cmpd + 1))
     case $f in
@@ -136,7 +136,7 @@ full() {
       *svc-L2*) ;;
       *)
         ab=; case $f in *.annexb) ab=--annexb ;; esac
-        aomdec $ab --rawvideo --limit="$N" -o $W/aom/$s.yuv "$p" 2>/dev/null || echo "$f: aomdec failed" >> $W/d-aom
+        aomdec $ab --rawvideo --limit="$N" -o $W/aom/$s.yuv "$p" 2>$W/stderr || echo "$f: aomdec failed: $(head -c 160 $W/stderr | tr '\n' ' ')" >> $W/d-aom
         cmp -s $W/aom/$s.yuv $W/r1/$s.yuv || echo "$f: differs from aomdec ($N frames): $(mismatch $W/aom/$s.yuv $W/r1/$s.yuv $W/r1/$s.frames)" >> $W/d-aom
         aomd=$((aomd + 1))
         # The published per-frame md5 (always 3 planes, so monochrome is checked by aomdec only).

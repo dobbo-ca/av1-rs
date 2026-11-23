@@ -72,6 +72,44 @@ fn items(file: &[u8]) -> Result<Vec<(u32, Vec<u8>)>, isobmff::Error> {
     Ok(found)
 }
 
+/// One temporal unit for dav1d and aomdec: a temporal delimiter, then every OBU of `stream`
+/// except temporal delimiters (dav1d's Section 5 probe wants exactly one, first). Every OBU must
+/// carry obu_size (AVIF requires it); a stream that does not parse is returned behind the
+/// delimiter as it is.
+fn temporal_unit(stream: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x12, 0x00];
+    let mut kept = Vec::with_capacity(stream.len());
+    let mut pos = 0;
+    while pos < stream.len() {
+        let h = stream[pos];
+        let ext = usize::from((h >> 2) & 1);
+        let mut p = pos + 1 + ext;
+        if h & 2 == 0 || p > stream.len() {
+            kept.clear();
+            kept.extend_from_slice(stream);
+            break;
+        }
+        let mut size = 0usize;
+        let mut shift = 0;
+        loop {
+            let Some(&b) = stream.get(p) else { break };
+            p += 1;
+            size |= usize::from(b & 0x7f) << shift;
+            shift += 7;
+            if b & 0x80 == 0 || shift > 56 {
+                break;
+            }
+        }
+        let end = p.saturating_add(size).min(stream.len());
+        if (h >> 3) & 15 != 2 {
+            kept.extend_from_slice(&stream[pos..end]);
+        }
+        pos = end;
+    }
+    out.extend_from_slice(&kept);
+    out
+}
+
 fn run(out_dir: &Path, files: &[PathBuf]) -> std::io::Result<()> {
     fs::create_dir_all(out_dir)?;
     for path in files {
@@ -80,9 +118,7 @@ fn run(out_dir: &Path, files: &[PathBuf]) -> std::io::Result<()> {
         match items(&data) {
             Ok(found) => {
                 for (id, stream) in &found {
-                    // A temporal delimiter first: dav1d's Section 5 reader expects one.
-                    let mut obu = vec![0x12, 0x00];
-                    obu.extend_from_slice(stream);
+                    let obu = temporal_unit(stream);
                     fs::write(out_dir.join(format!("{name}.item{id}.obu")), obu)?;
                 }
                 println!("{}: {} items", path.display(), found.len());
