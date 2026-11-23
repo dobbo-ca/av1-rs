@@ -1,20 +1,26 @@
 //! The decoder state machine: OBU dispatch, the sequence and frame header handling, tile group
 //! collection, the reference slots (spec 7.20, 7.21), frame output (7.18) and the limit checks.
 //!
-//! The pixel work of a frame is behind [`Decoder::decode_frame_tiles`], a hook that the tile
-//! decode fills in. [`probe`](crate::probe) runs the same path without it.
+//! The pixel work of a frame is [`Decoder::decode_frame_tiles`]: the tiles, then the in-loop
+//! filters. [`probe`](crate::probe) runs the same path without it.
 #![allow(dead_code)]
 
 use crate::bits::BitReader;
+use crate::cdef::cdef_alloc;
+use crate::cdf::CdfContext;
 use crate::consts::*;
 use crate::error::Error;
 use crate::frame::{FrameState, Plane as WorkPlane};
 use crate::grain::{GrainInput, apply_film_grain};
 use crate::header::{FrameHeader, RefInfo, RefState, TileRange, parse_tile_group};
 use crate::ledger::Ledger;
+use crate::lf::loop_filter_frame;
 use crate::limits::Limits;
+use crate::lr::lr_frame;
 use crate::obu::{Obu, ObuIter, parse_metadata};
 use crate::seq::SequenceHeader;
+use crate::superres::upscale;
+use crate::tile::TileDecoder;
 use crate::{ColorInfo, Format, Frame, FrameInfo, Metadata, Options, Plane, PlaneData};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -158,7 +164,7 @@ impl Decoder {
     ///
     /// # Errors
     /// `Truncated` or `Invalid` for a broken stream, `Unsupported` for a feature this decoder
-    /// does not handle (large scale tile lists, tile decoding for now), `InterFrame` at the
+    /// does not handle (large scale tile lists, intra block copy), `InterFrame` at the
     /// first inter frame, `WidthLimit`, `HeightLimit`, `PixelLimit`, `AllocLimit`,
     /// `OutOfMemory` and `MetadataLimit` from the limits, and `Cancelled` when `cancel` is set
     /// (checked before every OBU and by the tile decode). Frames of this temporal unit that were
@@ -420,13 +426,16 @@ impl Decoder {
     /// `UpscaledWidth` x `FrameHeight` (chroma subsampled, rounded up) in size.
     ///
     /// `data` is the temporal unit; `tiles` are byte ranges into it, in tile order. `self.state`
-    /// holds the allocated `CurrFrame`. The tile decode checks `cancel` between tiles.
+    /// holds the allocated `CurrFrame`. Tiles decode serially; `cancel` is checked between tiles
+    /// and by every tile once per superblock row.
     ///
-    /// For now: not implemented.
+    /// The frame CDFs are the defaults for `base_q_idx` (`primary_ref_frame` is `NONE` in an
+    /// intra frame). The tile CDFs the exit process returns are dropped: the frame end update
+    /// (7.4) only feeds a later frame that loads them, and no intra frame does.
     ///
     /// # Errors
-    /// `Unsupported("tile decoding")` until the tile decode is written; later `Truncated` and
-    /// `Invalid` from the symbol decoder, `Cancelled`, `AllocLimit`, `OutOfMemory`.
+    /// `Unsupported` for intra block copy, `Truncated` and `Invalid` from the symbol decoder,
+    /// `Cancelled`, `AllocLimit`, `OutOfMemory`.
     fn decode_frame_tiles(
         &mut self,
         h: &FrameHeader,
@@ -435,11 +444,38 @@ impl Decoder {
         tiles: &[TileRange],
         cancel: &AtomicBool,
     ) -> Result<(), Error> {
-        let _ = (h, seq, data, tiles);
-        if cancel.load(Ordering::Relaxed) {
-            return Err(Error::Cancelled);
+        if h.allow_intrabc {
+            return Err(Error::Unsupported("intrabc"));
         }
-        Err(Error::Unsupported("tile decoding"))
+        let mut fs = self
+            .state
+            .take()
+            .ok_or(Error::Invalid("frame decode without a frame state"))?;
+        let mut frame_cdf = CdfContext::new_boxed();
+        frame_cdf.init_non_coeff_cdfs();
+        frame_cdf.init_coeff_cdfs(h.base_q_idx);
+        for t in tiles {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            let tile_cols = h.tile_info.tile_cols.max(1);
+            let bytes = data
+                .get(t.start..t.end)
+                .ok_or(Error::Invalid("tile data outside the temporal unit"))?;
+            TileDecoder::new(
+                bytes,
+                t.tile_num / tile_cols,
+                t.tile_num % tile_cols,
+                &frame_cdf,
+                &mut fs,
+                h,
+                seq,
+            )?
+            .decode_tile(cancel)?;
+        }
+        fs.lr_frame = wrapup(&mut fs, seq, h)?;
+        self.state = Some(fs);
+        Ok(())
     }
 
     /// `metadata_obu()`: keeps the raw payload of every metadata OBU for the next output frame,
@@ -587,6 +623,70 @@ impl Decoder {
     }
 }
 
+/// Output planes of exactly `UpscaledWidth` x `FrameHeight` (chroma `(size + ss) >> ss`), each a
+/// copy of the top left of the matching plane of `src` when given.
+fn exact_planes(fs: &FrameState, src: Option<&[WorkPlane]>) -> Result<Vec<WorkPlane>, Error> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(fs.num_planes)
+        .map_err(|_| Error::OutOfMemory)?;
+    for i in 0..fs.num_planes {
+        let (sx, sy) = if i == 0 {
+            (0, 0)
+        } else {
+            (fs.subsampling_x, fs.subsampling_y)
+        };
+        let w = (fs.upscaled_width + sx) >> sx;
+        let ht = (fs.frame_height + sy) >> sy;
+        let mut p = WorkPlane::new(w, ht, &fs.ledger)?;
+        if let Some(s) = src.and_then(|s| s.get(i)) {
+            for y in 0..ht {
+                let from =
+                    s.px.get(y * s.stride..y * s.stride + w)
+                        .ok_or(Error::Invalid("plane smaller than its size"))?;
+                p.px[y * w..(y + 1) * w].copy_from_slice(from);
+            }
+        }
+        out.push(p);
+    }
+    Ok(out)
+}
+
+/// The frame wrapup of spec 7.4 after the last tile: deblocking (7.14), CDEF (7.15), superres
+/// (7.16) on the CDEF output and, for loop restoration, on the deblocked frame, then loop
+/// restoration (7.17). Returns `LrFrame`.
+fn wrapup(
+    fs: &mut FrameState,
+    seq: &SequenceHeader,
+    h: &FrameHeader,
+) -> Result<Vec<WorkPlane>, Error> {
+    loop_filter_frame(fs, seq, h);
+    let cdef = cdef_alloc(fs, seq, h)?;
+    let (up_cdef, up_curr) = if h.frame_width != h.upscaled_width {
+        let mut up_cdef = exact_planes(fs, None)?;
+        upscale(&cdef, fs, seq, h, &mut up_cdef);
+        drop(cdef);
+        let up_curr = if h.uses_lr {
+            let mut p = exact_planes(fs, None)?;
+            upscale(&fs.curr_frame, fs, seq, h, &mut p);
+            Some(p)
+        } else {
+            None
+        };
+        (up_cdef, up_curr)
+    } else {
+        (exact_planes(fs, Some(cdef.as_slice()))?, None)
+    };
+    if !h.uses_lr {
+        return Ok(up_cdef);
+    }
+    let mut out = exact_planes(fs, Some(up_cdef.as_slice()))?;
+    match &up_curr {
+        Some(c) => lr_frame(fs, seq, h, &up_cdef, c, &mut out),
+        None => lr_frame(fs, seq, h, &up_cdef, &fs.curr_frame, &mut out),
+    }
+    Ok(out)
+}
+
 /// The first `width` samples of row `row` of a plane.
 fn row_of(p: &WorkPlane, row: usize, width: usize) -> Result<&[u16], Error> {
     let start = row * p.stride;
@@ -710,21 +810,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_stops_at_the_tile_decode_hook() {
-        let data: Vec<u8> = still_obus().concat();
-        let e = decode(
-            &data,
-            Format::Section5,
-            &Options::default(),
-            &Limits::default(),
-            &cancel(),
-        )
-        .unwrap_err();
-        assert_eq!(e, Error::Unsupported("tile decoding"));
-        assert_eq!(e.class(), "unsupported");
-    }
-
-    #[test]
     fn frame_buffers_are_charged_to_max_alloc() {
         let data: Vec<u8> = still_obus().concat();
         // The 128x128 luma plane alone is 32 KiB of u16 samples.
@@ -741,6 +826,27 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(e, Error::AllocLimit);
+    }
+
+    #[test]
+    fn ledger_peak_stays_within_max_alloc_and_is_released_on_error() {
+        let data: Vec<u8> = still_obus().concat();
+        for max_alloc in [1024, 4096, 40_000, 100_000, 1 << 20] {
+            let mut d = Decoder::new(
+                Options::default(),
+                Limits {
+                    max_alloc,
+                    max_threads: 1,
+                    ..Limits::default()
+                },
+            );
+            let before = d.ledger.left();
+            let r = d.decode_temporal_unit(&data, Format::Section5, &cancel());
+            assert!(d.ledger.peak() <= max_alloc as u64);
+            if r.is_err() {
+                assert_eq!(d.ledger.left(), before);
+            }
+        }
     }
 
     #[test]

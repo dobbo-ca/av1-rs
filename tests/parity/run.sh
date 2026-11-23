@@ -25,6 +25,32 @@ inputs() {
 
 stem() { printf '%s' "${1%.*}"; }
 
+# where <frames-file> <byte offset, 0-based>: "frame F plane P x X y Y" of a sample in the .yuv.
+where() {
+  off=$2 i=0
+  while read -r w h bd lay; do
+    b=1; [ "$bd" -gt 8 ] && b=2
+    cw=$w ch=$h np=3
+    case $lay in 420) cw=$(((w + 1) / 2)) ch=$(((h + 1) / 2)) ;; 422) cw=$(((w + 1) / 2)) ;; 400) np=1 ;; esac
+    for p in $(seq 0 $((np - 1))); do
+      pw=$w ph=$h; [ "$p" -gt 0 ] && pw=$cw ph=$ch
+      sz=$((pw * ph * b))
+      if [ "$off" -lt "$sz" ]; then
+        s=$((off / b)); echo "frame $i plane $p x $((s % pw)) y $((s / pw)) (${w}x$h $lay $bd-bit)"; return
+      fi
+      off=$((off - sz))
+    done
+    i=$((i + 1))
+  done < "$1"
+  echo "past the end"
+}
+
+# mismatch <a.yuv> <b.yuv> <frames>: where the first difference is, and how many bytes differ.
+mismatch() {
+  first=$(cmp "$1" "$2" 2>&1 | head -n 1)
+  case $first in *differ:*) o=$(printf '%s' "$first" | sed -E 's/.*char ([0-9]+).*/\1/'); echo "first at $(where "$3" $((o - 1))), $(cmp -l "$1" "$2" 2>/dev/null | head -n 100000 | wc -l) bytes differ (capped 1e5)" ;; *) echo "$first" ;; esac
+}
+
 # planes size of one frame: W H bitdepth layout
 fsize() {
   b=1; [ "$3" -gt 8 ] && b=2
@@ -59,7 +85,7 @@ full() {
       N=$(wc -l < "$out")
     fi
     if [ -f $W/r1/$s.err ] && [ "$(cat $W/r1/$s.err)" != inter ]; then
-      echo "$f: av1-rs error $(cat $W/r1/$s.err) after $N frames" >> $W/d-err
+      echo "$f: av1-rs error $(cat $W/r1/$s.err) ($(cat $W/r1/$s.why 2>/dev/null)) after $N frames" >> $W/d-err
     fi
     [ "$N" -gt 0 ] || continue
     frames=$((frames + N))
@@ -76,16 +102,21 @@ full() {
     fi
     dav1d -q --threads 1 --filmgrain 1 --limit "$N" -i "$p" -o $W/dav/$s.yuv 2>/dev/null \
       || echo "$f: dav1d failed" >> $W/d-dav1d
-    cmp -s $W/dav/$s.yuv $W/r1/$s.yuv || echo "$f: differs from dav1d ($N frames): $(cmp $W/dav/$s.yuv $W/r1/$s.yuv 2>&1 | head -n 1)" >> $W/d-dav1d
+    cmp -s $W/dav/$s.yuv $W/r1/$s.yuv || echo "$f: differs from dav1d ($N frames): $(mismatch $W/dav/$s.yuv $W/r1/$s.yuv $W/r1/$s.frames)" >> $W/d-dav1d
     cmpd=$((cmpd + 1))
     case $f in
-      aom__*)
-        aomdec --rawvideo --limit="$N" -o $W/aom/$s.yuv "$p" 2>/dev/null || echo "$f: aomdec failed" >> $W/d-aom
-        cmp -s $W/aom/$s.yuv $W/r1/$s.yuv || echo "$f: differs from aomdec ($N frames)" >> $W/d-aom
+      # Two spatial layers: the upper layer is an inter frame (it predicts from the base), so
+      # av1-rs and dav1d (all layers) output the base layer, while libaom outputs the upper
+      # layer. Checked against dav1d only (docs/parity.md).
+      *svc-L2*) ;;
+      *)
+        ab=; case $f in *.annexb) ab=--annexb ;; esac
+        aomdec $ab --rawvideo --limit="$N" -o $W/aom/$s.yuv "$p" 2>/dev/null || echo "$f: aomdec failed" >> $W/d-aom
+        cmp -s $W/aom/$s.yuv $W/r1/$s.yuv || echo "$f: differs from aomdec ($N frames): $(mismatch $W/aom/$s.yuv $W/r1/$s.yuv $W/r1/$s.frames)" >> $W/d-aom
         aomd=$((aomd + 1))
         # The published per-frame md5 (always 3 planes, so monochrome is checked by aomdec only).
         m=/data/aom/${f#aom__}.md5
-        if [ -f "$m" ] && ! grep -q ' 400$' $W/r1/$s.frames; then
+        if [ "${f#aom__}" != "$f" ] && [ -f "$m" ] && ! grep -q ' 400$' $W/r1/$s.frames; then
           i=0 off=0
           while read -r w h bd lay; do
             i=$((i + 1)); sz=$(fsize "$w" "$h" "$bd" "$lay")
@@ -114,7 +145,7 @@ full() {
     else echo "| $g | FAIL, $l lines |" >> "$REP/summary.md"; bad=1; head -n 300 $W/d-$g > "$REP/$g.diff"; fi
   done
   echo >> "$REP/summary.md"
-  echo "Stop classes (av1-rs .err, one thread): $(cat $W/r1/*.err 2>/dev/null | sort | uniq -c | tr '\n' ' ')" >> "$REP/summary.md"
+  echo "Stop classes (av1-rs .err, one thread): $(for e in $W/r1/*.err; do [ -f "$e" ] && printf '%s\n' "$(cat "$e")"; done | sort | uniq -c | tr -s ' \n' ' ')" >> "$REP/summary.md"
   cat "$REP/summary.md"
   return $bad
 }

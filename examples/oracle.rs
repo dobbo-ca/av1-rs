@@ -141,6 +141,7 @@ fn write_frames(frames: &[Frame], stem: &Path) -> std::io::Result<()> {
 }
 
 fn write_err(stem: &Path, e: &Error) -> std::io::Result<()> {
+    fs::write(stem.with_extension("why"), e.to_string())?;
     fs::write(stem.with_extension("err"), e.class())
 }
 
