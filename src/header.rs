@@ -491,6 +491,10 @@ impl FrameHeader {
         self.upscaled_width = self.frame_width;
         self.frame_width = (self.upscaled_width * SUPERRES_NUM as u32 + self.superres_denom / 2)
             / self.superres_denom;
+        // libaom and dav1d never downscale below Min(16, UpscaledWidth) (the spec text has no
+        // such floor; libaom is the reference). Superres is in effect only when the widths
+        // differ (dav1d issue 322).
+        self.frame_width = self.frame_width.max(self.upscaled_width.min(16));
         // compute_image_size()
         self.mi_cols = 2 * ((self.frame_width + 7) >> 3);
         self.mi_rows = 2 * ((self.frame_height + 7) >> 3);

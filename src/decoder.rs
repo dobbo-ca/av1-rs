@@ -661,7 +661,7 @@ fn wrapup(
 ) -> Result<Vec<WorkPlane>, Error> {
     loop_filter_frame(fs, seq, h);
     let cdef = cdef_alloc(fs, seq, h)?;
-    let (up_cdef, up_curr) = if h.use_superres {
+    let (up_cdef, up_curr) = if h.frame_width != h.upscaled_width {
         let mut up_cdef = exact_planes(fs, None)?;
         upscale(&cdef, fs, seq, h, &mut up_cdef);
         drop(cdef);

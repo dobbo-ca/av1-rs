@@ -39,3 +39,13 @@ no Matroska input; dav1d-test-data has the same streams as IVF), and AVIF sample
 ## Results
 
 Filled per phase from the `parity` job on `main`.
+
+## Known oracle differences
+
+- Layered streams (`svc-L2T1-2`, `svc-L2T2-2`, and the dav1d-test-data `svc-L2*` copies): the upper
+  spatial layer predicts from the base layer, so it is an inter frame and av1-rs stops there;
+  dav1d (all layers) and av1-rs output the base layer, libaom outputs the upper layer. These
+  streams are compared with dav1d only.
+- Superres floor: like libaom and dav1d, the coded width is never below Min(16, UpscaledWidth),
+  and superres applies only when the coded and upscaled widths differ (dav1d issue 322; the spec
+  text has no floor).

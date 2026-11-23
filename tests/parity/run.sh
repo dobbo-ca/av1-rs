@@ -105,13 +105,18 @@ full() {
     cmp -s $W/dav/$s.yuv $W/r1/$s.yuv || echo "$f: differs from dav1d ($N frames): $(mismatch $W/dav/$s.yuv $W/r1/$s.yuv $W/r1/$s.frames)" >> $W/d-dav1d
     cmpd=$((cmpd + 1))
     case $f in
-      aom__*)
-        aomdec --rawvideo --limit="$N" -o $W/aom/$s.yuv "$p" 2>/dev/null || echo "$f: aomdec failed" >> $W/d-aom
+      # Two spatial layers: the upper layer is an inter frame (it predicts from the base), so
+      # av1-rs and dav1d (all layers) output the base layer, while libaom outputs the upper
+      # layer. Checked against dav1d only (docs/parity.md).
+      *svc-L2*) ;;
+      *)
+        ab=; case $f in *.annexb) ab=--annexb ;; esac
+        aomdec $ab --rawvideo --limit="$N" -o $W/aom/$s.yuv "$p" 2>/dev/null || echo "$f: aomdec failed" >> $W/d-aom
         cmp -s $W/aom/$s.yuv $W/r1/$s.yuv || echo "$f: differs from aomdec ($N frames): $(mismatch $W/aom/$s.yuv $W/r1/$s.yuv $W/r1/$s.frames)" >> $W/d-aom
         aomd=$((aomd + 1))
         # The published per-frame md5 (always 3 planes, so monochrome is checked by aomdec only).
         m=/data/aom/${f#aom__}.md5
-        if [ -f "$m" ] && ! grep -q ' 400$' $W/r1/$s.frames; then
+        if [ "${f#aom__}" != "$f" ] && [ -f "$m" ] && ! grep -q ' 400$' $W/r1/$s.frames; then
           i=0 off=0
           while read -r w h bd lay; do
             i=$((i + 1)); sz=$(fsize "$w" "$h" "$bd" "$lay")

@@ -1595,7 +1595,7 @@ impl<'a> TileDecoder<'a> {
             let unit_cols = self.fs.lr_unit_cols[plane];
             let unit_row_start = (r * (MI_SIZE >> sub_y)).div_ceil(unit_size);
             let unit_row_end = unit_rows.min(((r + h) * (MI_SIZE >> sub_y)).div_ceil(unit_size));
-            let (numerator, denominator) = if self.fh.use_superres {
+            let (numerator, denominator) = if self.fh.frame_width != self.fh.upscaled_width {
                 (
                     (MI_SIZE >> sub_x) * self.fh.superres_denom as usize,
                     unit_size * SUPERRES_NUM,
