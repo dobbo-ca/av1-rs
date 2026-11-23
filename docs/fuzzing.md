@@ -12,3 +12,11 @@ its temporal units. Seeds: the parity corpus (`run.sh seeds`).
 
 `.github/workflows/fuzz.yml`: weekly (Thursday 12:23 UTC) and on dispatch, two jobs at a time,
 `-rss_limit_mb=2048 -malloc_limit_mb=512`, crashers uploaded as artifacts.
+
+## Runs on main
+
+| Date | Commit | max_total_time | Targets | Fuzz hours | Crashes | Runs (probe / decode / avif) |
+|---|---|---|---|---|---|---|
+| 2026-11-23 | a5cb385 | 900 s | 3 | 0.75 | 0 | 9,965,781 / 7,930 / 4,341 |
+
+`decode` and `avif` run whole frames under ASan, so they do few runs per second.
