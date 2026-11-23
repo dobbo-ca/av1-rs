@@ -55,6 +55,7 @@ Production code passes `simd::best()`; tests loop over `simd::available()`.
 | `grain` | `grain::blend_luma_row`, `grain::blend_chroma_row` | `blend_luma`, `blend_chroma`: the film grain noise blend of one row (scaling lookup, `round2( scale * noise, ScalingShift )`, clip, chroma merge and chroma scaling from luma), 8/10/12-bit, all subsamplings. The scale is looked up in `grain::scale_table` (`scale_lut` at every sample value), so the high bit depth interpolation is exact by construction; the x86 helper `gather256_i32` masks every index to the 4096-entry table before the gather. The grain template generation (auto-regression) and the stripe building stay scalar (once per frame, and a copy) | AVX2 (8 lanes), NEON (4 lanes); AVX-512 runs the AVX2 kernel |
 | `lr` | `lr::wiener_filter`, `lr::self_guided_filter` | `wiener`, `self_guided`: loop restoration of one block of at most 64 x 64 samples inside one stripe, from the source window that `lr::source_window` gathers (stripe edge rules unchanged): the Wiener filter and the self guided filter (box sums r = 1 and r = 2, the a/b computation, the weighted combination). The arithmetic is in 32-bit lanes; the module doc gives the bounds that make it exact. Blocks narrower than one vector use the oracle | AVX2 (8 x i32), NEON (4 x i32); AVX-512 runs the AVX2 kernel |
 | `cdef` | `cdef::cdef_direction`, `cdef::cdef_filter` | `direction` (7.15.2, one 8x8 luma block), `filter` (7.15.3, one 8x8, 4x4, 4x8 or 8x4 block), 8/10/12-bit. The filter copies the block and a 2-sample border into a padded 16-bit block with the sentinel `0x8000` for unavailable taps (dav1d's design, see NOTICE), so the kernel has no per-tap check. The dispatch takes the oracle for a block whose premises do not hold (block not fully inside `MiRows` x `MiCols`, a sample of 4096 or more, strengths above 255, a plane too short); decoded frames always meet them (`MiRows` and `MiCols` are even, samples fit the bit depth) | AVX2 (16 lanes), NEON (8 lanes); AVX-512 runs the AVX2 kernels |
+| `ipred` | `src/predict.rs` | Paeth; Smooth, Smooth_V, Smooth_H; directional zone 1 without upsampling; intra edge filter; palette (rows of 8); CFL alpha step | AVX2 (8 x i32), NEON (4 x i32); AVX-512 runs the AVX2 kernels |
 
 Tiers not written:
 
@@ -69,6 +70,21 @@ Tiers not written:
 - `cdef` AVX-512: a block is 16 to 64 samples and each tap row is a separate 8- or 4-sample
   load, so 512-bit vectors would only add lane inserts (the direction search is one 8x8 block,
   128-bit rows).
+
+`ipred` notes:
+
+- Every SIMD tier also predicts V_PRED and H_PRED (pAngle 90 and 180) as row copies and fills
+  instead of the per-sample directional loop, and computes the CFL luma average once per
+  sample (the oracle computes it twice) before the alpha kernel. Same arithmetic, so the same
+  output.
+- Not written, so the scalar oracle runs on every tier: DC (DC_TOP / LEFT / 128 included: one
+  sum and a `fill` per row, already memset speed), directional zones 2 and 3 (per-sample
+  source positions; they need gathers or a transpose, left for a later round), upsampled edges
+  (at most 16 entries, only for blocks with w + h <= 16), the upsample itself, recursive filter
+  intra (7-tap dependent cells; not in the profile).
+- AVX-512: not written; the Avx512 tier runs the AVX2 kernels. Rows are 4 to 64 samples and
+  most intra blocks are 4 to 16 wide, so 16-lane vectors would only help the widest blocks.
+- Code written for this crate; dav1d's ipred was not ported.
 
 ## Kernels kept and dropped
 

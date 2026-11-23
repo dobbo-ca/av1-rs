@@ -216,3 +216,32 @@ pub fn cdef(data: &[u8]) {
         assert_eq!(got.px, want.px, "{s:?}");
     }
 }
+
+/// Kernel family `ipred` (src/simd/ipred): the first byte picks the kernel (intra prediction,
+/// palette, CFL, edge filter), the next bytes (two per choice, then a xorshift seeded by the
+/// input length) give its input. Every tier must equal scalar.
+pub fn ipred(data: &[u8]) {
+    use crate::simd::ipred::check;
+    let Some((&which, rest)) = data.split_first() else {
+        return;
+    };
+    let mut bytes = rest.iter();
+    let mut s = 0x9e37_79b9_7f4a_7c15u64 ^ rest.len() as u64;
+    let mut next = move || -> u32 {
+        match (bytes.next(), bytes.next()) {
+            (Some(&a), Some(&b)) => u32::from(a) | (u32::from(b) << 8),
+            _ => {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 32) as u32
+            }
+        }
+    };
+    match which % 4 {
+        0 => check::intra(&mut next),
+        1 => check::palette(&mut next),
+        2 => check::cfl(&mut next),
+        _ => check::filter_edge(&mut next),
+    }
+}

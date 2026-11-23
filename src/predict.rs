@@ -9,23 +9,25 @@ use crate::consts::{
     ANGLE_STEP, D67_PRED, DC_PRED, INTRA_FILTER_SCALE_BITS, SMOOTH_H_PRED, SMOOTH_PRED,
     SMOOTH_V_PRED, V_PRED,
 };
+use crate::simd::{Simd, ipred};
 use crate::tables::{
     DR_INTRA_DERIVATIVE, INTRA_FILTER_TAPS, MODE_TO_ANGLE, SM_WEIGHTS_TX_4X4, SM_WEIGHTS_TX_8X8,
     SM_WEIGHTS_TX_16X16, SM_WEIGHTS_TX_32X32, SM_WEIGHTS_TX_64X64,
 };
 
 /// `Intra_Edge_Kernel` (spec 7.11.2.12).
-const INTRA_EDGE_KERNEL: [[i32; 5]; 3] = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
+pub(crate) const INTRA_EDGE_KERNEL: [[i32; 5]; 3] =
+    [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
 
 /// Index of `AboveRow[ 0 ]` / `LeftCol[ 0 ]` in the edge arrays; room below it holds the
 /// entries -1 and -2 (the latter only after upsampling).
-const OFF: usize = 16;
+pub(crate) const OFF: usize = 16;
 /// Edge array length: `OFF`, up to `w + h` = 128 entries, and slack for the interpolation reads.
-const EDGE_LEN: usize = OFF + 128 + 16;
+pub(crate) const EDGE_LEN: usize = OFF + 128 + 16;
 /// Largest `numPx` of the intra edge filter (spec 7.11.2.12: sz <= 129), plus slack.
 const EDGE_FILTER_MAX: usize = 136;
 
-type Edge = [i32; EDGE_LEN];
+pub(crate) type Edge = [i32; EDGE_LEN];
 
 /// Which neighbours of the transform block are available (spec 7.11.2 inputs).
 #[derive(Clone, Copy, Debug)]
@@ -63,7 +65,7 @@ fn ix(i: i32) -> usize {
     (i + OFF as i32) as usize
 }
 
-fn round2(x: i32, n: u32) -> i32 {
+pub(crate) fn round2(x: i32, n: u32) -> i32 {
     (x + ((1 << n) >> 1)) >> n
 }
 
@@ -79,6 +81,19 @@ fn round2_signed(x: i32, n: u32) -> i32 {
 /// implies `x > 0`, `mode` is below 13, `log2w` / `log2h` are in 2..=6 and `bit_depth` is
 /// 8, 10 or 12.
 pub(crate) fn predict_intra(
+    px: &mut [u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    e: IntraEdges,
+    p: &IntraParams,
+) {
+    predict_intra_simd(crate::simd::best(), px, stride, x, y, e, p);
+}
+
+/// [`predict_intra`] with the kernels of the tier `simd` (`Simd::scalar()` is the oracle).
+pub(crate) fn predict_intra_simd(
+    simd: Simd,
     px: &mut [u16],
     stride: usize,
     x: usize,
@@ -138,18 +153,18 @@ pub(crate) fn predict_intra(
     if p.use_filter_intra {
         predict_recursive(px, stride, x, y, w, h, &above, &left, p);
     } else if (V_PRED..=D67_PRED).contains(&p.mode) {
-        predict_directional(px, stride, x, y, e, w, h, &mut above, &mut left, p);
+        predict_directional(simd, px, stride, x, y, e, w, h, &mut above, &mut left, p);
     } else if matches!(p.mode, SMOOTH_PRED | SMOOTH_V_PRED | SMOOTH_H_PRED) {
-        predict_smooth(px, stride, x, y, &above, &left, p);
+        ipred::smooth(simd, px, stride, x, y, &above, &left, p);
     } else if p.mode == DC_PRED {
         predict_dc(px, stride, x, y, e, &above, &left, p);
     } else {
-        predict_paeth(px, stride, x, y, w, h, &above, &left);
+        ipred::paeth(simd, px, stride, x, y, w, h, &above, &left);
     }
 }
 
 /// Spec 7.11.2.2 (basic intra prediction, PAETH_PRED).
-fn predict_paeth(
+pub(crate) fn predict_paeth(
     px: &mut [u16],
     stride: usize,
     x: usize,
@@ -284,7 +299,7 @@ fn use_upsample(w: usize, h: usize, smooth: bool, delta: i32) -> bool {
 
 /// Spec 7.11.2.12: smooths `sz` entries of an edge (starting at index -1) with the kernel
 /// chosen by `strength`. `sz` is at most 129.
-fn filter_edge(buf: &mut Edge, sz: usize, strength: usize) {
+pub(crate) fn filter_edge(buf: &mut Edge, sz: usize, strength: usize) {
     if strength == 0 || sz == 0 {
         return;
     }
@@ -329,6 +344,7 @@ fn interp(edge: &Edge, idx: i32, base: i32, up: u32) -> u16 {
 
 /// Spec 7.11.2.4 (directional intra prediction), including the edge filter and upsampling.
 fn predict_directional(
+    simd: Simd,
     px: &mut [u16],
     stride: usize,
     x: usize,
@@ -357,12 +373,12 @@ fn predict_directional(
             if e.have_above {
                 let strength = intra_edge_filter_strength(w, h, smooth, p_angle - 90);
                 let num_px = w.min(p.max_x - x + 1) + if p_angle < 90 { h } else { 0 } + 1;
-                filter_edge(above, num_px, strength);
+                ipred::filter_edge(simd, above, num_px, strength);
             }
             if e.have_left {
                 let strength = intra_edge_filter_strength(w, h, smooth, p_angle - 180);
                 let num_px = h.min(p.max_y - y + 1) + if p_angle > 180 { w } else { 0 } + 1;
-                filter_edge(left, num_px, strength);
+                ipred::filter_edge(simd, left, num_px, strength);
             }
         }
         if use_upsample(w, h, smooth, p_angle - 90) {
@@ -392,6 +408,40 @@ fn predict_directional(
         0
     };
 
+    ipred::directional(
+        simd,
+        px,
+        stride,
+        x,
+        y,
+        w,
+        h,
+        above,
+        left,
+        p_angle,
+        dx,
+        dy,
+        upsample_above,
+        upsample_left,
+    );
+}
+
+/// The prediction loop of spec 7.11.2.4 (step 9 on), after the edge filter and upsampling.
+pub(crate) fn directional_ref(
+    px: &mut [u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    above: &Edge,
+    left: &Edge,
+    p_angle: i32,
+    dx: i32,
+    dy: i32,
+    upsample_above: u32,
+    upsample_left: u32,
+) {
     for i in 0..h {
         for j in 0..w {
             let (ii, jj) = (i as i32, j as i32);
@@ -429,7 +479,7 @@ fn predict_directional(
 }
 
 /// Smooth weight table for a block side of `1 << log2` samples (log2 in 2..=6).
-fn sm_weights(log2: usize) -> &'static [u8] {
+pub(crate) fn sm_weights(log2: usize) -> &'static [u8] {
     match log2 {
         2 => &SM_WEIGHTS_TX_4X4,
         3 => &SM_WEIGHTS_TX_8X8,
@@ -440,7 +490,7 @@ fn sm_weights(log2: usize) -> &'static [u8] {
 }
 
 /// Spec 7.11.2.6 (SMOOTH_PRED, SMOOTH_V_PRED, SMOOTH_H_PRED).
-fn predict_smooth(
+pub(crate) fn predict_smooth(
     px: &mut [u16],
     stride: usize,
     x: usize,
@@ -509,6 +559,32 @@ fn predict_dc(
 /// the `w x h` block. The caller passes `map` starting at the block's first map entry and
 /// guarantees every map value is below `palette.len()`.
 pub(crate) fn predict_palette(
+    px: &mut [u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    palette: &[u16],
+    map: &[u8],
+    map_stride: usize,
+) {
+    ipred::palette(
+        crate::simd::best(),
+        px,
+        stride,
+        x,
+        y,
+        w,
+        h,
+        palette,
+        map,
+        map_stride,
+    );
+}
+
+/// The scalar oracle of [`predict_palette`].
+pub(crate) fn palette_ref(
     px: &mut [u16],
     stride: usize,
     x: usize,
@@ -624,6 +700,42 @@ pub(crate) fn predict_intrabc(
 /// block position, `max_luma_w` / `max_luma_h` the spec's `MaxLumaW` / `MaxLumaH`. The caller
 /// guarantees the luma samples the spec reads (up to `max_luma_w` x `max_luma_h`) are in `luma`.
 pub(crate) fn predict_cfl(
+    chroma: &mut [u16],
+    c_stride: usize,
+    luma: &[u16],
+    l_stride: usize,
+    start_x: usize,
+    start_y: usize,
+    tx_w: usize,
+    tx_h: usize,
+    subsampling_x: bool,
+    subsampling_y: bool,
+    max_luma_w: usize,
+    max_luma_h: usize,
+    alpha: i32,
+    bit_depth: u32,
+) {
+    ipred::cfl(
+        crate::simd::best(),
+        chroma,
+        c_stride,
+        luma,
+        l_stride,
+        start_x,
+        start_y,
+        tx_w,
+        tx_h,
+        subsampling_x,
+        subsampling_y,
+        max_luma_w,
+        max_luma_h,
+        alpha,
+        bit_depth,
+    );
+}
+
+/// The scalar oracle of [`predict_cfl`].
+pub(crate) fn cfl_ref(
     chroma: &mut [u16],
     c_stride: usize,
     luma: &[u16],
