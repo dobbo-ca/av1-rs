@@ -1701,6 +1701,8 @@ impl<'a> TileDecoder<'a> {
         if self.fh.allow_intrabc {
             return Ok(());
         }
+        // The unit positions are frame positions; a tile state counts from its own origin.
+        let (r, c) = (r + self.fs.mi_row0, c + self.fs.mi_col0);
         let w = NUM_4X4_BLOCKS_WIDE[b_size];
         let h = NUM_4X4_BLOCKS_HIGH[b_size];
         for plane in 0..self.fs.num_planes {

@@ -33,7 +33,8 @@ AVIF stills are decoded with `av1::decode_avif` (the primary image and its alpha
 | `max_metadata` (bytes) | 16 MiB | `MetadataLimit` |
 
 `max_alloc` is the enforced peak working memory of one call (all threads; charged before each
-allocation, released on drop). `max_threads = 1` spawns no thread. A frame size is checked
+allocation, released on drop). `max_threads = 1` spawns no thread; otherwise the tiles of a frame
+and the tiles of an AVIF grid decode on up to `max_threads` threads, with the same output. A frame size is checked
 before anything is allocated. Setting the cancel flag returns `Error::Cancelled` at the next OBU
 or tile. Details: [docs/limits.md](docs/limits.md).
 

@@ -1,12 +1,15 @@
 //! The AVIF layer: the item graph comes from `isobmff`, the pixels from [`Decoder`].
 //!
-//! Coded items are decoded one after another with their own decoder; grid tiles are pasted into
+//! Coded items are decoded with their own decoder, grid tiles on up to `max_threads` threads; tiles are pasted into
 //! the output as they are decoded. Transforms, colour and the alpha plane are passed through
 //! raw: nothing is applied.
 
+use crate::ledger::Ledger;
+use crate::parallel::run_parallel;
 use crate::{Decoder, Error, Format, Frame, Limits, Options, Plane, PlaneData};
 use isobmff::{Av1c, Codec, CodecConfig, Grid, Heif, Image, ImageKind};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// A decoded AVIF still.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +109,11 @@ fn decode_image(ctx: &Ctx<'_>, image: &Image, nested: bool) -> Result<Frame, Err
 /// One coded AV1 item: configOBUs + item data, decoded by a fresh decoder; the last output
 /// frame is the image.
 fn decode_coded(ctx: &Ctx<'_>, image: &Image) -> Result<Frame, Error> {
+    decode_item(ctx, image, Decoder::new(ctx.options.clone(), *ctx.limits))
+}
+
+/// [`decode_coded`] with the decoder given (a grid tile shares its ledger with the others).
+fn decode_item(ctx: &Ctx<'_>, image: &Image, mut decoder: Decoder) -> Result<Frame, Error> {
     let ImageKind::Coded {
         codec: Codec::Av1,
         config: CodecConfig::Av1(av1c),
@@ -114,7 +122,6 @@ fn decode_coded(ctx: &Ctx<'_>, image: &Image) -> Result<Frame, Error> {
         return Err(Error::Unsupported("avif codec"));
     };
     let unit = temporal_unit(ctx, image.id, av1c)?;
-    let mut decoder = Decoder::new(ctx.options.clone(), *ctx.limits);
     decoder
         .decode_temporal_unit(&unit, Format::Section5, ctx.cancel)?
         .pop()
@@ -148,22 +155,50 @@ fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
     if count == 0 || count != grid.tiles.len() as u64 {
         return Err(Error::Invalid("avif grid tile count"));
     }
-    let mut canvas: Option<Canvas> = None;
-    for (i, id) in grid.tiles.iter().enumerate() {
+    // Tiles decode on up to `max_threads` threads. The tiles decoding at once share one budget
+    // (`max_alloc`) and the threads: each gets `max_threads / workers` of them, so one thread
+    // when there are at least as many tiles as threads.
+    let max_threads = ctx.limits.max_threads.max(1);
+    let workers = max_threads.min(grid.tiles.len());
+    let inner = Limits {
+        max_threads: (max_threads / workers).max(1),
+        ..*ctx.limits
+    };
+    let ledger = Arc::new(Ledger::default());
+    // A `max_alloc` below the small-allocation allowance only means that every charge fails.
+    let _ = ledger.reset(ctx.limits.max_alloc, 0);
+    let canvas: Mutex<Option<Canvas>> = Mutex::new(None);
+    run_parallel(grid.tiles.len(), max_threads, |i| {
         if ctx.cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
+        let id = grid
+            .tiles
+            .get(i)
+            .ok_or(Error::Invalid("avif grid tile count"))?;
         let tile = ctx.heif.image(*id).map_err(container)?;
-        let frame = decode_coded(ctx, &tile)?;
+        let decoder = Decoder::with_ledger(ctx.options.clone(), inner, Arc::clone(&ledger));
+        let frame = decode_item(ctx, &tile, decoder)?;
         let i = u32::try_from(i).map_err(|_| Error::Invalid("avif grid tile count"))?;
-        if canvas.is_none() {
-            canvas = Some(Canvas::new(&frame, grid, ctx.limits)?);
+        let mut guard = canvas.lock().unwrap_or_else(|e| e.into_inner());
+        // The canvas is sized by whichever tile finishes first; tile 0 then sets the properties
+        // of the output frame, as in a serial decode.
+        if guard.is_none() {
+            let mut c = Canvas::new(&frame, grid, ctx.limits)?;
+            c.first = i;
+            *guard = Some(c);
         }
-        if let Some(c) = &mut canvas {
-            c.paste(&frame, i % grid.columns, i / grid.columns)?;
+        let Some(c) = guard.as_mut() else {
+            return Err(Error::Invalid("avif grid tile count"));
+        };
+        if i == 0 && c.first != 0 {
+            c.take_properties(&frame);
         }
-    }
+        c.paste(&frame, i % grid.columns, i / grid.columns)
+    })?;
     canvas
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner())
         .map(|c| c.frame)
         .ok_or(Error::Invalid("avif grid tile count"))
 }
@@ -173,6 +208,8 @@ struct Canvas {
     frame: Frame,
     tile_w: u32,
     tile_h: u32,
+    /// Index of the tile the canvas was sized from (0 in a serial decode).
+    first: u32,
 }
 
 fn zeroed<T: Clone + Default>(n: u64) -> Result<Vec<T>, Error> {
@@ -265,7 +302,20 @@ impl Canvas {
             },
             tile_w: tw,
             tile_h: th,
+            first: 0,
         })
+    }
+
+    /// Takes the output frame's properties (everything but the size, format and samples) from
+    /// `tile`, tile 0 of the grid.
+    fn take_properties(&mut self, tile: &Frame) {
+        let f = &mut self.frame;
+        f.color = tile.color;
+        f.metadata = tile.metadata.clone();
+        f.film_grain_applied = tile.film_grain_applied;
+        f.frame_type = tile.frame_type;
+        f.temporal_id = tile.temporal_id;
+        f.spatial_id = tile.spatial_id;
     }
 
     /// Copies `tile` to tile position (`col`, `row`), clipped to the output.

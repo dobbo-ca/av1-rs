@@ -18,12 +18,13 @@ use crate::lf::loop_filter_frame;
 use crate::limits::Limits;
 use crate::lr::lr_frame;
 use crate::obu::{Obu, ObuIter, parse_metadata};
+use crate::parallel::run_parallel;
 use crate::seq::SequenceHeader;
 use crate::superres::upscale;
 use crate::tile::TileDecoder;
 use crate::{ColorInfo, Format, Frame, FrameInfo, Metadata, Options, Plane, PlaneData};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// A frame whose header was read and whose tile groups are still coming.
 #[derive(Debug)]
@@ -124,6 +125,14 @@ impl Decoder {
     /// A decoder with its own working memory budget (`limits.max_alloc`).
     pub fn new(options: Options, limits: Limits) -> Decoder {
         Self::build(options, limits, false)
+    }
+
+    /// A decoder that charges `ledger`, shared with the other decoders of one call (the tiles of
+    /// an AVIF grid that decode at once); the caller has reset it to its `max_alloc`.
+    pub(crate) fn with_ledger(options: Options, limits: Limits, ledger: Arc<Ledger>) -> Decoder {
+        let mut d = Self::build(options, limits, false);
+        d.ledger = ledger;
+        d
     }
 
     /// A decoder that only parses headers.
@@ -426,8 +435,10 @@ impl Decoder {
     /// `UpscaledWidth` x `FrameHeight` (chroma subsampled, rounded up) in size.
     ///
     /// `data` is the temporal unit; `tiles` are byte ranges into it, in tile order. `self.state`
-    /// holds the allocated `CurrFrame`. Tiles decode serially; `cancel` is checked between tiles
-    /// and by every tile once per superblock row.
+    /// holds the allocated `CurrFrame`. Tiles decode on up to `Limits::max_threads` threads (one
+    /// scope per frame, see docs/threading.md), serially for `max_threads` 1, a single tile or
+    /// an `allow_intrabc` frame; `cancel` is checked before every tile and by every tile once per
+    /// superblock row.
     ///
     /// The frame CDFs are the defaults for `base_q_idx` (`primary_ref_frame` is `NONE` in an
     /// intra frame). The tile CDFs the exit process returns are dropped: the frame end update
@@ -444,32 +455,20 @@ impl Decoder {
         tiles: &[TileRange],
         cancel: &AtomicBool,
     ) -> Result<(), Error> {
-        let mut fs = self
+        let fs = self
             .state
             .take()
             .ok_or(Error::Invalid("frame decode without a frame state"))?;
-        let mut frame_cdf = CdfContext::new_boxed();
-        frame_cdf.init_non_coeff_cdfs();
-        frame_cdf.init_coeff_cdfs(h.base_q_idx);
-        for t in tiles {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(Error::Cancelled);
-            }
-            let tile_cols = h.tile_info.tile_cols.max(1);
-            let bytes = data
-                .get(t.start..t.end)
-                .ok_or(Error::Invalid("tile data outside the temporal unit"))?;
-            TileDecoder::new(
-                bytes,
-                t.tile_num / tile_cols,
-                t.tile_num % tile_cols,
-                &frame_cdf,
-                &mut fs,
-                h,
-                seq,
-            )?
-            .decode_tile(cancel)?;
-        }
+        let mut fs = decode_tiles(
+            fs,
+            &self.ledger,
+            self.limits.max_threads,
+            h,
+            seq,
+            data,
+            tiles,
+            cancel,
+        )?;
         fs.lr_frame = wrapup(&mut fs, seq, h)?;
         self.state = Some(fs);
         Ok(())
@@ -618,6 +617,70 @@ impl Decoder {
             data,
         })
     }
+}
+
+/// The tile phase of a frame: `decode_tile()` of every tile of `tiles` into `fs` (spec 5.11.1).
+///
+/// With `max_threads` above 1 and more than one tile, the tiles decode on up to
+/// `min( max_threads, tiles )` threads of one scope (the calling thread is one of them). A worker
+/// decodes a tile into its own tile-sized [`FrameState::new_tile`] state, which the same tile
+/// decode fills as it does the frame state, and merges it into `fs` (tiles are disjoint, so the
+/// order of the merges does not matter). Otherwise the tiles decode in order straight into `fs`.
+/// A frame with `allow_intrabc` is always the second case: intra block copy reads samples and
+/// mode info of other tiles. The result is the same for every `max_threads` (docs/threading.md).
+fn decode_tiles(
+    mut fs: FrameState,
+    ledger: &Arc<Ledger>,
+    max_threads: usize,
+    h: &FrameHeader,
+    seq: &SequenceHeader,
+    data: &[u8],
+    tiles: &[TileRange],
+    cancel: &AtomicBool,
+) -> Result<FrameState, Error> {
+    let mut frame_cdf = CdfContext::new_boxed();
+    frame_cdf.init_non_coeff_cdfs();
+    frame_cdf.init_coeff_cdfs(h.base_q_idx);
+    let tile_cols = h.tile_info.tile_cols.max(1);
+    let decode =
+        |fs: &mut FrameState, t: &TileRange, row: usize, col: usize| -> Result<(), Error> {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            let bytes = data
+                .get(t.start..t.end)
+                .ok_or(Error::Invalid("tile data outside the temporal unit"))?;
+            TileDecoder::new(bytes, row, col, &frame_cdf, fs, h, seq)?.decode_tile(cancel)?;
+            Ok(())
+        };
+    let threads = if h.allow_intrabc { 1 } else { max_threads };
+    if threads.max(1).min(tiles.len()) <= 1 {
+        for t in tiles {
+            decode(&mut fs, t, t.tile_num / tile_cols, t.tile_num % tile_cols)?;
+        }
+        return Ok(fs);
+    }
+    let sb_size = if seq.use_128x128_superblock { 128 } else { 64 };
+    let frame = Mutex::new(fs);
+    run_parallel(tiles.len(), threads, |i| {
+        let t = tiles
+            .get(i)
+            .ok_or(Error::Invalid("tile index out of range"))?;
+        let mut local = FrameState::new_tile(
+            h,
+            seq,
+            ledger,
+            t.tile_num / tile_cols,
+            t.tile_num % tile_cols,
+        )?;
+        decode(&mut local, t, 0, 0)?;
+        frame
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .merge_tile(&local, sb_size);
+        Ok(())
+    })?;
+    Ok(frame.into_inner().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// Output planes of exactly `UpscaledWidth` x `FrameHeight` (chroma `(size + ss) >> ss`), each a
@@ -913,5 +976,130 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A 192x128 4:2:0 frame header with 3 x 2 tiles of 64x64, loop restoration on, and the
+    /// bytes of its tiles: pseudo-random data, which the symbol decoder reads as some valid
+    /// syntax (or a syntax error, the same for every thread count).
+    fn six_tiles(seed: u64) -> (FrameHeader, Vec<u8>, Vec<TileRange>) {
+        let h = FrameHeader {
+            frame_width: 192,
+            frame_height: 128,
+            upscaled_width: 192,
+            mi_cols: 48,
+            mi_rows: 32,
+            base_q_idx: 60,
+            tx_mode: TX_MODE_SELECT,
+            frame_restoration_type: [RESTORE_WIENER, RESTORE_SGRPROJ, RESTORE_SWITCHABLE],
+            loop_restoration_size: [64, 32, 32],
+            uses_lr: true,
+            tile_info: crate::header::TileInfo {
+                tile_cols: 3,
+                tile_rows: 2,
+                mi_col_starts: vec![0, 16, 32, 48],
+                mi_row_starts: vec![0, 16, 32],
+                ..Default::default()
+            },
+            ..FrameHeader::default()
+        };
+        let mut x = seed | 1;
+        let (mut data, mut tiles) = (Vec::new(), Vec::new());
+        for tile_num in 0..6 {
+            let start = data.len();
+            for _ in 0..2000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                data.push((x >> 24) as u8);
+            }
+            tiles.push(TileRange {
+                tile_num,
+                start,
+                end: data.len(),
+            });
+        }
+        (h, data, tiles)
+    }
+
+    /// The tile phase of `six_tiles( seed )` with `threads` threads and `max_alloc`; the ledger is
+    /// returned to read its peak.
+    fn run_tiles(
+        seed: u64,
+        threads: usize,
+        max_alloc: usize,
+    ) -> (Result<FrameState, Error>, Arc<Ledger>) {
+        let seq = SequenceHeader::parse(&still_sequence_header(), 0).unwrap();
+        let (h, data, tiles) = six_tiles(seed);
+        let ledger = Arc::new(Ledger::default());
+        ledger.reset(max_alloc, 0).unwrap();
+        let r = FrameState::new(&h, &seq, &ledger)
+            .and_then(|fs| decode_tiles(fs, &ledger, threads, &h, &seq, &data, &tiles, &cancel()));
+        (r, ledger)
+    }
+
+    fn assert_same_state(a: &FrameState, b: &FrameState) {
+        assert_eq!(a.mi_sizes, b.mi_sizes);
+        assert_eq!(a.skips, b.skips);
+        assert_eq!(a.is_inters, b.is_inters);
+        assert_eq!(a.segment_ids, b.segment_ids);
+        assert_eq!(a.y_modes, b.y_modes);
+        assert_eq!(a.uv_modes, b.uv_modes);
+        assert_eq!(a.ref_frames0, b.ref_frames0);
+        assert_eq!(a.tx_sizes, b.tx_sizes);
+        assert_eq!(a.palette_sizes, b.palette_sizes);
+        assert_eq!(a.delta_lfs, b.delta_lfs);
+        assert_eq!(a.loopfilter_tx_sizes, b.loopfilter_tx_sizes);
+        assert_eq!(a.cdef_idx, b.cdef_idx);
+        assert_eq!(a.lr_type, b.lr_type);
+        assert_eq!(a.lr_wiener, b.lr_wiener);
+        assert_eq!(a.lr_sgr_set, b.lr_sgr_set);
+        assert_eq!(a.lr_sgr_xqd, b.lr_sgr_xqd);
+        assert_eq!(a.curr_frame.len(), b.curr_frame.len());
+        for (p, q) in a.curr_frame.iter().zip(&b.curr_frame) {
+            assert_eq!(p.px, q.px);
+        }
+    }
+
+    #[test]
+    fn tiles_decode_the_same_for_every_thread_count() {
+        let mut decoded = 0;
+        for seed in 1..=6 {
+            let (serial, _) = run_tiles(seed, 1, 64 << 20);
+            for threads in [2, 3, 6, 8] {
+                let (par, ledger) = run_tiles(seed, threads, 64 << 20);
+                match (&serial, &par) {
+                    (Ok(a), Ok(b)) => assert_same_state(a, b),
+                    (Err(a), Err(b)) => assert_eq!(a, b),
+                    _ => panic!("serial and {threads} threads differ in Ok or Err"),
+                }
+                assert!(ledger.peak() <= 64 << 20);
+                drop(par);
+                assert_eq!(ledger.left(), (64 << 20) - crate::ledger::SMALL);
+            }
+            decoded += usize::from(serial.is_ok());
+        }
+        // Most random tile data is valid syntax; this guards against a test that compares nothing.
+        assert!(decoded > 0);
+    }
+
+    #[test]
+    fn tile_threads_stay_within_max_alloc() {
+        for max_alloc in [1024, 100 << 10, 120 << 10, 400 << 10, 1 << 20] {
+            for threads in [1, 2, 3] {
+                let (r, ledger) = run_tiles(1, threads, max_alloc);
+                assert!(ledger.peak() <= max_alloc as u64);
+                assert!(r.is_ok() || r.as_ref().err() != Some(&Error::OutOfMemory));
+                drop(r);
+                assert_eq!(
+                    ledger.left(),
+                    max_alloc.saturating_sub(crate::ledger::SMALL)
+                );
+            }
+        }
+        // The frame alone fits in 120 KiB, a tile-sized state on top of it does not.
+        let (r, _) = run_tiles(1, 1, 120 << 10);
+        assert!(!matches!(r, Err(Error::AllocLimit)));
+        let (r, _) = run_tiles(1, 3, 120 << 10);
+        assert_eq!(r.err(), Some(Error::AllocLimit));
     }
 }
