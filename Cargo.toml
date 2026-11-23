@@ -18,3 +18,7 @@ opt-level = 2
 # One codegen unit, so the decode loops inline across modules.
 [profile.release]
 codegen-units = 1
+
+[features]
+# Exposes `av1::fuzzing` (cross-tier SIMD checks) to the fuzz crate in tests/fuzz. Not for users.
+fuzzing = []

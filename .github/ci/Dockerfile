@@ -33,7 +33,8 @@ FROM src AS ci
 RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + && cargo fmt --check
 RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
-    find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --all-targets -- -D warnings
+    find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --all-targets -- -D warnings \
+    && cargo clippy --locked --lib --features fuzzing -- -D warnings
 RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
 RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \

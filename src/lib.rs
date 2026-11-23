@@ -83,6 +83,9 @@ mod recon;
 mod scan;
 mod seq;
 // The SIMD tiers; `unsafe` is allowed only in its load/store helpers and in the dispatch fns.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 #[allow(dead_code)] // the kernel families join one per PR
 mod simd;
 mod superres;
