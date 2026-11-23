@@ -15,8 +15,8 @@ av1-oracle --threads 1 $W/in $W/r >/dev/null 2>&1 || true
 best() {
   b=
   for _ in 1 2 3; do
-    s=$(date +%s%N); "$@" >/dev/null 2>&1; e=$(date +%s%N)
-    t=$(((e - s) / 1000000))
+    t0=$(date +%s%N); "$@" >/dev/null 2>&1; t1=$(date +%s%N)
+    t=$(((t1 - t0) / 1000000))
     if [ -z "$b" ] || [ "$t" -lt "$b" ]; then b=$t; fi
   done
   echo "$b"
