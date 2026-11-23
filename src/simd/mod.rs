@@ -97,8 +97,7 @@ pub(crate) fn best() -> Simd {
         let cap = requested();
         avail
             .into_iter()
-            .filter(|s| cap.is_none_or(|r| s.0 <= r))
-            .next_back()
+            .rfind(|s| cap.is_none_or(|r| s.0 <= r))
             .unwrap_or(Simd(Tier::Scalar))
     })
 }
