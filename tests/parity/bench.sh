@@ -1,51 +1,75 @@
 #!/bin/sh
-# bench.sh <report-dir>: dav1d and av1-rs (examples/oracle.rs) decode the same frames of the
-# corpus, one thread and default threads, in one container. Information only: there is no speed
-# bar (docs/benchmarks.md). Wall time of the whole set, best of 3.
+# bench.sh <report-dir>: dav1d, aomdec and av1-rs (examples/oracle.rs, the default build and the
+# x86-64-v4 build) decode the same frames of each bench class (tests/parity/bench-lib.sh), with
+# one thread and with the default threads, in one container. Information only: there is no speed
+# bar (docs/benchmarks.md). Wall time of the whole class, best of 5. No decoder writes samples.
 set -u
 W=/work
 REP=$1
-rm -rf $W; mkdir -p "$REP" $W/in $W/r $W/d
-grep -E 'quantizer-(00|31|63)|allintra|size-(196|226)' /data.list | while IFS= read -r f; do
-  ln -sf "/data/${f#./}" "$W/in/$(printf '%s' "${f#./}" | sed 's#/#__#g')"
-done
-# The frames av1-rs outputs (the leading intra frames); dav1d decodes the same number.
-av1-oracle --threads 1 $W/in $W/r >/dev/null 2>&1 || echo "av1-oracle exited non-zero in the frame-count run" >> "$REP/failures.txt"
+NT=$(nproc)
+. tests/parity/bench-lib.sh
+rm -rf $W; mkdir -p "$REP" $W
+: > "$REP/failures.txt"
+classes $W/c 2>> "$REP/failures.txt"
 
+# The frames av1-rs outputs per stream (the leading intra frames); dav1d and aomdec decode the
+# same number.
+for c in $CLASSES; do
+  av1-oracle --null --threads 1 $W/c/$c $W/f/$c >/dev/null 2>&1 || echo "av1-oracle exited non-zero on $c" >> "$REP/failures.txt"
+done
+
+ms() {
+  t0=$(date +%s%N); "$@" >/dev/null 2>&1 || echo "failed: $*" >> "$REP/failures.txt"; t1=$(date +%s%N)
+  echo $(((t1 - t0) / 1000000))
+}
 best() {
   b=
-  for _ in 1 2 3; do
-    t0=$(date +%s%N); "$@" >/dev/null 2>&1 || echo "failed: $*" >> "$REP/failures.txt"; t1=$(date +%s%N)
-    t=$(((t1 - t0) / 1000000))
+  for _ in 1 2 3 4 5; do
+    t=$(ms "$@")
     if [ -z "$b" ] || [ "$t" -lt "$b" ]; then b=$t; fi
   done
   echo "$b"
 }
-
-dav() {
-  for p in $W/in/*; do
-    s=$(basename "${p%.*}")
-    n=$(wc -l < "$W/r/$s.frames" 2>/dev/null || echo 0)
+# each <class> <cmd...>: runs <cmd> <file> <frames> for every file of the class.
+each() {
+  c=$1; shift
+  for p in $W/c/$c/*; do
+    n=$(wc -l < "$W/f/$c/$(basename "${p%.*}").frames" 2>/dev/null || echo 0)
     [ "$n" -gt 0 ] || continue
-    dav1d -q --threads "$1" --limit "$n" -i "$p" -o /dev/null --muxer null
+    "$@" "$p" "$n" || return 1
   done
 }
+dav() { dav1d -q --threads "$1" --limit "$3" -i "$2" -o /dev/null --muxer null; }
+aom() { aomdec --rawvideo --threads="$1" --limit="$3" -o /dev/null "$2"; }
+rs() { "$1" --null --threads "$2" "$W/c/$3" $W/o; }
+ratio() { [ "${2:-0}" -gt 0 ] && echo "$(($1 * 100 / $2))%" || echo "-"; }
 
-frames=$(cat $W/r/*.frames 2>/dev/null | wc -l)
-r1=$(best av1-oracle --threads 1 $W/in $W/d)
-rn=$(best av1-oracle $W/in $W/d)
-d1=$(best dav 1)
-dn=$(best dav 0)
-ratio() { [ "$2" -gt 0 ] && echo "$(($1 * 100 / $2))%" || echo "-"; }
+table() {
+  tn=$1 dt=$2 at=$3
+  echo "| class | streams | frames | dav1d ms | aomdec ms | av1-rs ms | av1-rs v4 ms | av1-rs / dav1d | v4 / dav1d | av1-rs / aomdec |"
+  echo "|---|---|---|---|---|---|---|---|---|---|"
+  sd=0 sa=0 sr=0 sv=0
+  for c in $CLASSES; do
+    d=$(best each $c dav $dt); a=$(best each $c aom $at)
+    r=$(best rs av1-oracle $tn $c); v=$(best rs av1-oracle-v4 $tn $c)
+    sd=$((sd + d)) sa=$((sa + a)) sr=$((sr + r)) sv=$((sv + v))
+    echo "| $c | $(ls $W/c/$c | wc -l) | $(cat $W/f/$c/*.frames 2>/dev/null | wc -l) | $d | $a | $r | $v | $(ratio $r $d) | $(ratio $v $d) | $(ratio $r $a) |"
+  done
+  echo "| all | | | $sd | $sa | $sr | $sv | $(ratio $sr $sd) | $(ratio $sv $sd) | $(ratio $sr $sa) |"
+}
+
 {
   echo "## av1-rs bench (information only)"
   echo
-  echo "$(ls $W/in | wc -l) streams, $frames frames (av1-rs output incl. writing .yuv; dav1d to null)."
+  echo "Classes: tests/parity/bench-lib.sh. Best of 5 wall times; no decoder writes samples. av1-rs v4: built with -C target-cpu=x86-64-v4 and the false-deps flags."
   echo
-  echo "| threads | dav1d ms | av1-rs ms | av1-rs / dav1d |"
-  echo "|---|---|---|---|"
-  echo "| 1 | $d1 | $r1 | $(ratio "$r1" "$d1") |"
-  echo "| default | $dn | $rn | $(ratio "$rn" "$dn") |"
+  echo "### 1 thread"
+  echo
+  table 1 1 1
+  echo
+  echo "### default threads ($NT)"
+  echo
+  table $NT 0 $NT
 } > "$REP/summary.md"
-[ -f "$REP/failures.txt" ] && { echo; echo "WARNING: a timed command failed, times are not meaningful:"; cat "$REP/failures.txt"; } >> "$REP/summary.md"
+[ -s "$REP/failures.txt" ] && { echo; echo "WARNING: a command failed, its times are not meaningful:"; sed 's/^/    /' "$REP/failures.txt"; } >> "$REP/summary.md"
 cat "$REP/summary.md"

@@ -2,7 +2,7 @@
 //! comparing with other decoders.
 //!
 //! ```text
-//! oracle [--info] [--threads N] [--no-filmgrain] [--op N] [--all-layers] <in-dir> <out-dir>
+//! oracle [--info] [--null] [--threads N] [--no-filmgrain] [--op N] [--all-layers] <in-dir> <out-dir>
 //! ```
 //!
 //! Inputs (sorted by name): `.ivf` (each IVF frame is one temporal unit), `.obu`, `.av1` and
@@ -23,6 +23,8 @@
 //! assembled and cropped; transforms are not applied), `<stem>.frames` has its one line, and
 //! `<stem>.alpha.yuv` the alpha image when there is one. `--info` does not apply to `.avif`.
 //!
+//! With `--null` the samples are decoded but no `.yuv` is written (the bench and profile runs).
+//!
 //! With `--info` the decode is replaced by `av1::probe` and `<stem>.info` has one line per
 //! frame: `type show W H frameW bitdepth layout` (`show` is 1 when the frame is output).
 //!
@@ -41,6 +43,7 @@ use std::sync::atomic::AtomicBool;
 
 struct Args {
     info: bool,
+    null: bool,
     threads: Option<usize>,
     film_grain: bool,
     operating_point: usize,
@@ -59,6 +62,7 @@ enum Kind {
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         info: false,
+        null: false,
         threads: None,
         film_grain: true,
         operating_point: 0,
@@ -76,6 +80,7 @@ fn parse_args() -> Result<Args, String> {
         };
         match a.as_str() {
             "--info" => args.info = true,
+            "--null" => args.null = true,
             "--no-filmgrain" => args.film_grain = false,
             "--all-layers" => args.all_layers = true,
             "--threads" => args.threads = Some(number("--threads")?),
@@ -151,15 +156,19 @@ fn out(stem: &Path, ext: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn write_frames(frames: &[Frame], stem: &Path) -> std::io::Result<()> {
+fn write_frames(frames: &[Frame], stem: &Path, null: bool) -> std::io::Result<()> {
     let mut yuv = Vec::new();
     let mut lines = String::new();
     for f in frames {
-        append_planes(&mut yuv, f);
+        if !null {
+            append_planes(&mut yuv, f);
+        }
         let l = layout(f.mono_chrome, f.subsampling_x, f.subsampling_y);
         let _ = writeln!(lines, "{} {} {} {}", f.width, f.height, f.bit_depth, l);
     }
-    fs::write(out(stem, "yuv"), yuv)?;
+    if !null {
+        fs::write(out(stem, "yuv"), yuv)?;
+    }
     fs::write(out(stem, "frames"), lines)
 }
 
@@ -190,8 +199,8 @@ fn run_file(
         };
         return match decode_avif(&data, &options, limits, &AtomicBool::new(false)) {
             Ok(avif) => {
-                write_frames(std::slice::from_ref(&avif.image), &stem)?;
-                if let Some(alpha) = &avif.alpha {
+                write_frames(std::slice::from_ref(&avif.image), &stem, args.null)?;
+                if let Some(alpha) = avif.alpha.as_ref().filter(|_| !args.null) {
                     let mut yuv = Vec::new();
                     append_planes(&mut yuv, alpha);
                     fs::write(out(&stem, "alpha.yuv"), yuv)?;
@@ -199,7 +208,7 @@ fn run_file(
                 Ok(())
             }
             Err(e) => {
-                write_frames(&[], &stem)?;
+                write_frames(&[], &stem, args.null)?;
                 write_err(&stem, &e)
             }
         };
@@ -215,7 +224,7 @@ fn run_file(
             if args.info {
                 fs::write(out(&stem, "info"), "")?;
             } else {
-                write_frames(&[], &stem)?;
+                write_frames(&[], &stem, args.null)?;
             }
             return write_err(&stem, &e);
         }
@@ -272,7 +281,7 @@ fn run_file(
             }
         }
     }
-    write_frames(&frames, &stem)?;
+    write_frames(&frames, &stem, args.null)?;
     match stopped {
         Some(e) => write_err(&stem, &e),
         None => Ok(()),
@@ -303,7 +312,7 @@ fn main() -> ExitCode {
         Err(msg) => {
             eprintln!("oracle: {msg}");
             eprintln!(
-                "usage: oracle [--info] [--threads N] [--no-filmgrain] [--op N] [--all-layers] <in-dir> <out-dir>"
+                "usage: oracle [--info] [--null] [--threads N] [--no-filmgrain] [--op N] [--all-layers] <in-dir> <out-dir>"
             );
             return ExitCode::from(2);
         }

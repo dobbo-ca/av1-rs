@@ -127,18 +127,42 @@ RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
     sh tests/parity/run.sh seeds tests/fuzz/seeds
 RUN cargo +nightly fuzz build --fuzz-dir tests/fuzz
 
-# Benchmark (bench.yml): dav1d and examples/bench on the same corpus, in one container, so the
-# ratio compares the same machine. Information only (no speed bar). BENCH_RUN changes per run,
-# so a cache hit of the same source does not reuse an old timing.
-FROM oracles AS bench
+# Benchmark (bench.yml) and profile (profile.yml) binaries: av1-oracle (the default release
+# build), av1-oracle-v4 (the release-binary flags of docs/conventions.md: x86-64-v4 with the
+# false-deps features, fat LTO, panic=abort) and av1-avifx (extracts AVIF items for the classes).
+FROM oracles AS bench-bin
 COPY . .
 COPY --from=data /data.list /data.list
 RUN --mount=type=cache,id=av1-rs-target-bench,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + \
-    && cargo build --locked --release --example oracle --example avifx && cp target/release/examples/oracle /usr/local/bin/av1-oracle && cp target/release/examples/avifx /usr/local/bin/av1-avifx
+    && cargo build --locked --release --example oracle --example avifx \
+    && cp target/release/examples/oracle /usr/local/bin/av1-oracle && cp target/release/examples/avifx /usr/local/bin/av1-avifx \
+    && RUSTFLAGS="-C target-cpu=x86-64-v4 -C target-feature=+false-deps-tzcnt,+false-deps-bls" \
+       CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_PANIC=abort \
+       cargo build --locked --release --example oracle --target-dir target/v4 \
+    && cp target/v4/release/examples/oracle /usr/local/bin/av1-oracle-v4
+
+# Benchmark: dav1d, aomdec and av1-rs on the bench classes, in one container, so the ratio
+# compares the same machine. Information only (no speed bar). BENCH_RUN changes per run, so a
+# cache hit of the same source does not reuse an old timing.
+FROM bench-bin AS bench
 ARG BENCH_RUN=0
 RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
     echo "run $BENCH_RUN" && mkdir -p /report && { sh tests/parity/bench.sh /report; echo $? > /report/status; }
 
 FROM scratch AS bench-report
 COPY --from=bench /report /
+
+# Profile (profile.yml): the oracle with line tables and frame pointers, perf and valgrind, and
+# the bench classes copied into the image (the workflow runs it with `docker run --privileged`,
+# because perf_event_open is not allowed inside a BuildKit RUN).
+FROM bench-bin AS profile
+RUN apt-get update && apt-get install -y --no-install-recommends linux-perf valgrind \
+    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,id=av1-rs-target-bench,sharing=locked,target=/src/target \
+    find src examples tests -name '*.rs' -exec touch {} + \
+    && RUSTFLAGS="-C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
+       cargo build --locked --release --example oracle --target-dir target/prof \
+    && cp target/prof/release/examples/oracle /usr/local/bin/av1-oracle-prof
+RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
+    sh tests/parity/profile.sh prep /bench && du -sh /bench
