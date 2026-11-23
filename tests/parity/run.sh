@@ -114,7 +114,7 @@ full() {
     else echo "| $g | FAIL, $l lines |" >> "$REP/summary.md"; bad=1; head -n 300 $W/d-$g > "$REP/$g.diff"; fi
   done
   echo >> "$REP/summary.md"
-  echo "Stop classes (av1-rs .err, one thread): $(cat $W/r1/*.err 2>/dev/null | sort | uniq -c | tr '\n' ' ')" >> "$REP/summary.md"
+  echo "Stop classes (av1-rs .err, one thread): $(for e in $W/r1/*.err; do [ -f "$e" ] && printf '%s\n' "$(cat "$e")"; done | sort | uniq -c | tr -s ' \n' ' ')" >> "$REP/summary.md"
   cat "$REP/summary.md"
   return $bad
 }
