@@ -145,6 +145,13 @@ pub const MV_INTRABC_CONTEXT: usize = 1;
 pub const MV_JOINTS: usize = 4;
 /// Number of values for `mv_class`
 pub const MV_CLASSES: usize = 11;
+/// `mv_joint` values (spec semantics of `mv_joint`): which components of the motion vector difference change
+pub const MV_JOINT_ZERO: usize = 0;
+pub const MV_JOINT_HNZVZ: usize = 1;
+pub const MV_JOINT_HZVNZ: usize = 2;
+pub const MV_JOINT_HNZVNZ: usize = 3;
+/// `mv_class` value of the smallest motion vector differences
+pub const MV_CLASS_0: usize = 0;
 /// Number of values for `mv_class0_bit`
 pub const CLASS0_SIZE: usize = 2;
 /// Maximum number of bits for decoding motion vectors

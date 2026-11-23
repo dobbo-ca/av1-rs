@@ -61,6 +61,7 @@ mod error;
 mod frame;
 mod grain;
 mod header;
+mod intrabc;
 mod ledger;
 mod lf;
 mod limits;

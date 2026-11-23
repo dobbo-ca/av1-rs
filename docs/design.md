@@ -45,10 +45,13 @@ cdf_tables.rs default CDF tables transcribed from the spec
 tile.rs       tile group decode (5.11): partition, intra frame mode info, palette, filter intra,
               tx size, residual, read_cdef, read_lr, delta q/lf, segmentation ids; calls predict
               and recon in spec order (decode_block -> compute_prediction / residual)
-coef.rs       coefficients syntax (5.11.39), transform type (5.11.47), contexts (8.3.2)
+intrabc.rs    intra block copy: find_mv_stack for an intra frame (7.10.2), assign_mv / read_mv (5.11.26,
+              5.11.32), compute_prediction (5.11.33) and the inter prediction of 7.11.3 for refIdx -1
+coef.rs       coefficients syntax (5.11.39), transform type (5.11.47), contexts (8.3.2),
+              transform_tree (5.11.36) for inter (intrabc) blocks
 scan.rs       scan tables
 predict.rs    intra prediction (7.11.2) incl. directional + edge filter/upsample, smooth,
-              paeth, DC, filter intra; palette (7.11.4); CFL (7.11.5)
+              paeth, DC, filter intra; palette (7.11.4); CFL (7.11.5); bilinear block copy (7.11.3.4)
 recon.rs      dequant (7.12.2) and reconstruct (7.12.3)
 transform.rs  1D and 2D inverse transforms (7.13): DCT 4..64, ADST 4/8/16, flipADST, identity,
               WHT, with the spec's intermediate rounding and clamping

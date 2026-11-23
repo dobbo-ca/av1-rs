@@ -6,8 +6,9 @@
 //!
 //! The residual (`residual( )`, transform blocks, coefficients, transform type) is not here:
 //! `decode_block` calls `self.residual( )`, which `src/coef.rs` implements as an
-//! `impl TileDecoder<'_>` method. Prediction happens per transform block inside it, so
-//! `compute_prediction( )` has nothing to do in an intra frame and is not called.
+//! `impl TileDecoder<'_>` method. Intra prediction happens per transform block inside it, so
+//! `compute_prediction( )` is only called for an intra block copy block (`src/intrabc.rs`, which
+//! also has the motion vector syntax and prediction of such a block).
 //!
 //! # Entry point
 //!
@@ -39,7 +40,7 @@ use crate::tables::{
     BLOCK_HEIGHT, BLOCK_WIDTH, MAX_TX_DEPTH, MAX_TX_SIZE_RECT, MI_HEIGHT_LOG2, MI_WIDTH_LOG2,
     NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_COLOR_CONTEXT,
     PALETTE_COLOR_HASH_MULTIPLIERS, PARTITION_SUBSIZE, SPLIT_TX_SIZE, SUBSAMPLED_SIZE, TX_HEIGHT,
-    TX_WIDTH,
+    TX_SIZE_SQR_UP, TX_WIDTH,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -139,6 +140,8 @@ pub(crate) struct TileDecoder<'a> {
     pub color_map_uv: Box<[[u8; 64]; 64]>,
     /// `TxSize`.
     pub tx_size: usize,
+    /// `Mv[ 0 ]` of an intra block copy block, `[ row, col ]` in 1/8 sample units.
+    pub mv: [i32; 2],
     /// `CurrentQIndex`.
     pub current_q_index: i32,
     /// `DeltaLF[ i ]`.
@@ -329,7 +332,7 @@ fn read_color_map(
 
 /// Sets `val` in a `rows` x `cols` rectangle at (`r`, `c`) of a `mi_cols` wide array; positions
 /// outside the array are left alone.
-fn fill_rows<T: Copy>(
+pub(crate) fn fill_rows<T: Copy>(
     v: &mut [T],
     mi_cols: usize,
     r: usize,
@@ -454,6 +457,7 @@ impl<'a> TileDecoder<'a> {
             color_map_y: Box::new([[0; 64]; 64]),
             color_map_uv: Box::new([[0; 64]; 64]),
             tx_size: TX_4X4,
+            mv: [0; 2],
             current_q_index: i32::from(fh.base_q_idx),
             delta_lf: [0; FRAME_LF_COUNT],
             read_deltas: false,
@@ -474,9 +478,9 @@ impl<'a> TileDecoder<'a> {
     /// Returns the tile's final CDFs.
     ///
     /// # Errors
-    /// `Cancelled` when `cancel` is set (checked once per superblock row), `Unsupported` for
-    /// intra block copy, `Invalid` for a syntax value the spec forbids or for trailing bits that
-    /// break the exit process's conformance requirement.
+    /// `Cancelled` when `cancel` is set (checked once per superblock row), `Invalid` for a
+    /// syntax value the spec forbids or for trailing bits that break the exit process's
+    /// conformance requirement.
     pub(crate) fn decode_tile(mut self, cancel: &AtomicBool) -> Result<Box<CdfContext>, Error> {
         self.clear_above_context();
         self.delta_lf = [0; FRAME_LF_COUNT];
@@ -863,6 +867,10 @@ impl<'a> TileDecoder<'a> {
             cols,
             INTRA_FRAME as i8,
         );
+        if self.is_inter {
+            fill_rows(&mut self.fs.mvs, mi_cols, r, c, rows, cols, self.mv);
+            self.compute_prediction()?;
+        }
         // compute_prediction( ) is a no-op for an intra block: prediction runs per transform
         // block inside residual( ).
         self.residual()?;
@@ -982,7 +990,15 @@ impl<'a> TileDecoder<'a> {
         self.use_intrabc =
             self.fh.allow_intrabc && self.sd.read_symbol(&mut self.cdf.intrabc_cdf) != 0;
         if self.use_intrabc {
-            return Err(Error::Unsupported("intrabc"));
+            // motion_mode is SIMPLE, compound_type COMPOUND_AVERAGE and interp_filter BILINEAR:
+            // fixed values the intrabc prediction hard-codes.
+            self.is_inter = true;
+            self.y_mode = DC_PRED;
+            self.uv_mode = DC_PRED;
+            self.palette_size_y = 0;
+            self.palette_size_uv = 0;
+            self.intrabc_mode_info();
+            return Ok(());
         }
         self.is_inter = false;
         let above_mode = if self.avail_u {
@@ -1513,11 +1529,117 @@ impl<'a> TileDecoder<'a> {
         }
     }
 
-    /// Spec 5.11.16 `read_block_tx_size( )` for an intra block (`is_inter` is 0, so the
-    /// `read_var_tx_size` branch is never taken). `InterTxSizes` is not kept: in an intra frame
-    /// it equals `TxSizes`, which the CDF selection reads instead.
+    /// Spec 5.11.16 `read_block_tx_size( )`. `InterTxSizes` is only kept for a frame with
+    /// `allow_intrabc` (see `FrameState::inter_tx_sizes`): without intra block copy it equals
+    /// `TxSizes`, which the `tx_depth` CDF selection reads instead.
     fn read_block_tx_size(&mut self) {
-        self.read_tx_size(!self.skip || !self.is_inter);
+        let bw4 = NUM_4X4_BLOCKS_WIDE[self.mi_size];
+        let bh4 = NUM_4X4_BLOCKS_HIGH[self.mi_size];
+        if self.fh.tx_mode == TX_MODE_SELECT
+            && self.mi_size > BLOCK_4X4
+            && self.is_inter
+            && !self.skip
+            && !self.lossless
+        {
+            let max_tx_sz = MAX_TX_SIZE_RECT[self.mi_size];
+            let tx_w4 = TX_WIDTH[max_tx_sz] / MI_SIZE;
+            let tx_h4 = TX_HEIGHT[max_tx_sz] / MI_SIZE;
+            for row in (self.mi_row..self.mi_row + bh4).step_by(tx_h4) {
+                for col in (self.mi_col..self.mi_col + bw4).step_by(tx_w4) {
+                    self.read_var_tx_size(row, col, max_tx_sz, 0);
+                }
+            }
+        } else {
+            self.read_tx_size(!self.skip || !self.is_inter);
+            let mi_cols = self.fs.mi_cols;
+            let rows = bh4.min(self.fs.mi_rows.saturating_sub(self.mi_row));
+            let cols = bw4.min(mi_cols.saturating_sub(self.mi_col));
+            let tx_size = self.tx_size as u8;
+            fill_rows(
+                &mut self.fs.inter_tx_sizes,
+                mi_cols,
+                self.mi_row,
+                self.mi_col,
+                rows,
+                cols,
+                tx_size,
+            );
+        }
+    }
+
+    /// Spec 5.11.17 `read_var_tx_size( row, col, txSz, depth )`.
+    fn read_var_tx_size(&mut self, row: usize, col: usize, tx_sz: usize, depth: usize) {
+        if row >= self.fs.mi_rows || col >= self.fs.mi_cols {
+            return;
+        }
+        let txfm_split = if tx_sz == TX_4X4 || depth == MAX_VARTX_DEPTH {
+            false
+        } else {
+            let ctx = self.txfm_split_ctx(row, col, tx_sz);
+            self.sd.read_symbol(&mut self.cdf.txfm_split_cdf[ctx]) != 0
+        };
+        let w4 = TX_WIDTH[tx_sz] / MI_SIZE;
+        let h4 = TX_HEIGHT[tx_sz] / MI_SIZE;
+        if txfm_split {
+            let sub_tx_sz = SPLIT_TX_SIZE[tx_sz];
+            let step_w = TX_WIDTH[sub_tx_sz] / MI_SIZE;
+            let step_h = TX_HEIGHT[sub_tx_sz] / MI_SIZE;
+            for i in (0..h4).step_by(step_h) {
+                for j in (0..w4).step_by(step_w) {
+                    self.read_var_tx_size(row + i, col + j, sub_tx_sz, depth + 1);
+                }
+            }
+        } else {
+            let mi_cols = self.fs.mi_cols;
+            let rows = h4.min(self.fs.mi_rows - row);
+            let cols = w4.min(mi_cols - col);
+            fill_rows(
+                &mut self.fs.inter_tx_sizes,
+                mi_cols,
+                row,
+                col,
+                rows,
+                cols,
+                tx_sz as u8,
+            );
+            self.tx_size = tx_sz;
+        }
+    }
+
+    /// The `ctx` of the `txfm_split` CDF selection (spec 9.3), with `get_above_tx_width` and
+    /// `get_left_tx_height`.
+    fn txfm_split_ctx(&self, row: usize, col: usize, tx_sz: usize) -> usize {
+        let above_w = if row == self.mi_row && !self.avail_u {
+            64
+        } else {
+            let i = self.mi_idx(row - 1, col);
+            if row == self.mi_row && self.fs.skips[i] && self.fs.is_inters[i] {
+                BLOCK_WIDTH[usize::from(self.fs.mi_sizes[i])]
+            } else {
+                TX_WIDTH[usize::from(self.fs.inter_tx_sizes[i])]
+            }
+        };
+        let left_h = if col == self.mi_col && !self.avail_l {
+            64
+        } else {
+            let i = self.mi_idx(row, col - 1);
+            if col == self.mi_col && self.fs.skips[i] && self.fs.is_inters[i] {
+                BLOCK_HEIGHT[usize::from(self.fs.mi_sizes[i])]
+            } else {
+                TX_HEIGHT[usize::from(self.fs.inter_tx_sizes[i])]
+            }
+        };
+        let above = above_w < TX_WIDTH[tx_sz];
+        let left = left_h < TX_HEIGHT[tx_sz];
+        let size = BLOCK_WIDTH[self.mi_size]
+            .max(BLOCK_HEIGHT[self.mi_size])
+            .min(64);
+        // find_tx_size( size, size ): the square transform sizes are in order of size.
+        let max_tx_sz = (size.trailing_zeros() - 2) as usize;
+        usize::from(TX_SIZE_SQR_UP[tx_sz] != max_tx_sz) * 3
+            + (TX_SIZES - 1 - max_tx_sz) * 6
+            + usize::from(above)
+            + usize::from(left)
     }
 
     /// Spec 5.11.15 `read_tx_size( allowSelect )`.

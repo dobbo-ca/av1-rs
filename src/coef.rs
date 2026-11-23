@@ -4,10 +4,13 @@
 //! `transform_type( )` (5.11.47) and `get_tx_set( )` (5.11.48), and the call of the
 //! reconstruction process (7.12.3) with the quantizers of 7.12.2.
 //!
-//! Only intra blocks exist in the frames this decoder handles (`is_inter` is always 0, intra
-//! block copy is rejected in `tile.rs`), so the `transform_tree` and inter branches of the spec
-//! are not implemented. `TxTypes` is not kept as a frame array: for an intra block the luma
-//! type is only read back by the same transform block, and chroma derives it from `UVMode`.
+//! The only inter blocks of the frames this decoder handles are intra block copy blocks
+//! (`is_inter` 1, spec 5.11.7), so the inter branches of the spec are the ones an intrabc
+//! block takes: `transform_tree` (5.11.36), the inter transform sets and `inter_tx_type`. Their
+//! prediction is done by `compute_prediction( )` (`src/intrabc.rs`) before `residual( )`.
+//! `TxTypes` is only kept as a frame array (`FrameState::tx_types`) for inter blocks, whose
+//! chroma reads the luma type back; an intra block's luma type is only read back by the same
+//! transform block, and its chroma derives it from `UVMode`.
 //!
 //! Entry point: `TileDecoder::residual( )`, called by `decode_block` after the mode info.
 
@@ -22,7 +25,7 @@ use crate::tables::{
     NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, SIG_REF_DIFF_OFFSET, SUBSAMPLED_SIZE, TX_HEIGHT,
     TX_HEIGHT_LOG2, TX_SIZE_SQR, TX_SIZE_SQR_UP, TX_WIDTH, TX_WIDTH_LOG2,
 };
-use crate::tile::TileDecoder;
+use crate::tile::{TileDecoder, fill_rows};
 
 /// `Tx_Type_In_Set_Intra` (spec 5.11.40).
 const TX_TYPE_IN_SET_INTRA: [[u8; TX_TYPES]; TX_SET_TYPES_INTRA] = [
@@ -30,6 +33,53 @@ const TX_TYPE_IN_SET_INTRA: [[u8; TX_TYPES]; TX_SET_TYPES_INTRA] = [
     [1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0],
     [1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
 ];
+
+/// `Tx_Type_In_Set_Inter` (spec 5.11.40).
+const TX_TYPE_IN_SET_INTER: [[u8; TX_TYPES]; TX_SET_TYPES_INTER] = [
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+];
+
+/// `Tx_Type_Inter_Inv_Set1` (spec 5.11.47).
+const TX_TYPE_INTER_INV_SET1: [usize; 16] = [
+    IDTX,
+    V_DCT,
+    H_DCT,
+    V_ADST,
+    H_ADST,
+    V_FLIPADST,
+    H_FLIPADST,
+    DCT_DCT,
+    ADST_DCT,
+    DCT_ADST,
+    FLIPADST_DCT,
+    DCT_FLIPADST,
+    ADST_ADST,
+    FLIPADST_FLIPADST,
+    ADST_FLIPADST,
+    FLIPADST_ADST,
+];
+
+/// `Tx_Type_Inter_Inv_Set2` (spec 5.11.47).
+const TX_TYPE_INTER_INV_SET2: [usize; 12] = [
+    IDTX,
+    V_DCT,
+    H_DCT,
+    DCT_DCT,
+    ADST_DCT,
+    DCT_ADST,
+    FLIPADST_DCT,
+    DCT_FLIPADST,
+    ADST_ADST,
+    FLIPADST_FLIPADST,
+    ADST_FLIPADST,
+    FLIPADST_ADST,
+];
+
+/// `Tx_Type_Inter_Inv_Set3` (spec 5.11.47).
+const TX_TYPE_INTER_INV_SET3: [usize; 2] = [IDTX, DCT_DCT];
 
 /// `Tx_Type_Intra_Inv_Set1` (spec 5.11.47).
 const TX_TYPE_INTRA_INV_SET1: [usize; 7] =
@@ -221,6 +271,16 @@ fn is_tx_type_in_set(tx_set: usize, tx_type: usize) -> bool {
     TX_TYPE_IN_SET_INTRA[tx_set][tx_type] != 0
 }
 
+/// `is_tx_type_in_set( txSet, txType )` for an inter block (spec 5.11.40).
+fn is_tx_type_in_set_inter(tx_set: usize, tx_type: usize) -> bool {
+    TX_TYPE_IN_SET_INTER[tx_set][tx_type] != 0
+}
+
+/// `find_tx_size( w, h )` (spec 5.11.36): the transform size of `w` x `h` samples, if any.
+fn find_tx_size(w: usize, h: usize) -> Option<usize> {
+    (0..TX_SIZES_ALL).find(|&tx_sz| TX_WIDTH[tx_sz] == w && TX_HEIGHT[tx_sz] == h)
+}
+
 /// The `ctx` of `coeff_base_eob`: `get_coeff_base_ctx( ..., isEob = 1 ) - SIG_COEF_CONTEXTS +
 /// SIG_COEF_CONTEXTS_EOB` (spec 9.3), for the scan index `c`.
 fn coeff_base_eob_ctx(tx_sz: usize, c: usize) -> usize {
@@ -350,6 +410,12 @@ impl TileDecoder<'_> {
                     let num4x4_w = NUM_4X4_BLOCKS_WIDE[plane_sz];
                     let num4x4_h = NUM_4X4_BLOCKS_HIGH[plane_sz];
                     let (sub_x, sub_y) = self.plane_subsampling(plane);
+                    if self.is_inter && !self.lossless && plane == 0 {
+                        let base_x = (self.mi_col + (chunk_x << 4)) * MI_SIZE;
+                        let base_y = (self.mi_row + (chunk_y << 4)) * MI_SIZE;
+                        self.transform_tree(base_x, base_y, num4x4_w * 4, num4x4_h * 4, &mut s)?;
+                        continue;
+                    }
                     let base_x_block = (self.mi_col >> sub_x) * MI_SIZE;
                     let base_y_block = (self.mi_row >> sub_y) * MI_SIZE;
                     for y in (0..num4x4_h).step_by(step_y) {
@@ -369,6 +435,46 @@ impl TileDecoder<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Spec 5.11.36 `transform_tree( startX, startY, w, h )`, for the luma of an inter block.
+    ///
+    /// # Errors
+    /// `Invalid` if a size of the tree is not a transform size (not reachable from the block
+    /// sizes the syntax allows).
+    fn transform_tree(
+        &mut self,
+        start_x: usize,
+        start_y: usize,
+        w: usize,
+        h: usize,
+        s: &mut ResidualScratch,
+    ) -> Result<(), Error> {
+        let max_x = self.fs.mi_cols * MI_SIZE;
+        let max_y = self.fs.mi_rows * MI_SIZE;
+        if start_x >= max_x || start_y >= max_y {
+            return Ok(());
+        }
+        let row = start_y >> MI_SIZE_LOG2;
+        let col = start_x >> MI_SIZE_LOG2;
+        let luma_tx_sz = usize::from(self.fs.inter_tx_sizes[self.mi_idx(row, col)]);
+        let luma_w = TX_WIDTH[luma_tx_sz];
+        let luma_h = TX_HEIGHT[luma_tx_sz];
+        if w <= luma_w && h <= luma_h {
+            let tx_sz = find_tx_size(w, h).ok_or(Error::Invalid("transform tree size"))?;
+            self.transform_block(0, start_x, start_y, tx_sz, 0, 0, s)
+        } else if w > h {
+            self.transform_tree(start_x, start_y, w / 2, h, s)?;
+            self.transform_tree(start_x + w / 2, start_y, w / 2, h, s)
+        } else if w < h {
+            self.transform_tree(start_x, start_y, w, h / 2, s)?;
+            self.transform_tree(start_x, start_y + h / 2, w, h / 2, s)
+        } else {
+            self.transform_tree(start_x, start_y, w / 2, h / 2, s)?;
+            self.transform_tree(start_x + w / 2, start_y, w / 2, h / 2, s)?;
+            self.transform_tree(start_x, start_y + h / 2, w / 2, h / 2, s)?;
+            self.transform_tree(start_x + w / 2, start_y + h / 2, w / 2, h / 2, s)
+        }
     }
 
     /// `(subX, subY)` of `plane`.
@@ -405,7 +511,8 @@ impl TileDecoder<'_> {
         uv_tx
     }
 
-    /// Spec 5.11.35 `transform_block( plane, baseX, baseY, txSz, x, y )` for an intra block.
+    /// Spec 5.11.35 `transform_block( plane, baseX, baseY, txSz, x, y )`. An inter block was
+    /// predicted by `compute_prediction( )`, so only its residual is added here.
     fn transform_block(
         &mut self,
         plane: usize,
@@ -444,7 +551,9 @@ impl TileDecoder<'_> {
         } else {
             self.palette_size_uv
         };
-        if palette_size > 0 {
+        if self.is_inter {
+            // Predicted by compute_prediction( ) (spec 5.11.35: only `!is_inter` predicts here).
+        } else if palette_size > 0 {
             // predict_palette( plane, startX, startY, x, y, txSz ), spec 7.11.4.
             if y * 4 + th > 64 || x * 4 + tw > 64 {
                 return Err(Error::Invalid("palette map out of range"));
@@ -536,7 +645,7 @@ impl TileDecoder<'_> {
                 );
             }
         }
-        if plane == 0 {
+        if plane == 0 && !self.is_inter {
             s.max_luma_w = start_x + step_x * 4;
             s.max_luma_h = start_y + step_y * 4;
         }
@@ -675,10 +784,22 @@ impl TileDecoder<'_> {
         )
     }
 
-    /// Spec 5.11.48 `get_tx_set( txSz )` for an intra block.
+    /// Spec 5.11.48 `get_tx_set( txSz )`.
     fn get_tx_set(&self, tx_sz: usize) -> usize {
         let tx_sz_sqr = TX_SIZE_SQR[tx_sz];
         let tx_sz_sqr_up = TX_SIZE_SQR_UP[tx_sz];
+        if tx_sz_sqr_up > TX_32X32 {
+            return TX_SET_DCTONLY;
+        }
+        if self.is_inter {
+            return if self.fh.reduced_tx_set || tx_sz_sqr_up == TX_32X32 {
+                TX_SET_INTER_3
+            } else if tx_sz_sqr == TX_16X16 {
+                TX_SET_INTER_2
+            } else {
+                TX_SET_INTER_1
+            };
+        }
         if tx_sz_sqr_up >= TX_32X32 {
             TX_SET_DCTONLY
         } else if self.fh.reduced_tx_set || tx_sz_sqr == TX_16X16 {
@@ -688,16 +809,37 @@ impl TileDecoder<'_> {
         }
     }
 
-    /// Spec 5.11.40 `compute_tx_type( plane, txSz, blockX, blockY )` for an intra block.
-    /// `luma_tx_type` is `TxTypes[ blockY ][ blockX ]` of the luma transform block just decoded
-    /// (only read when `plane` is 0).
-    fn compute_tx_type(&self, plane: usize, tx_sz: usize, luma_tx_type: usize) -> usize {
+    /// Spec 5.11.40 `compute_tx_type( plane, txSz, blockX, blockY )`, with `blockX` and `blockY`
+    /// the `x4` and `y4` of the transform block. `luma_tx_type` is `TxTypes[ blockY ][ blockX ]`
+    /// of the luma transform block just decoded (only read when `plane` is 0).
+    fn compute_tx_type(
+        &self,
+        plane: usize,
+        tx_sz: usize,
+        block_x: usize,
+        block_y: usize,
+        luma_tx_type: usize,
+    ) -> usize {
         if self.lossless || TX_SIZE_SQR_UP[tx_sz] > TX_32X32 {
             return DCT_DCT;
         }
         let tx_set = self.get_tx_set(tx_sz);
         if plane == 0 {
             return luma_tx_type;
+        }
+        if self.is_inter {
+            let x4 = self.mi_col.max(block_x << self.fs.subsampling_x);
+            let y4 = self.mi_row.max(block_y << self.fs.subsampling_y);
+            let tx_type = self
+                .fs
+                .tx_types
+                .get(self.mi_idx(y4, x4))
+                .map_or(DCT_DCT, |&t| usize::from(t));
+            return if is_tx_type_in_set_inter(tx_set, tx_type) {
+                tx_type
+            } else {
+                DCT_DCT
+            };
         }
         let tx_type = MODE_TO_TXFM[self.uv_mode];
         if is_tx_type_in_set(tx_set, tx_type) {
@@ -707,7 +849,8 @@ impl TileDecoder<'_> {
         }
     }
 
-    /// Spec 5.11.47 `transform_type( x4, y4, txSz )` for an intra block: returns `TxType`.
+    /// Spec 5.11.47 `transform_type( x4, y4, txSz )`: returns `TxType`. The caller stores it in
+    /// `TxTypes` for an inter block.
     fn transform_type(&mut self, tx_sz: usize) -> usize {
         let set = self.get_tx_set(tx_sz);
         let qindex = self
@@ -717,6 +860,27 @@ impl TileDecoder<'_> {
             return DCT_DCT;
         }
         let sqr = TX_SIZE_SQR[tx_sz];
+        if self.is_inter {
+            // set 1 is only chosen for 4x4 and 8x8 squares (get_tx_set).
+            return match set {
+                TX_SET_INTER_1 => {
+                    let sym = self
+                        .sd
+                        .read_symbol(&mut self.cdf.inter_tx_type_set1_cdf[sqr]);
+                    TX_TYPE_INTER_INV_SET1[sym]
+                }
+                TX_SET_INTER_2 => {
+                    let sym = self.sd.read_symbol(&mut self.cdf.inter_tx_type_set2_cdf);
+                    TX_TYPE_INTER_INV_SET2[sym]
+                }
+                _ => {
+                    let sym = self
+                        .sd
+                        .read_symbol(&mut self.cdf.inter_tx_type_set3_cdf[sqr]);
+                    TX_TYPE_INTER_INV_SET3[sym]
+                }
+            };
+        }
         let intra_dir = if self.use_filter_intra {
             FILTER_INTRA_MODE_TO_INTRA_DIR[self.filter_intra_mode]
         } else {
@@ -734,6 +898,23 @@ impl TileDecoder<'_> {
                 .read_symbol(&mut self.cdf.intra_tx_type_set2_cdf[sqr][intra_dir]);
             TX_TYPE_INTRA_INV_SET2[sym]
         }
+    }
+
+    /// `TxTypes[ y4 + j ][ x4 + i ] = tx_type` for the transform block (spec 5.11.39 and
+    /// 5.11.47); positions outside the frame are not stored.
+    fn set_tx_types(&mut self, x4: usize, y4: usize, tx_sz: usize, tx_type: usize) {
+        let mi_cols = self.fs.mi_cols;
+        let rows = (TX_HEIGHT[tx_sz] >> 2).min(self.fs.mi_rows.saturating_sub(y4));
+        let cols = (TX_WIDTH[tx_sz] >> 2).min(mi_cols.saturating_sub(x4));
+        fill_rows(
+            &mut self.fs.tx_types,
+            mi_cols,
+            y4,
+            x4,
+            rows,
+            cols,
+            tx_type as u8,
+        );
     }
 
     /// The `ctx` of `all_zero` (spec 9.3).
@@ -865,13 +1046,21 @@ impl TileDecoder<'_> {
             .sd
             .read_symbol(&mut self.cdf.txb_skip_cdf[tx_sz_ctx][ctx])
             != 0;
-        if !all_zero {
+        if all_zero {
+            if plane == 0 && self.is_inter {
+                self.set_tx_types(x4, y4, tx_sz, DCT_DCT);
+            }
+        } else {
             let luma_tx_type = if plane == 0 {
-                self.transform_type(tx_sz)
+                let tx_type = self.transform_type(tx_sz);
+                if self.is_inter {
+                    self.set_tx_types(x4, y4, tx_sz, tx_type);
+                }
+                tx_type
             } else {
                 DCT_DCT
             };
-            plane_tx_type = self.compute_tx_type(plane, tx_sz, luma_tx_type);
+            plane_tx_type = self.compute_tx_type(plane, tx_sz, x4, y4, luma_tx_type);
             let tx_class = get_tx_class(plane_tx_type);
             let scan = get_scan(tx_sz, plane_tx_type);
 
