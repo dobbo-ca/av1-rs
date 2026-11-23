@@ -15,13 +15,13 @@
 //! ```ignore
 //! let td = TileDecoder::new(tile_bytes, tile_row, tile_col, &frame_cdfs, &mut frame_state,
 //!                           &frame_header, &seq)?;
-//! let final_cdfs = td.decode_tile(&cancel)?;
+//! td.decode_tile(&cancel)?;
 //! ```
 //!
 //! `tile_bytes` is the tile's data (`tileSize` bytes of `tile_group_obu`), `frame_cdfs` the
 //! frame's CDFs at the start of the tile (the tile works on a copy, spec 8.2.2). `decode_tile`
-//! runs the symbol decoder's exit process (spec 8.2.4) and returns the tile's final CDFs: the
-//! caller keeps the ones of `context_update_tile_id` for the frame end update CDF process.
+//! runs the symbol decoder's exit process (spec 8.2.4); the tile's final CDFs are dropped (no intra
+//! frame loads them) and its buffers stay in the frame state for the next tile (`TileScratch`).
 //! `cancel` is checked once per superblock row. The caller creates a new `TileDecoder` per tile
 //! and sets `CurrentQIndex` (done in `new`) per tile.
 //!
@@ -177,14 +177,82 @@ pub(crate) struct TileDecoder<'a> {
 
     /// The reconstruction buffers (fixed size, reused by every transform block).
     pub itx: Box<ItxScratch>,
-    /// `Quant[ ]` of the current transform block (spec 5.11.39); see `coef`. Allocated once
-    /// per tile.
+    /// `Quant[ ]` of the current transform block (spec 5.11.39); see `coef`. Kept in the
+    /// [`TileScratch`].
     pub quant: Box<[i32; QUANT_LEN]>,
     /// The levels of the current transform block, padded so that the context reads need no
     /// bounds checks; see `coef::TX_PAD`.
     pub levels: Box<[u8; LEVELS_LEN]>,
 
     _charged: Charged,
+}
+
+/// The buffers of a [`TileDecoder`] that do not depend on the tile, kept in
+/// [`FrameState::tile_scratch`] between the tiles and frames decoded on that state so a tile
+/// allocates nothing: the CDF copy, the colour maps and the above and left context arrays
+/// (charged to the ledger while they live) and the reconstruction scratch.
+#[derive(Debug)]
+pub(crate) struct TileScratch {
+    cdf: Box<CdfContext>,
+    color_map_y: Box<[[u8; 64]; 64]>,
+    color_map_uv: Box<[[u8; 64]; 64]>,
+    itx: Box<ItxScratch>,
+    quant: Box<[i32; QUANT_LEN]>,
+    levels: Box<[u8; LEVELS_LEN]>,
+    above_level_context: [Vec<u8>; 3],
+    above_dc_context: [Vec<u8>; 3],
+    above_seg_pred_context: Vec<u8>,
+    left_level_context: [Vec<u8>; 3],
+    left_dc_context: [Vec<u8>; 3],
+    left_seg_pred_context: Vec<u8>,
+    charged: Charged,
+    /// The context array lengths (columns, rows) and the plane count they were made for.
+    dims: (usize, usize, usize),
+}
+
+impl TileScratch {
+    /// New buffers: the tile CDFs of `frame_cdf` (spec 8.2.2), zeroed colour maps and context
+    /// arrays of `cols` and `rows` entries for the first `np` planes.
+    fn new(
+        frame_cdf: &CdfContext,
+        ledger: &std::sync::Arc<crate::ledger::Ledger>,
+        (cols, rows, np): (usize, usize, usize),
+    ) -> Result<TileScratch, Error> {
+        let mut charged = Charged::new(ledger);
+        let pn = |n: usize, plane: usize| if plane < np { n } else { 0 };
+        Ok(TileScratch {
+            cdf: frame_cdf.init_symbol_cdfs(),
+            color_map_y: Box::new([[0; 64]; 64]),
+            color_map_uv: Box::new([[0; 64]; 64]),
+            itx: ItxScratch::new(),
+            quant: Box::new([0; QUANT_LEN]),
+            levels: Box::new([0; LEVELS_LEN]),
+            above_level_context: [
+                charged.vec(pn(cols, 0))?,
+                charged.vec(pn(cols, 1))?,
+                charged.vec(pn(cols, 2))?,
+            ],
+            above_dc_context: [
+                charged.vec(pn(cols, 0))?,
+                charged.vec(pn(cols, 1))?,
+                charged.vec(pn(cols, 2))?,
+            ],
+            above_seg_pred_context: charged.vec(cols)?,
+            left_level_context: [
+                charged.vec(pn(rows, 0))?,
+                charged.vec(pn(rows, 1))?,
+                charged.vec(pn(rows, 2))?,
+            ],
+            left_dc_context: [
+                charged.vec(pn(rows, 0))?,
+                charged.vec(pn(rows, 1))?,
+                charged.vec(pn(rows, 2))?,
+            ],
+            left_seg_pred_context: charged.vec(rows)?,
+            charged,
+            dims: (cols, rows, np),
+        })
+    }
 }
 
 /// `neg_deinterleave( diff, ref, max )` (spec 5.11.9).
@@ -401,36 +469,27 @@ impl<'a> TileDecoder<'a> {
             return Err(Error::Invalid("tile outside the frame"));
         }
         let sd = SymbolDecoder::new(data, fh.disable_cdf_update)?;
-        let mut charged = Charged::new(&fs.ledger);
         let cols = fs.mi_cols.next_multiple_of(MAX_SB4);
         let rows = fs.mi_rows.next_multiple_of(MAX_SB4);
         let np = fs.num_planes;
-        let pn = |n: usize, plane: usize| if plane < np { n } else { 0 };
-        let above_level_context = [
-            charged.vec(pn(cols, 0))?,
-            charged.vec(pn(cols, 1))?,
-            charged.vec(pn(cols, 2))?,
-        ];
-        let above_dc_context = [
-            charged.vec(pn(cols, 0))?,
-            charged.vec(pn(cols, 1))?,
-            charged.vec(pn(cols, 2))?,
-        ];
-        let above_seg_pred_context = charged.vec(cols)?;
-        let left_level_context = [
-            charged.vec(pn(rows, 0))?,
-            charged.vec(pn(rows, 1))?,
-            charged.vec(pn(rows, 2))?,
-        ];
-        let left_dc_context = [
-            charged.vec(pn(rows, 0))?,
-            charged.vec(pn(rows, 1))?,
-            charged.vec(pn(rows, 2))?,
-        ];
-        let left_seg_pred_context = charged.vec(rows)?;
+        // The context arrays are cleared by `decode_tile`; buffers of another size are dropped
+        // before new ones are allocated.
+        let old = fs
+            .tile_scratch
+            .take()
+            .filter(|s| s.dims == (cols, rows, np));
+        let s = match old {
+            Some(mut s) => {
+                frame_cdf.init_symbol_cdfs_into(&mut s.cdf);
+                *s.color_map_y = [[0; 64]; 64];
+                *s.color_map_uv = [[0; 64]; 64];
+                s
+            }
+            None => TileScratch::new(frame_cdf, &fs.ledger, (cols, rows, np))?,
+        };
         Ok(TileDecoder {
             sd,
-            cdf: frame_cdf.init_symbol_cdfs(),
+            cdf: s.cdf,
             seq,
             fh,
             fs,
@@ -465,8 +524,8 @@ impl<'a> TileDecoder<'a> {
             palette_colors_y: [0; 8],
             palette_colors_u: [0; 8],
             palette_colors_v: [0; 8],
-            color_map_y: Box::new([[0; 64]; 64]),
-            color_map_uv: Box::new([[0; 64]; 64]),
+            color_map_y: s.color_map_y,
+            color_map_uv: s.color_map_uv,
             tx_size: TX_4X4,
             mv: [0; 2],
             current_q_index: i32::from(fh.base_q_idx),
@@ -474,28 +533,29 @@ impl<'a> TileDecoder<'a> {
             read_deltas: false,
             ref_sgr_xqd: [[0; 2]; 3],
             ref_lr_wiener: [[[0; 3]; 2]; 3],
-            above_level_context,
-            above_dc_context,
-            above_seg_pred_context,
-            left_level_context,
-            left_dc_context,
-            left_seg_pred_context,
+            above_level_context: s.above_level_context,
+            above_dc_context: s.above_dc_context,
+            above_seg_pred_context: s.above_seg_pred_context,
+            left_level_context: s.left_level_context,
+            left_dc_context: s.left_dc_context,
+            left_seg_pred_context: s.left_seg_pred_context,
             block_decoded: [[[false; BD]; BD]; 3],
-            itx: ItxScratch::new(),
-            quant: Box::new([0; QUANT_LEN]),
-            levels: Box::new([0; LEVELS_LEN]),
-            _charged: charged,
+            itx: s.itx,
+            quant: s.quant,
+            levels: s.levels,
+            _charged: s.charged,
         })
     }
 
     /// Spec 5.11.2 `decode_tile( )`, followed by the symbol decoder's exit process (spec 8.2.4).
-    /// Returns the tile's final CDFs.
+    /// The tile's final CDFs are not kept (no intra frame loads them); its buffers go back to
+    /// the frame state's [`TileScratch`] for the next tile.
     ///
     /// # Errors
     /// `Cancelled` when `cancel` is set (checked once per superblock row), `Invalid` for a
     /// syntax value the spec forbids or for trailing bits that break the exit process's
     /// conformance requirement.
-    pub(crate) fn decode_tile(mut self, cancel: &AtomicBool) -> Result<Box<CdfContext>, Error> {
+    pub(crate) fn decode_tile(mut self, cancel: &AtomicBool) -> Result<(), Error> {
         self.clear_above_context();
         self.delta_lf = [0; FRAME_LF_COUNT];
         for plane in 0..self.fs.num_planes {
@@ -523,11 +583,49 @@ impl<'a> TileDecoder<'a> {
                 self.decode_partition(r, c, sb_size)?;
             }
         }
-        let TileDecoder { sd, cdf, .. } = self;
+        let TileDecoder {
+            sd,
+            cdf,
+            fs,
+            color_map_y,
+            color_map_uv,
+            itx,
+            quant,
+            levels,
+            above_level_context,
+            above_dc_context,
+            above_seg_pred_context,
+            left_level_context,
+            left_dc_context,
+            left_seg_pred_context,
+            _charged: charged,
+            ..
+        } = self;
         // The padding check of the exit process is a conformance requirement on the encoder;
         // dav1d and libaom do not enforce it, so a stream they decode is not refused here.
         let _padding_ok = sd.exit();
-        Ok(cdf)
+        let dims = (
+            above_seg_pred_context.len(),
+            left_seg_pred_context.len(),
+            fs.num_planes,
+        );
+        fs.tile_scratch = Some(TileScratch {
+            cdf,
+            color_map_y,
+            color_map_uv,
+            itx,
+            quant,
+            levels,
+            above_level_context,
+            above_dc_context,
+            above_seg_pred_context,
+            left_level_context,
+            left_dc_context,
+            left_seg_pred_context,
+            charged,
+            dims,
+        });
+        Ok(())
     }
 
     /// `is_inside( candidateR, candidateC )` (spec 5.11.51).

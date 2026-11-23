@@ -36,6 +36,9 @@ struct Pending {
     next_tile: usize,
 }
 
+/// Most plane lists of recycled frames a decoder keeps.
+const SPARE_LISTS: usize = 16;
+
 /// What an output frame needs to know about itself, from its frame header or, for a
 /// `show_existing_frame`, from its reference slot.
 struct Shown {
@@ -125,6 +128,15 @@ pub struct Decoder {
     /// given back when the unit's frames are handed out.
     ready_bytes: usize,
     infos: Vec<FrameInfo>,
+    /// The frame state of the last frame (mode-info arrays, tile buffers, frame CDFs; its planes
+    /// are in the ledger's pool), reused by the next frame of the same shape.
+    spare: Option<FrameState>,
+    /// The empty tile list of the next frame (kept for its capacity).
+    tile_buf: Vec<TileRange>,
+    /// Empty plane lists of the frames handed back with [`Decoder::recycle`].
+    spare_planes: Vec<Vec<Plane>>,
+    /// False only for the `fuzzing` oracle: no frame state is reused.
+    pub(crate) reuse: bool,
 }
 
 impl Decoder {
@@ -168,6 +180,10 @@ impl Decoder {
             ready: Vec::new(),
             ready_bytes: 0,
             infos: Vec::new(),
+            spare: None,
+            tile_buf: Vec::new(),
+            spare_planes: Vec::new(),
+            reuse: true,
         }
     }
 
@@ -202,9 +218,47 @@ impl Decoder {
             if cancel.load(Ordering::Relaxed) {
                 return Err(Error::Cancelled);
             }
-            self.handle_obu(data, obu?, cancel)?;
+            if let Err(e) = obu.and_then(|o| self.handle_obu(data, o, cancel)) {
+                // After an error the decoder keeps no frame state, only pooled buffers.
+                self.spare = None;
+                return Err(e);
+            }
         }
         Ok(self.select_output())
+    }
+
+    /// Hands frames returned by this decoder back for reuse: their sample buffers, the plane
+    /// lists and the `Vec` itself. The next frames this decoder outputs are built in them, so with
+    /// the frame buffers the decoder keeps from one frame to the next (`docs/limits.md`), a
+    /// [`Decoder::decode_temporal_unit`] of the same shape as the previous one, with
+    /// `Limits::max_threads` 1, allocates nothing once its frames were recycled.
+    ///
+    /// The buffers count against `Limits::max_alloc` while the decoder keeps them; a buffer that
+    /// does not fit is dropped, and kept buffers are dropped when a later allocation needs their
+    /// room, so recycling never makes a decode fail. Frames of another decoder may be recycled
+    /// too (only their buffers are kept).
+    ///
+    /// # Errors
+    /// None: this cannot fail.
+    pub fn recycle(&mut self, mut frames: Vec<Frame>) {
+        for mut f in frames.drain(..) {
+            for p in f.planes.drain(..) {
+                match p.data {
+                    PlaneData::U8(v) => self.ledger.adopt(v),
+                    PlaneData::U16(v) => self.ledger.adopt(v),
+                }
+            }
+            // The lists are not charged (a few words each), so only a few are kept.
+            if f.planes.capacity() > 0
+                && self.spare_planes.len() < SPARE_LISTS
+                && self.spare_planes.try_reserve(1).is_ok()
+            {
+                self.spare_planes.push(f.planes);
+            }
+        }
+        if self.ready.is_empty() && self.ready.capacity() < frames.capacity() {
+            self.ready = frames;
+        }
     }
 
     /// Gives back the ledger bytes held by the unit's output planes.
@@ -339,9 +393,11 @@ impl Decoder {
             let s = Shown::of_header(&h, seq);
             self.infos.push(frame_info(&s, &h, mono));
         }
+        let mut tiles = std::mem::take(&mut self.tile_buf);
+        tiles.clear();
         self.pending = Some(Pending {
             header: h,
-            tiles: Vec::new(),
+            tiles,
             next_tile: 0,
         });
         if is_frame {
@@ -404,9 +460,14 @@ impl Decoder {
             .pending
             .as_mut()
             .ok_or(Error::Invalid("tile group without a frame header"))?;
-        let tg = parse_tile_group(payload, payload_start, &p.header.tile_info, p.next_tile)?;
+        let tg = parse_tile_group(
+            payload,
+            payload_start,
+            &p.header.tile_info,
+            p.next_tile,
+            &mut p.tiles,
+        )?;
         p.next_tile = tg.tg_end + 1;
-        p.tiles.extend_from_slice(&tg.tiles);
         let num_tiles = p.header.tile_info.tile_cols * p.header.tile_info.tile_rows;
         if p.next_tile == num_tiles {
             self.finish_frame(data, cancel)?;
@@ -425,18 +486,46 @@ impl Decoder {
             .clone()
             .ok_or(Error::Invalid("frame without a sequence header"))?;
         let h = p.header;
+        let mut tiles = p.tiles;
         let mut stored = None;
         if !self.probe_only {
-            self.state = Some(FrameState::new(&h, &seq, &self.ledger)?);
-            self.decode_frame_tiles(&h, &seq, data, &p.tiles, cancel)?;
-            let state = self
+            // The slots this frame refreshes are emptied first, as dav1d does (a frame that fails
+            // leaves them empty), so the planes of a frame no slot keeps any more are free for this
+            // one, and its `Arc` holds the new frame.
+            let mut spare_arc = None;
+            for (i, slot) in self.store.iter_mut().enumerate() {
+                if (h.refresh_frame_flags >> i) & 1 != 0
+                    && let Some(mut a) = slot.take()
+                    && let Some(v) = Arc::get_mut(&mut a)
+                {
+                    self.ledger.put_planes(std::mem::take(v));
+                    spare_arc = Some(a);
+                }
+            }
+            let spare = self.spare.take().filter(|_| self.reuse);
+            self.state = Some(FrameState::reuse(spare, &h, &seq, &self.ledger)?);
+            let decoded = self.decode_frame_tiles(&h, &seq, data, &tiles, cancel);
+            tiles.clear();
+            self.tile_buf = tiles;
+            decoded?;
+            let mut state = self
                 .state
                 .take()
                 .ok_or(Error::Invalid("frame decode left no state"))?;
             if state.lr_frame.len() != usize::from(seq.num_planes) {
                 return Err(Error::Invalid("frame decode produced no output planes"));
             }
-            stored = Some(Arc::new(state.lr_frame));
+            let planes = std::mem::take(&mut state.lr_frame);
+            stored = match spare_arc.as_mut().and_then(Arc::get_mut) {
+                Some(v) => {
+                    *v = planes;
+                    spare_arc
+                }
+                None => Some(Arc::new(planes)),
+            };
+            // `CurrFrame` goes to the pool; the arrays wait for the next frame.
+            state.curr_frame.clear();
+            self.spare = Some(state);
         }
         self.refs.update(&h, &seq);
         for (i, slot) in self.store.iter_mut().enumerate() {
@@ -558,7 +647,9 @@ impl Decoder {
         };
         let apply =
             self.options.film_grain && seq.film_grain_params_present && h.film_grain.apply_grain;
-        let mut out = Vec::with_capacity(planes.len());
+        let mut out = self.spare_planes.pop().unwrap_or_default();
+        out.try_reserve_exact(planes.len())
+            .map_err(|_| Error::OutOfMemory)?;
         if apply {
             let empty: &[u16] = &[];
             let input = GrainInput {
@@ -581,7 +672,7 @@ impl Decoder {
                 ],
             };
             // Same layout as the input: a plane as wide as the input stride.
-            let mut grained = Vec::with_capacity(planes.len());
+            let mut grained = self.ledger.planes(planes.len())?;
             for p in planes {
                 grained.push(WorkPlane::new(p.stride, p.height, &self.ledger)?);
             }
@@ -603,6 +694,7 @@ impl Decoder {
             for (g, p) in grained.iter().zip(planes) {
                 out.push(self.public_plane(g, p.width, p.height, s.bit_depth)?);
             }
+            self.ledger.put_planes(grained);
         } else {
             for p in planes {
                 out.push(self.public_plane(p, p.width, p.height, s.bit_depth)?);
@@ -640,25 +732,18 @@ impl Decoder {
         bit_depth: u8,
     ) -> Result<Plane, Error> {
         let n = width.checked_mul(height).ok_or(Error::AllocLimit)?;
-        let bytes = if bit_depth == 8 {
-            n
-        } else {
-            n.saturating_mul(2)
-        };
-        // Held until the unit's frames are handed out (`release_ready`), so frames waiting in
-        // `ready` count against `max_alloc`.
-        self.ledger.reserve(bytes)?;
-        self.ready_bytes += bytes;
+        // The buffer (recycled or new) stays charged until the unit's frames are handed out
+        // (`release_ready`), so frames waiting in `ready` count against `max_alloc`.
         let data = if bit_depth == 8 {
-            let mut v: Vec<u8> = Vec::new();
-            v.try_reserve_exact(n).map_err(|_| Error::OutOfMemory)?;
+            let (mut v, bytes) = self.ledger.take::<u8>(n)?;
+            self.ready_bytes += bytes;
             for row in 0..height {
                 v.extend(row_of(p, row, width)?.iter().map(|&x| x as u8));
             }
             PlaneData::U8(v)
         } else {
-            let mut v: Vec<u16> = Vec::new();
-            v.try_reserve_exact(n).map_err(|_| Error::OutOfMemory)?;
+            let (mut v, bytes) = self.ledger.take::<u16>(n)?;
+            self.ready_bytes += bytes;
             for row in 0..height {
                 v.extend_from_slice(row_of(p, row, width)?);
             }
@@ -685,7 +770,7 @@ impl Decoder {
 /// samples and keeps the spec order where it matters, so the result is the same for every
 /// `max_threads` (docs/threading.md).
 fn decode_frame(
-    fs: FrameState,
+    mut fs: FrameState,
     ledger: &Arc<Ledger>,
     max_threads: usize,
     h: &FrameHeader,
@@ -694,18 +779,19 @@ fn decode_frame(
     tiles: &[TileRange],
     cancel: &AtomicBool,
 ) -> Result<FrameState, Error> {
-    let mut frame_cdf = CdfContext::new_boxed();
+    // Every field is set by the two inits, so the CDFs of an earlier frame can be reused.
+    let mut frame_cdf = fs.frame_cdf.take().unwrap_or_else(CdfContext::new_boxed);
     frame_cdf.init_non_coeff_cdfs();
     frame_cdf.init_coeff_cdfs(h.base_q_idx);
     let threads = team_size(max_threads, &fs, tiles.len());
     if threads <= 1 {
-        let mut fs = fs;
         let tile_cols = h.tile_info.tile_cols.max(1);
         for t in tiles {
             let (row, col) = (t.tile_num / tile_cols, t.tile_num % tile_cols);
             decode_tile(&mut fs, &frame_cdf, data, t, row, col, h, seq, cancel)?;
         }
         fs.lr_frame = wrapup(&mut fs, seq, h, cancel)?;
+        fs.frame_cdf = Some(frame_cdf);
         return Ok(fs);
     }
     let w = Wrap {
@@ -732,6 +818,7 @@ fn decode_frame(
             .ok_or(Error::Invalid("frame decode left no state"))?;
     fs.curr_frame = w.curr.into_inner().unwrap_or_else(|e| e.into_inner());
     fs.lr_frame = planes;
+    fs.frame_cdf = Some(w.frame_cdf);
     Ok(fs)
 }
 
@@ -1215,9 +1302,7 @@ fn exact_size(fs: &FrameState, plane: usize) -> (usize, usize) {
 /// Output planes of exactly `UpscaledWidth` x `FrameHeight` (chroma `(size + ss) >> ss`), each a
 /// copy of the top left of the matching plane of `src` when given.
 fn exact_planes(fs: &FrameState, src: Option<&[WorkPlane]>) -> Result<Vec<WorkPlane>, Error> {
-    let mut out = Vec::new();
-    out.try_reserve_exact(fs.num_planes)
-        .map_err(|_| Error::OutOfMemory)?;
+    let mut out = fs.ledger.planes(fs.num_planes)?;
     for i in 0..fs.num_planes {
         let (w, ht) = exact_size(fs, i);
         let mut p = WorkPlane::new(w, ht, &fs.ledger)?;
@@ -1256,7 +1341,7 @@ fn wrapup(
     let (up_cdef, up_curr) = if h.frame_width != h.upscaled_width {
         let mut up_cdef = exact_planes(fs, None)?;
         upscale(&cdef, fs, seq, h, &mut up_cdef, cancel)?;
-        drop(cdef);
+        fs.ledger.put_planes(cdef);
         let up_curr = if h.uses_lr {
             let mut p = exact_planes(fs, None)?;
             upscale(&fs.curr_frame, fs, seq, h, &mut p, cancel)?;
@@ -1266,7 +1351,9 @@ fn wrapup(
         };
         (up_cdef, up_curr)
     } else {
-        (exact_planes(fs, Some(cdef.as_slice()))?, None)
+        let p = exact_planes(fs, Some(cdef.as_slice()))?;
+        fs.ledger.put_planes(cdef);
+        (p, None)
     };
     if !h.uses_lr {
         return Ok(up_cdef);
@@ -1275,6 +1362,10 @@ fn wrapup(
     match &up_curr {
         Some(c) => lr_frame(fs, seq, h, &up_cdef, c, &mut out, cancel)?,
         None => lr_frame(fs, seq, h, &up_cdef, &fs.curr_frame, &mut out, cancel)?,
+    }
+    fs.ledger.put_planes(up_cdef);
+    if let Some(c) = up_curr {
+        fs.ledger.put_planes(c);
     }
     Ok(out)
 }
@@ -1617,6 +1708,46 @@ mod tests {
     }
 
     #[test]
+    fn reuse_and_recycle_keep_the_output_and_the_ledger_peak() {
+        let data: Vec<u8> = still_obus().concat();
+        let one = Limits {
+            max_threads: 1,
+            ..Limits::default()
+        };
+        let want = Decoder::new(Options::default(), one).decode_temporal_unit(
+            &data,
+            Format::Section5,
+            &cancel(),
+        );
+        for max_alloc in [1024, 40_000, 100_000, 150_000, 200_000, 400_000, 1 << 20] {
+            let mut d = Decoder::new(Options::default(), Limits { max_alloc, ..one });
+            let mut ok = None;
+            for _ in 0..3 {
+                let r = d.decode_temporal_unit(&data, Format::Section5, &cancel());
+                assert!(d.ledger.peak() <= max_alloc as u64);
+                // Reuse never makes the same unit fail where it fitted, nor the reverse.
+                assert_eq!(*ok.get_or_insert(r.is_ok()), r.is_ok());
+                match r {
+                    Ok(frames) => {
+                        assert_eq!(Ok(&frames), want.as_ref());
+                        d.recycle(frames);
+                    }
+                    Err(_) => {
+                        d.take_frames();
+                    }
+                }
+            }
+        }
+        // The decoder that reuses nothing (the fuzz oracle) gives the same frames.
+        let mut fresh = Decoder::new(Options::default(), one);
+        fresh.reuse = false;
+        for _ in 0..2 {
+            let r = fresh.decode_temporal_unit(&data, Format::Section5, &cancel());
+            assert_eq!(r.as_ref(), want.as_ref());
+        }
+    }
+
+    #[test]
     fn cancel_flag_is_honoured() {
         let data: Vec<u8> = still_obus().concat();
         let stop = AtomicBool::new(true);
@@ -1730,8 +1861,8 @@ mod tests {
             tile_info: crate::header::TileInfo {
                 tile_cols: 3,
                 tile_rows: 2,
-                mi_col_starts: vec![0, 16, 32, 48],
-                mi_row_starts: vec![0, 16, 32],
+                mi_col_starts: crate::header::Starts::of(&[0, 16, 32, 48]),
+                mi_row_starts: crate::header::Starts::of(&[0, 16, 32]),
                 ..Default::default()
             },
             ..FrameHeader::default()

@@ -234,9 +234,7 @@ pub(crate) fn cdef_alloc(
 /// # Errors
 /// `AllocLimit` or `OutOfMemory` from the plane allocations.
 pub(crate) fn cdef_planes(curr: &[Plane], ledger: &Arc<Ledger>) -> Result<Vec<Plane>, Error> {
-    let mut out = Vec::new();
-    out.try_reserve_exact(curr.len())
-        .map_err(|_| Error::OutOfMemory)?;
+    let mut out = ledger.planes(curr.len())?;
     for p in curr {
         let mut q = Plane::new(p.width, p.height, ledger)?;
         q.stride = p.stride;

@@ -17,6 +17,7 @@ its temporal units. Seeds: the parity corpus (`run.sh seeds`).
 | `simd_itx` | `av1::fuzzing::itx`: one inverse transform + add block (size, type, bit depth, coded region, coefficients, samples) on every tier against scalar |
 | `simd_threads` | `av1::fuzzing::threads`: the threaded frame wrapup on a frame built from the input (format, bit depth, superres, filter parameters, mode info, samples) with 1, 2 and 3 threads; the outputs must be equal |
 | `simd_entropy` | `av1::fuzzing::entropy`: the symbol reader against the spec's bit by bit reader on every tier, and the CDF adaptation of every tier against scalar |
+| `simd_alloc` | `av1::fuzzing::alloc`: a `Decoder` that reuses its buffers and gets its frames back with `recycle`, against one that keeps no frame state (family `alloc` has no SIMD tiers) |
 
 Each SIMD kernel family adds a cross-tier target `simd_<family>`: it calls
 `av1::fuzzing::<family>` (feature `fuzzing`, enabled only by the fuzz crate), which builds kernel

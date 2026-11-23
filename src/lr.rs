@@ -41,6 +41,13 @@ pub(crate) const SGR_PARAMS: [[u8; 4]; 16] = [
 /// Widest block filtered at once.
 pub(crate) const BLOCK_W: usize = 64;
 
+/// Tallest block: a stripe is 64 luma rows (`64 >> subsampling_y` chroma rows).
+const STRIPE_H: usize = 64;
+
+/// Samples of the largest source window (a block with a 3 sample border); the per-block
+/// buffers live on the stack, so the filters allocate nothing.
+const WIN: usize = (BLOCK_W + 6) * (STRIPE_H + 6);
+
 /// `Round2( x, n )` for signed `x` (arithmetic shift), `n` may be 0.
 fn round2(x: i64, n: usize) -> i64 {
     if n == 0 { x } else { (x + (1 << (n - 1))) >> n }
@@ -59,8 +66,8 @@ struct Stripe {
 }
 
 /// Get source sample process (spec 7.17.6) for the `(w + 6) x (h + 6)` samples around the block
-/// at (`x`, `y`) into `win` (reused from block to block): sample `(r, c)` is
-/// `get_source_sample( plane, x + c - 3, y + r - 3 )`.
+/// at (`x`, `y`) into `win` (`w <= BLOCK_W`, `h <= STRIPE_H`): sample `(r, c)` is
+/// `win[ r * (w + 6) + c ]`, `get_source_sample( plane, x + c - 3, y + r - 3 )`.
 fn source_window(
     cdef: &Plane,
     curr: &Plane,
@@ -69,10 +76,9 @@ fn source_window(
     y: usize,
     w: usize,
     h: usize,
-    win: &mut Vec<i32>,
+    win: &mut [i32; WIN],
 ) {
     let ww = w + 6;
-    win.clear();
     for r in 0..h + 6 {
         let mut yy = (y as isize + r as isize - 3).clamp(0, st.end_y);
         let src = if yy < st.start {
@@ -85,10 +91,10 @@ fn source_window(
             cdef
         };
         let row = &src.px[yy as usize * src.stride..];
-        win.extend((0..ww).map(|c| {
+        for c in 0..ww {
             let xx = (x as isize + c as isize - 3).clamp(0, st.end_x) as usize;
-            i32::from(row[xx])
-        }));
+            win[r * ww + c] = i32::from(row[xx]);
+        }
     }
 }
 
@@ -126,7 +132,7 @@ pub(crate) fn wiener_filter(
     let limit = (1i64 << (bd + 1 + FILTER_BITS - round0)) - 1;
     let max_val = (1i64 << bd) - 1;
     let ww = w + 6;
-    let mut intermediate = vec![0i64; (h + 6) * w];
+    let mut intermediate = [0i64; (STRIPE_H + 6) * BLOCK_W];
     for r in 0..h + 6 {
         for c in 0..w {
             let mut s = 0i64;
@@ -150,7 +156,7 @@ pub(crate) fn wiener_filter(
 }
 
 /// Box filter process (spec 7.17.3) for `r` (the nonzero `Sgr_Params[ set ][ pass * 2 ]`) and
-/// `eps`; returns `F` as `h * w` values. `pass0` is `pass == 0`.
+/// `eps`; writes `F` as `h * w` values to `f`. `pass0` is `pass == 0`.
 fn box_filter(
     win: &[i32],
     w: usize,
@@ -159,7 +165,8 @@ fn box_filter(
     r: usize,
     eps: i64,
     pass0: bool,
-) -> Vec<i32> {
+    f: &mut [i32; STRIPE_H * BLOCK_W],
+) {
     let ww = w + 6;
     let aw = w + 2;
     let n = ((2 * r + 1) * (2 * r + 1)) as i64;
@@ -167,8 +174,8 @@ fn box_filter(
     let s = ((1i64 << SGRPROJ_MTABLE_BITS) + n2e / 2) / n2e;
     let one_over_n = ((1i64 << SGRPROJ_RECIP_BITS) + n / 2) / n;
     // A[ i ][ j ] and B[ i ][ j ] for i in -1..h+1, j in -1..w+1 are stored at (i + 1, j + 1).
-    let mut a_arr = vec![0i32; (h + 2) * aw];
-    let mut b_arr = vec![0i32; (h + 2) * aw];
+    let mut a_arr = [0i32; (STRIPE_H + 2) * (BLOCK_W + 2)];
+    let mut b_arr = [0i32; (STRIPE_H + 2) * (BLOCK_W + 2)];
     for i in 0..h + 2 {
         // Spec i is i - 1: with pass 0 only odd rows (even i here) are used.
         if pass0 && (i & 1) == 1 {
@@ -201,7 +208,6 @@ fn box_filter(
             b_arr[i * aw + j] = round2(b2, SGRPROJ_RECIP_BITS) as i32;
         }
     }
-    let mut f = vec![0i32; h * w];
     for i in 0..h {
         let shift = if pass0 && (i & 1) == 1 { 4 } else { 5 };
         for j in 0..w {
@@ -229,7 +235,6 @@ fn box_filter(
             f[i * w + j] = round2(v, SGRPROJ_SGR_BITS + shift - SGRPROJ_RST_BITS) as i32;
         }
     }
-    f
 }
 
 /// Self guided filter process (spec 7.17.2) on the `w` x `h` block at (`x`, `y`) of `dst` (`y`
@@ -249,8 +254,16 @@ pub(crate) fn self_guided_filter(
         return;
     };
     let (r0, r1) = (usize::from(params[0]), usize::from(params[2]));
-    let flt0 = (r0 != 0).then(|| box_filter(win, w, h, bd, r0, i64::from(params[1]), true));
-    let flt1 = (r1 != 0).then(|| box_filter(win, w, h, bd, r1, i64::from(params[3]), false));
+    let mut flt0 = [0i32; STRIPE_H * BLOCK_W];
+    let mut flt1 = [0i32; STRIPE_H * BLOCK_W];
+    if r0 != 0 {
+        box_filter(win, w, h, bd, r0, i64::from(params[1]), true, &mut flt0);
+    }
+    if r1 != 0 {
+        box_filter(win, w, h, bd, r1, i64::from(params[3]), false, &mut flt1);
+    }
+    let flt0 = (r0 != 0).then_some(&flt0);
+    let flt1 = (r1 != 0).then_some(&flt1);
     let w0 = i64::from(xqd[0]);
     let w1 = i64::from(xqd[1]);
     let w2 = (1 << SGRPROJ_PRJ_BITS) - w0 - w1;
@@ -415,8 +428,7 @@ pub(crate) fn lr_stripe(
     };
     let bd = usize::from(seq.bit_depth);
     let simd = crate::simd::best();
-    // The source window of the current block (at most 70 x 70 samples).
-    let mut win = Vec::new();
+    let mut win = [0i32; WIN];
     let plane = g.plane;
     let end_x = g.end_x;
     let luma_y = if n == 0 { 0 } else { n * 64 - 8 };
@@ -494,18 +506,13 @@ mod tests {
         let win = vec![100i32; (w + 6) * (h + 6)];
         // r = 1, pass 1: variance 0 -> a2 = 1, B = Round2( 255 * 900 * 455, 12 ) = 25494,
         // F = Round2( 32 * 100 + 32 * 25494, 9 ) = 1600 = 100 << SGRPROJ_RST_BITS.
-        assert!(
-            box_filter(&win, w, h, 8, 1, 4, false)
-                .iter()
-                .all(|&v| v == 1600)
-        );
+        let mut f = [0; STRIPE_H * BLOCK_W];
+        box_filter(&win, w, h, 8, 1, 4, false, &mut f);
+        assert!(f[..w * h].iter().all(|&v| v == 1600));
         // r = 2, pass 0: B = Round2( 255 * 2500 * 164, 12 ) = 25525, every row gives
         // Round2( 32 * 100 + 32 * 25525, 9 ) or Round2( 16 * 100 + 16 * 25525, 8 ) = 1602.
-        assert!(
-            box_filter(&win, w, h, 8, 2, 12, true)
-                .iter()
-                .all(|&v| v == 1602)
-        );
+        box_filter(&win, w, h, 8, 2, 12, true, &mut f);
+        assert!(f[..w * h].iter().all(|&v| v == 1602));
     }
 
     #[test]
@@ -521,7 +528,7 @@ mod tests {
             end_x: 7,
             end_y: 15,
         };
-        let mut win = Vec::new();
+        let mut win = [0; WIN];
         source_window(&cdef, &curr, &st, 0, 4, 2, 6, &mut win);
         let col = |r: usize| win[r * 8 + 3];
         // Window rows are source rows 1..=12: rows 1..=3 curr (row 1 clamped to start - 2 = 2),

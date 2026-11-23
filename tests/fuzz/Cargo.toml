@@ -90,3 +90,10 @@ path = "fuzz_targets/simd_entropy.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "simd_alloc"
+path = "fuzz_targets/simd_alloc.rs"
+test = false
+doc = false
+bench = false

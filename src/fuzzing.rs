@@ -305,3 +305,50 @@ pub fn entropy(data: &[u8]) {
         }
     }
 }
+
+/// Family `alloc` (buffer reuse; no SIMD tiers, so the oracle is a decoder that reuses
+/// nothing). Decodes the temporal units of `data` (Section 5) with a decoder that reuses its
+/// frame state and gets every output back through [`Decoder::recycle`](crate::Decoder::recycle),
+/// and with one that keeps no frame state between frames; every unit must give the same frames
+/// or the same error.
+pub fn alloc(data: &[u8]) {
+    use crate::{Decoder, Format, Limits, Options};
+    use std::sync::atomic::AtomicBool;
+    let limits = Limits {
+        max_alloc: 256 << 20,
+        max_threads: 1,
+        max_width: 1024,
+        max_height: 1024,
+        ..Limits::default()
+    };
+    let Ok(units) = crate::split_temporal_units(data, Format::Section5, &limits) else {
+        return;
+    };
+    // Work budget, as in the `decode` target: tile data past the end reads as zeros, so a few
+    // bytes can decode whole frames.
+    let Ok(p) = crate::probe(data, Format::Section5, &limits) else {
+        return;
+    };
+    let work: u64 = p
+        .frames
+        .iter()
+        .map(|f| u64::from(f.width) * u64::from(f.height))
+        .sum();
+    if work > 16 << 20 {
+        return;
+    }
+    let cancel = AtomicBool::new(false);
+    let mut reuse = Decoder::new(Options::default(), limits);
+    let mut fresh = Decoder::new(Options::default(), limits);
+    fresh.reuse = false;
+    for u in units {
+        let a = reuse.decode_temporal_unit(u, Format::Section5, &cancel);
+        let b = fresh.decode_temporal_unit(u, Format::Section5, &cancel);
+        assert_eq!(a, b);
+        assert_eq!(reuse.take_frames(), fresh.take_frames());
+        match a {
+            Ok(frames) => reuse.recycle(frames),
+            Err(_) => break,
+        }
+    }
+}

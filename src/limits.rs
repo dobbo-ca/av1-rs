@@ -7,7 +7,10 @@ pub struct Limits {
     /// Peak working memory of one decoder, in bytes, all threads together (default 1 GiB). Every
     /// buffer that scales with the frame size is charged before it is allocated; the frames a
     /// decoder returns are not counted once returned (`decode` counts the frames it collects). More is
-    /// [`Error::AllocLimit`](crate::Error::AllocLimit).
+    /// [`Error::AllocLimit`](crate::Error::AllocLimit). A decoder keeps the buffers of its last
+    /// frame, and those of frames handed back with
+    /// [`Decoder::recycle`](crate::Decoder::recycle), charged for the next frames; the sample
+    /// buffers among them give way to any charge that needs their room (docs/limits.md).
     pub max_alloc: usize,
     /// Most OS threads of one call, the calling thread included (default
     /// `std::thread::available_parallelism`). 1 spawns no thread; 0 is treated as 1.
