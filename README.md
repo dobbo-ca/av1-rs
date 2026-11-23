@@ -32,11 +32,17 @@ AVIF stills are decoded with `av1::decode_avif` (the primary image and its alpha
 | `max_pixels` | 2^28 | `PixelLimit` |
 | `max_metadata` (bytes) | 16 MiB | `MetadataLimit` |
 
-`max_alloc` is the enforced peak working memory of one decoder, or of one `decode_avif` call (all threads; charged before each
-allocation, released on drop). That covers frame buffers, film grain buffers and the output frames of one temporal unit until it returns; frames already returned (except by `decode`, which counts the frames it collects), the temporal-unit index of `split_temporal_units` (only capped by `max_alloc`) and the item bytes inside `isobmff` are not counted, and `max_metadata` is on top. `max_threads = 1` spawns no thread; otherwise the tiles of a frame
-and the tiles of an AVIF grid decode on up to `max_threads` threads, with the same output. A frame size is checked
-before anything is allocated. Setting the cancel flag returns `Error::Cancelled` at the next OBU
-or tile. Details: [docs/limits.md](docs/limits.md).
+`max_alloc` is the enforced peak working memory of one decoder or one `decode_avif` call, all
+threads included: frame buffers, film grain buffers and the output frames of a temporal unit
+(and every frame `decode` collects) are charged before allocation and released on drop. Not
+counted: frames already returned by `Decoder`, the item bytes inside `isobmff`; `max_metadata`
+is on top. `max_threads = 1` spawns no thread; otherwise the tiles of a frame and the tiles of
+an AVIF grid decode on up to `max_threads` threads, with the same output. A frame size is
+checked before anything is allocated. The cancel flag returns `Error::Cancelled` at the next
+OBU, superblock row or filter row. Details: [docs/limits.md](docs/limits.md).
+
+Metadata OBUs (HDR CLL / MDCV, ITU-T T.35, any type) and the colour configuration are kept raw
+by default (`Frame::metadata`, `Frame::color`); `Options::keep_metadata = false` drops them.
 
 ## Docs
 

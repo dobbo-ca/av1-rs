@@ -10,3 +10,9 @@ The result is the job summary of the `bench` run (`summary.md`: dav1d ms, av1-rs
 for 1 thread and default threads). A decoder command that exits non-zero is listed in the summary
 as a warning, and the times of that run mean nothing. No numbers are copied here: the decoder is
 scalar and spec-literal, and the job summary of the latest run on `main` is the record.
+
+## Last run (2026-11-23, main 49f2864, information only)
+
+24 streams, 100 frames: dav1d 200 ms / av1-rs 1005 ms with one thread (5.0x); dav1d 115 ms /
+av1-rs 1134 ms with default threads (9.9x; these streams have one tile, so av1-rs gains nothing
+from threads). The decoder is scalar and spec-literal; SIMD and speed work come later.

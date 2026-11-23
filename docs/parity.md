@@ -42,6 +42,8 @@ no Matroska input; dav1d-test-data has the same streams as IVF).
 
 ## Results
 
+Last green run on `main` (a5cb385, 2026-11-23): 679 inputs, 604 frames; 289 streams and 238 AVIF items bit-exact against dav1d, 518 inputs against aomdec, 236 libaom vectors against the published md5, 133 AVIF files against avifdec; every gate green, `--threads 1` equal to the default threads, aarch64 equal to x86_64 on the subset.
+
 The `parity` job on `main` gates: 289 streams (240 libaom + 49 dav1d-test-data) against dav1d, and against aomdec and the published md5 where those apply, and 151 AVIF files against avifdec (libavif with dav1d; a file avifdec cannot decode must be listed in `tests/parity/avifdec-known-failures.txt`, and a listed file that decodes fails the gate as a stale entry) plus every coded item against dav1d and aomdec. `run.sh` fails the job if fewer than 289 streams or 151 AVIF files are present, or if fewer than 289 streams, 238 extracted AVIF items, 604 frames or 133 AVIF files were actually compared (items are counted apart from streams). The exact counts of compared frames, streams and files are the first lines of the job `summary.md`; the known differences are listed below. Pin the floors in `run.sh` from the latest green run.
 
 ## Known oracle differences
