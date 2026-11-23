@@ -442,18 +442,20 @@ impl Decoder {
         Err(Error::Unsupported("tile decoding"))
     }
 
-    /// `metadata_obu()`: keeps the payload of a known metadata type for the next output frame,
-    /// within `Limits::max_metadata`.
+    /// `metadata_obu()`: keeps the raw payload of every metadata OBU for the next output frame,
+    /// within `Limits::max_metadata`, unless `Options::keep_metadata` is false.
     fn metadata_obu(&mut self, payload: &[u8]) -> Result<(), Error> {
-        if let Some(m) = parse_metadata(payload)? {
-            let cost = m.payload.len() + size_of::<Metadata>();
-            let total = self.metadata_bytes.saturating_add(cost);
-            if total > self.limits.max_metadata {
-                return Err(Error::MetadataLimit);
-            }
-            self.metadata_bytes = total;
-            self.metadata.push(m);
+        if !self.options.keep_metadata {
+            return Ok(());
         }
+        let m = parse_metadata(payload)?;
+        let cost = m.payload.len() + size_of::<Metadata>();
+        let total = self.metadata_bytes.saturating_add(cost);
+        if total > self.limits.max_metadata {
+            return Err(Error::MetadataLimit);
+        }
+        self.metadata_bytes = total;
+        self.metadata.push(m);
         Ok(())
     }
 

@@ -101,6 +101,10 @@ pub struct Options {
     /// Apply film grain synthesis to the output when the frame has film grain parameters
     /// (default `true`).
     pub film_grain: bool,
+    /// Keep the metadata OBUs (HDR CLL / MDCV, ITU-T T.35, timecode, scalability and any other
+    /// type) raw in [`Frame::metadata`] (default `true`). `false` drops them. The colour
+    /// configuration is always in [`Frame::color`].
+    pub keep_metadata: bool,
 }
 
 impl Default for Options {
@@ -109,6 +113,7 @@ impl Default for Options {
             operating_point: 0,
             all_layers: false,
             film_grain: true,
+            keep_metadata: true,
         }
     }
 }
@@ -149,7 +154,7 @@ pub struct Plane {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Metadata {
     /// The `metadata_type`: 1 HDR content light level, 2 HDR mastering display colour volume,
-    /// 3 scalability, 4 ITU-T T.35, 5 timecode.
+    /// 3 scalability, 4 ITU-T T.35, 5 timecode; other values are kept raw too.
     pub metadata_type: u64,
     /// The raw payload after `metadata_type`, up to the trailing bits.
     pub payload: Vec<u8>,

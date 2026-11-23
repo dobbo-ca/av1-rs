@@ -227,25 +227,16 @@ pub fn split_temporal_units(data: &[u8], format: Format) -> Result<Vec<&[u8]>, E
 
 /// `metadata_obu()` (spec 5.8.1): the `metadata_type` and the raw payload after it. The payload
 /// is the bytes up to the trailing bits: trailing zero bytes are cut, then a last byte equal to
-/// `0x80` (the trailing one bit of a byte aligned payload) is cut too. Returns `None` for a
-/// `metadata_type` this decoder does not know (the spec says to ignore those).
+/// `0x80` (the trailing one bit of a byte aligned payload) is cut too. Every `metadata_type` is
+/// kept raw, including types this decoder does not interpret (owner rule: keep metadata by
+/// default; `Options::keep_metadata` drops it).
 ///
 /// # Errors
 /// `Truncated` if `metadata_type` is cut off, `Invalid` if it is not a valid leb128.
-pub(crate) fn parse_metadata(payload: &[u8]) -> Result<Option<Metadata>, Error> {
+pub(crate) fn parse_metadata(payload: &[u8]) -> Result<Metadata, Error> {
     let mut r = BitReader::new(payload);
     let (metadata_type, _) = r.leb128()?;
     let metadata_type = u64::from(metadata_type);
-    let known = [
-        METADATA_TYPE_HDR_CLL,
-        METADATA_TYPE_HDR_MDCV,
-        METADATA_TYPE_SCALABILITY,
-        METADATA_TYPE_ITUT_T35,
-        METADATA_TYPE_TIMECODE,
-    ];
-    if !known.contains(&metadata_type) {
-        return Ok(None);
-    }
     let mut rest = r.rest();
     while let [head @ .., 0] = rest {
         rest = head;
@@ -253,10 +244,10 @@ pub(crate) fn parse_metadata(payload: &[u8]) -> Result<Option<Metadata>, Error> 
     if let [head @ .., 0x80] = rest {
         rest = head;
     }
-    Ok(Some(Metadata {
+    Ok(Metadata {
         metadata_type,
         payload: rest.to_vec(),
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -365,13 +356,12 @@ mod tests {
     #[test]
     fn metadata_payload_and_trailing_bits() {
         // HDR CLL: type 1, max_cll, max_fall, trailing byte 0x80, then padding zeros.
-        let m = parse_metadata(&[1, 0x03, 0xe8, 0x01, 0x90, 0x80, 0, 0])
-            .unwrap()
-            .unwrap();
+        let m = parse_metadata(&[1, 0x03, 0xe8, 0x01, 0x90, 0x80, 0, 0]).unwrap();
         assert_eq!(m.metadata_type, METADATA_TYPE_HDR_CLL);
         assert_eq!(m.payload, [0x03, 0xe8, 0x01, 0x90]);
-        // Unknown type is ignored.
-        assert!(parse_metadata(&[0x20, 0x80]).unwrap().is_none());
+        // A type this decoder does not interpret is kept raw too.
+        let u = parse_metadata(&[0x20, 0x07, 0x80]).unwrap();
+        assert_eq!((u.metadata_type, u.payload), (0x20, vec![0x07]));
         assert_eq!(parse_metadata(&[]), Err(Error::Truncated));
     }
 }

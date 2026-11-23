@@ -208,6 +208,7 @@ fn run_file(
         operating_point: args.operating_point,
         all_layers: args.all_layers,
         film_grain: args.film_grain,
+        ..Options::default()
     };
     let cancel = AtomicBool::new(false);
     let mut decoder = Decoder::new(options, *limits);
