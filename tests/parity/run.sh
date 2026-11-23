@@ -87,17 +87,29 @@ full() {
     else
       N=$(wc -l < "$out")
     fi
+    # Known oracle differences (docs/parity.md, "Known oracle differences"):
+    # - libavif poc_* files are security reproducers (hostile input): fuzz seeds, no oracle.
+    # - *_tile_shared_in_dimg: an item used twice in dimg; av1-rs refuses it, as libavif >= 1.1.1.
+    # - *_reversed_dimg_order: libavif 0.11 ignores the dimg order (fixed in 1.1.1).
+    case $f in libavif__poc_*) continue ;; esac
     if [ -f $W/r1/$s.err ] && [ "$(cat $W/r1/$s.err)" != inter ]; then
-      echo "$f: av1-rs error $(cat $W/r1/$s.err) ($(cat $W/r1/$s.why 2>/dev/null)) after $N frames" >> $W/d-err
+      case $f in
+        *_tile_shared_in_dimg.avif) ;;
+        *) echo "$f: av1-rs error $(cat $W/r1/$s.err) ($(cat $W/r1/$s.why 2>/dev/null)) after $N frames" >> $W/d-err ;;
+      esac
     fi
     [ "$N" -gt 0 ] || continue
     # The whole AVIF image (grid assembled, before irot/imir/clap) against avifdec (libavif with
-    # dav1d); its y4m minus the header and the one FRAME line is the same layout as .yuv.
+    # dav1d); its y4m minus the header and the one FRAME line is the same layout as .yuv, plus
+    # the alpha plane when there is one.
     case $f in *.avif)
+      case $f in *_reversed_dimg_order.avif) continue ;; esac
       avifdec --jobs 1 "$p" $W/avd/$s.y4m >/dev/null 2>&1 || { echo "$f" >> "$REP/avifdec-failed.txt"; continue; }
       hl=$(head -n 1 $W/avd/$s.y4m | wc -c)
       tail -c +$((hl + 7)) $W/avd/$s.y4m > $W/avd/$s.yuv
-      cmp -s $W/avd/$s.yuv $W/r1/$s.yuv || echo "$f: differs from avifdec: $(mismatch $W/avd/$s.yuv $W/r1/$s.yuv $W/r1/$s.frames)" >> $W/d-avif
+      cat $W/r1/$s.yuv $W/r1/$s.alpha.yuv > $W/avd/$s.ours 2>/dev/null
+      cmp -s $W/avd/$s.yuv $W/r1/$s.yuv || cmp -s $W/avd/$s.yuv $W/avd/$s.ours \
+        || echo "$f: differs from avifdec: $(mismatch $W/avd/$s.yuv $W/r1/$s.yuv $W/r1/$s.frames)" >> $W/d-avif
       avifd=$((avifd + 1))
       continue ;;
     esac

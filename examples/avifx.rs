@@ -80,7 +80,10 @@ fn run(out_dir: &Path, files: &[PathBuf]) -> std::io::Result<()> {
         match items(&data) {
             Ok(found) => {
                 for (id, stream) in &found {
-                    fs::write(out_dir.join(format!("{name}.item{id}.obu")), stream)?;
+                    // A temporal delimiter first: dav1d's Section 5 reader expects one.
+                    let mut obu = vec![0x12, 0x00];
+                    obu.extend_from_slice(stream);
+                    fs::write(out_dir.join(format!("{name}.item{id}.obu")), obu)?;
                 }
                 println!("{}: {} items", path.display(), found.len());
             }
