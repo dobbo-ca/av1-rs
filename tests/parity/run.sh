@@ -2,7 +2,8 @@
 # Parity gates of av1-rs (docs/parity.md). CI only, called by .github/ci/Dockerfile; needs
 # av1-oracle (examples/oracle.rs), dav1d and aomdec on PATH and the corpus in /data (/data.list).
 #   run.sh full <report-dir>   av1-rs vs dav1d (every stream), aomdec and the published per-frame
-#                              md5 (libaom vectors), and --threads 1 vs default threads
+#                              md5 (libaom vectors), --threads 1 vs default threads, and the
+#                              scalar and AVX2 SIMD tiers vs the best tier (AV1_SIMD)
 #   run.sh ref <out-dir>       av1-oracle, one thread, on the arm64 subset
 #   run.sh arm <ref-dir>       av1-oracle-arm64 under qemu on the same subset vs <ref-dir>
 #   run.sh seeds <dst>         the corpus as fuzz seeds, one option byte (0x00) appended
@@ -80,6 +81,10 @@ full() {
   flag=; [ "$MODE" = info ] && flag=--info
   av1-oracle $flag --threads 1 $W/in $W/r1 || bad=1
   av1-oracle $flag $W/in $W/rn || bad=1
+  # Every lower SIMD tier (src/simd) must give the output of the best tier (r1), byte for byte.
+  for t in scalar avx2; do
+    AV1_SIMD=$t av1-oracle $flag --threads 1 $W/in $W/t-$t || bad=1
+  done
   : > $W/d-dav1d; : > $W/d-aom; : > $W/d-md5; : > $W/d-err; : > $W/d-avif
   frames=0 cmpd=0 itemd=0 aomd=0 md5d=0 avifd=0
   for p in $W/in/*; do
@@ -182,6 +187,8 @@ full() {
   [ "$avifd" -ge 133 ] || echo "only $avifd AVIF files compared against avifdec, want at least 133" >> $W/d-err
   [ "$frames" -ge 604 ] || echo "only $frames frames compared against dav1d, want at least 604" >> $W/d-err
   diff -r $W/r1 $W/rn > $W/d-threads
+  : > $W/d-tiers
+  for t in scalar avx2; do diff -r $W/r1 $W/t-$t >> $W/d-tiers; done
   {
     echo "## av1-rs parity ($MODE)"
     echo
@@ -190,7 +197,7 @@ full() {
     echo "| gate | result |"
     echo "|---|---|"
   } > "$REP/summary.md"
-  for g in err dav1d aom md5 avif threads; do
+  for g in err dav1d aom md5 avif threads tiers; do
     l=$(wc -l < $W/d-$g)
     if [ "$l" -eq 0 ]; then echo "| $g | ok |" >> "$REP/summary.md"
     else echo "| $g | FAIL, $l lines |" >> "$REP/summary.md"; bad=1; head -n 300 $W/d-$g > "$REP/$g.diff"; fi
@@ -216,6 +223,9 @@ arm() {
   inputs $W/in "$SUBSET"
   flag=; [ "$MODE" = info ] && flag=--info
   qemu-aarch64 -L /usr/aarch64-linux-gnu "$(command -v av1-oracle-arm64)" $flag --threads 1 $W/in $W/arm || exit 1
+  # The scalar tier on aarch64 too (the NEON tier is the default run above).
+  AV1_SIMD=scalar qemu-aarch64 -L /usr/aarch64-linux-gnu "$(command -v av1-oracle-arm64)" $flag --threads 1 $W/in $W/arm-scalar || exit 1
+  diff -r "$1" $W/arm-scalar || exit 1
   [ "$(ls $W/in | wc -l)" -ge 50 ] || { echo "arm64 subset has only $(ls $W/in | wc -l) streams, want at least 50" >&2; exit 1; }
   diff -r "$1" $W/arm && echo "arm64 matches x86_64 on $(ls $W/in | wc -l) streams"
 }

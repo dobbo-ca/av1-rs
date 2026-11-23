@@ -38,6 +38,11 @@ RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
 RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + && cargo test --locked --no-fail-fast
+# The whole suite again with each lower SIMD tier forced (src/simd; the default run above uses
+# the best tier, AVX-512 on the ARC nodes). The cross-tier kernel tests compare every tier anyway.
+RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
+    find src examples tests -name '*.rs' -exec touch {} + \
+    && AV1_SIMD=scalar cargo test --locked --no-fail-fast && AV1_SIMD=avx2 cargo test --locked --no-fail-fast
 # The examples are built too, so the cross linker runs (a lib alone is not linked).
 RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + && cargo build --locked --release --target aarch64-unknown-linux-gnu --examples
@@ -52,12 +57,14 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64 -L /usr/aarch64-
 FROM qemu-tools AS qemu-arm64
 COPY . .
 
-# aarch64 tests under qemu-user. There is no NEON code yet, so only the library unit tests run
-# (the full suite runs natively in `ci`); the SIMD kernel tests join here when SIMD lands.
+# aarch64 tests under qemu-user: the library unit tests (they hold the SIMD kernel, cross-tier
+# and dispatch tests; the full suite runs natively in `ci`), with the NEON tier and with the
+# scalar tier forced.
 FROM qemu-arm64 AS arm64
 RUN --mount=type=cache,id=av1-rs-target-arm64,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + \
-    && cargo test --locked --release --target aarch64-unknown-linux-gnu --lib
+    && cargo test --locked --release --target aarch64-unknown-linux-gnu --lib \
+    && AV1_SIMD=scalar cargo test --locked --release --target aarch64-unknown-linux-gnu --lib
 
 # The C oracles (CI only, never linked into the crate): dav1d 1.0.0 and aomdec 3.6.0 from
 # bookworm. Nothing of the crate is copied here, so a crate change does not rebuild it.
@@ -163,6 +170,9 @@ RUN --mount=type=cache,id=av1-rs-target-bench,sharing=locked,target=/src/target 
     find src examples tests -name '*.rs' -exec touch {} + \
     && RUSTFLAGS="-C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
        cargo build --locked --release --example oracle --target-dir target/prof \
-    && cp target/prof/release/examples/oracle /usr/local/bin/av1-oracle-prof
+    && cp target/prof/release/examples/oracle /usr/local/bin/av1-oracle-prof \
+    && RUSTFLAGS="-C force-frame-pointers=yes -C llvm-args=-inline-threshold=0" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
+       cargo build --locked --release --example oracle --target-dir target/noinline \
+    && cp target/noinline/release/examples/oracle /usr/local/bin/av1-oracle-noinline
 RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
     sh tests/parity/profile.sh prep /bench && du -sh /bench
