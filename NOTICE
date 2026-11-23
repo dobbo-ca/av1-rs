@@ -1,0 +1,14 @@
+av1-rs. Copyright 2026 dobbo-ca. Licensed under Apache-2.0.
+
+Specification tables
+--------------------
+
+The constant tables and default CDF tables in src/ are transcribed from the AV1 Bitstream &
+Decoding Process Specification, Copyright 2018 The Alliance for Open Media. Licensing terms are
+at aomedia.org/license.
+
+Ported code
+-----------
+
+(To be filled in by the integrator: every part ported from dav1d or rav1d, with the source file
+and licence line "BSD-2-Clause, Copyright (c) VideoLAN and dav1d authors".)
