@@ -576,11 +576,11 @@ impl Decoder {
                 apply_film_grain(&h.film_grain, &input, [o0, o1, o2], &self.ledger)?;
             }
             for (g, p) in grained.iter().zip(planes) {
-                out.push(self.to_public(g, p.width, p.height, s.bit_depth)?);
+                out.push(self.public_plane(g, p.width, p.height, s.bit_depth)?);
             }
         } else {
             for p in planes {
-                out.push(self.to_public(p, p.width, p.height, s.bit_depth)?);
+                out.push(self.public_plane(p, p.width, p.height, s.bit_depth)?);
             }
         }
         let metadata = std::mem::take(&mut self.metadata);
@@ -606,7 +606,7 @@ impl Decoder {
 
     /// Copies the visible `width` x `height` samples of `p` into an output plane, `u8` for 8-bit
     /// frames and `u16` otherwise. `width` and `height` are within the plane.
-    fn to_public(
+    fn public_plane(
         &mut self,
         p: &WorkPlane,
         width: usize,
