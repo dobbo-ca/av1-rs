@@ -36,6 +36,11 @@
 //! ([`Error::MetadataLimit`]). `max_threads` caps the worker threads of one call (1 spawns
 //! none).
 //!
+//! A [`Decoder`] reuses its frame buffers from one frame to the next, and
+//! [`Decoder::recycle`] hands returned frames back, so with `max_threads = 1` a temporal unit of
+//! the same shape as the previous one allocates nothing; the kept buffers stay charged to
+//! `max_alloc` (docs/limits.md).
+//!
 //! # Cancelling
 //!
 //! [`decode`] and [`Decoder::decode_temporal_unit`] take an `&AtomicBool`. Setting it from

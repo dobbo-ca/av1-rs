@@ -76,6 +76,53 @@ pub(crate) const SEGMENTATION_FEATURE_MAX: [i32; SEG_LVL_MAX] = [
 /// frame (`INTRA_FRAME` first).
 const DEFAULT_LOOP_FILTER_REF_DELTAS: [i8; TOTAL_REFS_PER_FRAME] = [1, 0, 0, 0, -1, 0, -1, -1];
 
+/// `MiColStarts` or `MiRowStarts`: at most 65 entries (64 tiles and the end), kept inline so a
+/// frame header allocates nothing. Reads as a slice of the entries pushed so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Starts {
+    v: [u32; MAX_TILE_COLS + 1],
+    n: usize,
+}
+
+impl Default for Starts {
+    fn default() -> Starts {
+        Starts {
+            v: [0; MAX_TILE_COLS + 1],
+            n: 0,
+        }
+    }
+}
+
+impl Starts {
+    /// The entries of `v` (test headers).
+    #[cfg(test)]
+    pub(crate) fn of(v: &[u32]) -> Starts {
+        let mut s = Starts::default();
+        for &x in v {
+            s.push(x).unwrap();
+        }
+        s
+    }
+
+    /// Appends `x`; `Invalid` past 65 entries (more than 64 tiles).
+    fn push(&mut self, x: u32) -> Result<(), Error> {
+        let slot = self
+            .v
+            .get_mut(self.n)
+            .ok_or(Error::Invalid("too many tiles"))?;
+        *slot = x;
+        self.n += 1;
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for Starts {
+    type Target = [u32];
+    fn deref(&self) -> &[u32] {
+        &self.v[..self.n]
+    }
+}
+
 /// Everything `tile_info()` computes (spec 5.9.15).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TileInfo {
@@ -84,9 +131,9 @@ pub(crate) struct TileInfo {
     pub tile_cols_log2: u32,
     pub tile_rows_log2: u32,
     /// `TileCols + 1` entries; the last is `MiCols`.
-    pub mi_col_starts: Vec<u32>,
+    pub mi_col_starts: Starts,
     /// `TileRows + 1` entries; the last is `MiRows`.
-    pub mi_row_starts: Vec<u32>,
+    pub mi_row_starts: Starts,
     pub context_update_tile_id: usize,
     pub tile_size_bytes: u32,
 }
@@ -949,11 +996,11 @@ fn tile_info(
         let tile_width_sb = (sb_cols + (1 << t.tile_cols_log2) - 1) >> t.tile_cols_log2;
         let mut start_sb = 0;
         while start_sb < sb_cols {
-            t.mi_col_starts.push((start_sb << sb_shift) as u32);
+            t.mi_col_starts.push((start_sb << sb_shift) as u32)?;
             start_sb += tile_width_sb;
         }
         t.tile_cols = t.mi_col_starts.len();
-        t.mi_col_starts.push(mi_cols as u32);
+        t.mi_col_starts.push(mi_cols as u32)?;
 
         let min_log2_tile_rows = min_log2_tiles.saturating_sub(t.tile_cols_log2);
         t.tile_rows_log2 = min_log2_tile_rows;
@@ -967,11 +1014,11 @@ fn tile_info(
         let tile_height_sb = (sb_rows + (1 << t.tile_rows_log2) - 1) >> t.tile_rows_log2;
         let mut start_sb = 0;
         while start_sb < sb_rows {
-            t.mi_row_starts.push((start_sb << sb_shift) as u32);
+            t.mi_row_starts.push((start_sb << sb_shift) as u32)?;
             start_sb += tile_height_sb;
         }
         t.tile_rows = t.mi_row_starts.len();
-        t.mi_row_starts.push(mi_rows as u32);
+        t.mi_row_starts.push(mi_rows as u32)?;
     } else {
         let mut widest_tile_sb = 0;
         let mut start_sb = 0;
@@ -979,14 +1026,14 @@ fn tile_info(
             if t.mi_col_starts.len() >= MAX_TILE_COLS {
                 return Err(Error::Invalid("more than 64 tile columns"));
             }
-            t.mi_col_starts.push((start_sb << sb_shift) as u32);
+            t.mi_col_starts.push((start_sb << sb_shift) as u32)?;
             let max_width = (sb_cols - start_sb).min(max_tile_width_sb);
             let size_sb = r.ns(max_width as u32)? as usize + 1;
             widest_tile_sb = widest_tile_sb.max(size_sb);
             start_sb += size_sb;
         }
         t.tile_cols = t.mi_col_starts.len();
-        t.mi_col_starts.push(mi_cols as u32);
+        t.mi_col_starts.push(mi_cols as u32)?;
         t.tile_cols_log2 = tile_log2(1, t.tile_cols);
 
         if min_log2_tiles > 0 {
@@ -1001,13 +1048,13 @@ fn tile_info(
             if t.mi_row_starts.len() >= MAX_TILE_ROWS {
                 return Err(Error::Invalid("more than 64 tile rows"));
             }
-            t.mi_row_starts.push((start_sb << sb_shift) as u32);
+            t.mi_row_starts.push((start_sb << sb_shift) as u32)?;
             let max_height = (sb_rows - start_sb).min(max_tile_height_sb);
             let size_sb = r.ns(max_height as u32)? as usize + 1;
             start_sb += size_sb;
         }
         t.tile_rows = t.mi_row_starts.len();
-        t.mi_row_starts.push(mi_rows as u32);
+        t.mi_row_starts.push(mi_rows as u32)?;
         t.tile_rows_log2 = tile_log2(1, t.tile_rows);
     }
     if t.tile_cols > MAX_TILE_COLS || t.tile_rows > MAX_TILE_ROWS {
@@ -1039,13 +1086,12 @@ pub(crate) struct TileRange {
 pub(crate) struct TileGroup {
     pub tg_start: usize,
     pub tg_end: usize,
-    pub tiles: Vec<TileRange>,
 }
 
 /// Parses the header of a `tile_group_obu( sz )` and cuts out the byte range of each tile.
 /// `data` is the tile group payload (for an `OBU_FRAME`, the bytes after the frame header and its
 /// byte alignment); ranges are offsets into it plus `base`. `next_tile` is the `TileNum` the
-/// group must start at.
+/// group must start at. The tiles are appended to `tiles` (on an error, some may have been).
 ///
 /// # Errors
 /// `Truncated` if the header or a tile size is cut off, `Invalid` if `tg_start` is not
@@ -1056,6 +1102,7 @@ pub(crate) fn parse_tile_group(
     base: usize,
     ti: &TileInfo,
     next_tile: usize,
+    tiles: &mut Vec<TileRange>,
 ) -> Result<TileGroup, Error> {
     let num_tiles = ti.tile_cols * ti.tile_rows;
     let mut r = BitReader::new(data);
@@ -1077,7 +1124,9 @@ pub(crate) fn parse_tile_group(
         return Err(Error::Invalid("tg_end out of range"));
     }
     let mut pos = r.get_position() / 8;
-    let mut tiles = Vec::with_capacity(tg_end - tg_start + 1);
+    tiles
+        .try_reserve(tg_end - tg_start + 1)
+        .map_err(|_| Error::OutOfMemory)?;
     for tile_num in tg_start..=tg_end {
         let left = data.len() - pos;
         let tile_size = if tile_num == tg_end {
@@ -1102,11 +1151,7 @@ pub(crate) fn parse_tile_group(
         });
         pos = end;
     }
-    Ok(TileGroup {
-        tg_start,
-        tg_end,
-        tiles,
-    })
+    Ok(TileGroup { tg_start, tg_end })
 }
 
 #[cfg(test)]
@@ -1128,8 +1173,8 @@ pub(crate) mod tests {
         let mut r = BitReader::new(&w.bytes);
         let t = tile_info(&mut r, &seq(false), 16, 8).unwrap();
         assert_eq!((t.tile_cols, t.tile_rows), (1, 1));
-        assert_eq!(t.mi_col_starts, [0, 16]);
-        assert_eq!(t.mi_row_starts, [0, 8]);
+        assert_eq!(*t.mi_col_starts, [0, 16]);
+        assert_eq!(*t.mi_row_starts, [0, 8]);
         assert_eq!(r.get_position(), 1);
     }
 
@@ -1147,8 +1192,8 @@ pub(crate) mod tests {
         let t = tile_info(&mut r, &seq(false), 256, 64).unwrap();
         assert_eq!((t.tile_cols, t.tile_rows), (4, 1));
         assert_eq!((t.tile_cols_log2, t.tile_rows_log2), (2, 0));
-        assert_eq!(t.mi_col_starts, [0, 64, 128, 192, 256]);
-        assert_eq!(t.mi_row_starts, [0, 64]);
+        assert_eq!(*t.mi_col_starts, [0, 64, 128, 192, 256]);
+        assert_eq!(*t.mi_row_starts, [0, 64]);
         assert_eq!((t.context_update_tile_id, t.tile_size_bytes), (3, 2));
     }
 
@@ -1166,8 +1211,8 @@ pub(crate) mod tests {
         let mut r = BitReader::new(&w.bytes);
         let t = tile_info(&mut r, &seq(false), 64, 32).unwrap();
         assert_eq!((t.tile_cols, t.tile_rows), (2, 1));
-        assert_eq!(t.mi_col_starts, [0, 16, 64]);
-        assert_eq!(t.mi_row_starts, [0, 32]);
+        assert_eq!(*t.mi_col_starts, [0, 16, 64]);
+        assert_eq!(*t.mi_row_starts, [0, 32]);
         assert_eq!((t.context_update_tile_id, t.tile_size_bytes), (1, 4));
     }
 
@@ -1184,7 +1229,7 @@ pub(crate) mod tests {
         let mut r = BitReader::new(&w.bytes);
         let t = tile_info(&mut r, &seq(false), 2048, 16).unwrap();
         assert_eq!(t.tile_cols, 2);
-        assert_eq!(t.mi_col_starts, [0, 1024, 2048]);
+        assert_eq!(*t.mi_col_starts, [0, 1024, 2048]);
     }
 
     #[test]
@@ -1192,13 +1237,14 @@ pub(crate) mod tests {
         let ti = TileInfo {
             tile_cols: 1,
             tile_rows: 1,
-            mi_col_starts: vec![0, 16],
-            mi_row_starts: vec![0, 8],
+            mi_col_starts: Starts::of(&[0, 16]),
+            mi_row_starts: Starts::of(&[0, 8]),
             ..TileInfo::default()
         };
-        let tg = parse_tile_group(&[1, 2, 3], 10, &ti, 0).unwrap();
+        let mut tiles = Vec::new();
+        let tg = parse_tile_group(&[1, 2, 3], 10, &ti, 0, &mut tiles).unwrap();
         assert_eq!(
-            tg.tiles,
+            tiles,
             [TileRange {
                 tile_num: 0,
                 start: 10,
@@ -1215,15 +1261,16 @@ pub(crate) mod tests {
             tile_rows: 1,
             tile_cols_log2: 1,
             tile_size_bytes: 2,
-            mi_col_starts: vec![0, 8, 16],
-            mi_row_starts: vec![0, 8],
+            mi_col_starts: Starts::of(&[0, 8, 16]),
+            mi_row_starts: Starts::of(&[0, 8]),
             ..TileInfo::default()
         };
         // flag 0 (no start/end), padded to a byte; first tile has 3 bytes; the last the rest.
         let data = [0x00, 0x02, 0x00, 7, 8, 9, 5, 6];
-        let tg = parse_tile_group(&data, 0, &ti, 0).unwrap();
+        let mut tiles = Vec::new();
+        parse_tile_group(&data, 0, &ti, 0, &mut tiles).unwrap();
         assert_eq!(
-            tg.tiles,
+            tiles,
             [
                 TileRange {
                     tile_num: 0,
@@ -1240,18 +1287,19 @@ pub(crate) mod tests {
         // A first tile that claims more than what is there.
         let bad = [0x00, 0x09, 0x00, 7, 8];
         assert!(matches!(
-            parse_tile_group(&bad, 0, &ti, 0),
+            parse_tile_group(&bad, 0, &ti, 0, &mut Vec::new()),
             Err(Error::Invalid(_))
         ));
         // A group that starts at the wrong tile: flag 1, tg_start 1, tg_end 1.
         let late = [0b1110_0000, 5];
         assert!(matches!(
-            parse_tile_group(&late, 0, &ti, 0),
+            parse_tile_group(&late, 0, &ti, 0, &mut Vec::new()),
             Err(Error::Invalid(_))
         ));
-        let ok = parse_tile_group(&late, 0, &ti, 1).unwrap();
+        let mut ok = Vec::new();
+        parse_tile_group(&late, 0, &ti, 1, &mut ok).unwrap();
         assert_eq!(
-            ok.tiles,
+            ok,
             [TileRange {
                 tile_num: 1,
                 start: 1,

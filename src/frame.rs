@@ -3,11 +3,13 @@
 //! allocated and released when they drop.
 #![allow(dead_code)]
 
+use crate::cdf::CdfContext;
 use crate::consts::{MI_SIZE, RESTORE_NONE};
 use crate::error::Error;
 use crate::header::FrameHeader;
 use crate::ledger::{Ledger, zeroed};
 use crate::seq::SequenceHeader;
+use crate::tile::TileScratch;
 use std::sync::Arc;
 
 /// One plane of samples, one `u16` per sample for every bit depth (rows are `stride` samples
@@ -23,28 +25,30 @@ pub(crate) struct Plane {
 }
 
 impl Plane {
-    /// A zeroed plane of `width` x `height` samples with `stride == width`.
+    /// A zeroed plane of `width` x `height` samples with `stride == width`, on a buffer from the
+    /// ledger's pool when one is large enough.
     ///
     /// # Errors
     /// `AllocLimit` if the ledger is exhausted, `OutOfMemory` if the allocation fails.
     pub(crate) fn new(width: usize, height: usize, ledger: &Arc<Ledger>) -> Result<Plane, Error> {
         let n = width.checked_mul(height).ok_or(Error::AllocLimit)?;
-        let mut px = Vec::new();
-        zeroed(&mut px, n, ledger)?;
+        let (mut px, charged) = ledger.take::<u16>(n)?;
+        px.resize(n, 0);
         Ok(Plane {
             width,
             height,
             stride: width,
             px,
             ledger: Arc::clone(ledger),
-            charged: n * size_of::<u16>(),
+            charged,
         })
     }
 }
 
 impl Drop for Plane {
+    /// The buffer goes back to the ledger's pool, still charged.
     fn drop(&mut self) {
-        self.ledger.release(self.charged);
+        self.ledger.give(std::mem::take(&mut self.px), self.charged);
     }
 }
 
@@ -238,9 +242,170 @@ pub(crate) struct FrameState {
     /// leaves it here after the loop filter, CDEF, superres and loop restoration; the decoder
     /// then stores and outputs it.
     pub lr_frame: Vec<Plane>,
+    /// The buffers of a tile decode, kept between the tiles and frames this state decodes
+    /// (see [`TileScratch`]).
+    pub tile_scratch: Option<TileScratch>,
+    /// The frame CDFs of the last frame decoded on this state, reused by the next.
+    pub frame_cdf: Option<Box<CdfContext>>,
+    /// The sizes every buffer above was allocated for.
+    shape: Shape,
+}
+
+/// What decides the size of every array and plane of a [`FrameState`]: a state of an earlier
+/// frame with the same shape is reused as it is ([`FrameState::reuse`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Shape {
+    mi: (usize, usize),
+    luma: (usize, usize),
+    num_planes: usize,
+    subsampling: (usize, usize),
+    palette: bool,
+    intrabc: bool,
+    lr_unit_rows: [usize; 3],
+    lr_unit_cols: [usize; 3],
+}
+
+/// `unitRows` and `unitCols` of each plane (spec 5.11.57); 0 for a plane without loop
+/// restoration.
+fn lr_units(
+    h: &FrameHeader,
+    num_planes: usize,
+    (subsampling_x, subsampling_y): (usize, usize),
+) -> ([usize; 3], [usize; 3]) {
+    let mut lr_unit_rows = [0; 3];
+    let mut lr_unit_cols = [0; 3];
+    for plane in 0..num_planes.min(3) {
+        if h.frame_restoration_type[plane] != RESTORE_NONE {
+            let (sx, sy) = if plane == 0 {
+                (0, 0)
+            } else {
+                (subsampling_x, subsampling_y)
+            };
+            let unit_size = usize::from(h.loop_restoration_size[plane]).max(1);
+            let round2 = |x: usize, s: usize| (x + ((1 << s) >> 1)) >> s;
+            lr_unit_rows[plane] =
+                count_units_in_frame(unit_size, round2(h.frame_height as usize, sy));
+            lr_unit_cols[plane] =
+                count_units_in_frame(unit_size, round2(h.upscaled_width as usize, sx));
+        }
+    }
+    (lr_unit_rows, lr_unit_cols)
+}
+
+impl Shape {
+    fn of(
+        h: &FrameHeader,
+        seq: &SequenceHeader,
+        mi: (usize, usize),
+        luma: (usize, usize),
+    ) -> Shape {
+        let num_planes = usize::from(seq.num_planes);
+        let subsampling = (
+            usize::from(seq.subsampling_x),
+            usize::from(seq.subsampling_y),
+        );
+        let (lr_unit_rows, lr_unit_cols) = lr_units(h, num_planes, subsampling);
+        Shape {
+            mi,
+            luma,
+            num_planes,
+            subsampling,
+            palette: h.allow_screen_content_tools,
+            intrabc: h.allow_intrabc,
+            lr_unit_rows,
+            lr_unit_cols,
+        }
+    }
 }
 
 impl FrameState {
+    /// [`FrameState::new`], on the arrays of `spare` (the state of an earlier frame of the same
+    /// decoder) when the frame has the same [`Shape`]: they are cleared as `new` would allocate
+    /// them, and charged once as before. Otherwise `spare` is dropped first, so its memory is
+    /// free for the new state.
+    ///
+    /// # Errors
+    /// `AllocLimit` or `OutOfMemory` from the buffers.
+    pub(crate) fn reuse(
+        spare: Option<FrameState>,
+        h: &FrameHeader,
+        seq: &SequenceHeader,
+        ledger: &Arc<Ledger>,
+    ) -> Result<FrameState, Error> {
+        let (mi, luma) = Self::frame_dims(h);
+        if let Some(mut s) = spare
+            && s.shape == Shape::of(h, seq, mi, luma)
+            && Arc::ptr_eq(&s.ledger, ledger)
+        {
+            s.reset(h, seq)?;
+            return Ok(s);
+        }
+        Self::new(h, seq, ledger)
+    }
+
+    /// `(mi_rows, mi_cols)` and the luma plane size (rounded up to 128) of a frame state.
+    fn frame_dims(h: &FrameHeader) -> ((usize, usize), (usize, usize)) {
+        let luma_w = (h.frame_width as usize + 127) & !127;
+        let luma_h = (h.frame_height as usize + 127) & !127;
+        ((h.mi_rows as usize, h.mi_cols as usize), (luma_w, luma_h))
+    }
+
+    /// Clears a state of the same shape for the frame of header `h`: every array as
+    /// [`FrameState::build`] makes it, new zeroed `CurrFrame` planes (from the pool), no
+    /// `LrFrame`.
+    fn reset(&mut self, h: &FrameHeader, seq: &SequenceHeader) -> Result<(), Error> {
+        self.mi_sizes.fill(0);
+        self.skips.fill(false);
+        self.is_inters.fill(false);
+        self.segment_ids.fill(0);
+        self.prev_segment_ids.clear();
+        self.y_modes.fill(0);
+        self.uv_modes.fill(0);
+        self.ref_frames0.fill(0);
+        self.tx_sizes.fill(0);
+        self.inter_tx_sizes.fill(0);
+        self.mvs.fill([0; 2]);
+        self.tx_types.fill(0);
+        for i in 0..2 {
+            self.palette_sizes[i].fill(0);
+            self.palette_colors[i].fill([0; 8]);
+        }
+        self.delta_lfs.fill([0; 4]);
+        for i in 0..3 {
+            self.loopfilter_tx_sizes[i].fill(0);
+            self.lr_type[i].fill(0);
+            self.lr_wiener[i].fill([[0; 3]; 2]);
+            self.lr_sgr_set[i].fill(0);
+            self.lr_sgr_xqd[i].fill([0; 2]);
+        }
+        self.cdef_idx.fill(-1);
+        self.frame_width = h.frame_width as usize;
+        self.frame_height = h.frame_height as usize;
+        self.upscaled_width = h.upscaled_width as usize;
+        self.mi_row0 = 0;
+        self.mi_col0 = 0;
+        self.mi_row_starts.clear();
+        self.mi_row_starts
+            .extend(h.tile_info.mi_row_starts.iter().map(|&v| v as usize));
+        self.mi_col_starts.clear();
+        self.mi_col_starts
+            .extend(h.tile_info.mi_col_starts.iter().map(|&v| v as usize));
+        self.bit_depth = seq.bit_depth;
+        self.lr_frame.clear();
+        self.curr_frame.clear();
+        let (luma_w, luma_h) = self.shape.luma;
+        for plane in 0..self.num_planes {
+            let (pw, ph) = if plane == 0 {
+                (luma_w, luma_h)
+            } else {
+                (luma_w >> self.subsampling_x, luma_h >> self.subsampling_y)
+            };
+            let p = Plane::new(pw, ph, &self.ledger)?;
+            self.curr_frame.push(p);
+        }
+        Ok(())
+    }
+
     /// Allocates the `CurrFrame` planes for a frame with header `h` (the dimensions were already
     /// checked against `Limits` by the caller).
     ///
@@ -251,15 +416,8 @@ impl FrameState {
         seq: &SequenceHeader,
         ledger: &Arc<Ledger>,
     ) -> Result<FrameState, Error> {
-        let luma_w = (h.frame_width as usize + 127) & !127;
-        let luma_h = (h.frame_height as usize + 127) & !127;
-        Self::build(
-            h,
-            seq,
-            ledger,
-            (h.mi_rows as usize, h.mi_cols as usize),
-            (luma_w, luma_h),
-        )
+        let (mi, luma) = Self::frame_dims(h);
+        Self::build(h, seq, ledger, mi, luma)
     }
 
     /// The state for tile (`tile_row`, `tile_col`) of the frame with header `h`: arrays and
@@ -283,12 +441,12 @@ impl FrameState {
         };
         let starts = &h.tile_info;
         let (row0, row1) = (
-            at(&starts.mi_row_starts, tile_row)?,
-            at(&starts.mi_row_starts, tile_row + 1)?,
+            at(&starts.mi_row_starts[..], tile_row)?,
+            at(&starts.mi_row_starts[..], tile_row + 1)?,
         );
         let (col0, col1) = (
-            at(&starts.mi_col_starts, tile_col)?,
-            at(&starts.mi_col_starts, tile_col + 1)?,
+            at(&starts.mi_col_starts[..], tile_col)?,
+            at(&starts.mi_col_starts[..], tile_col + 1)?,
         );
         if row0 > row1 || col0 > col1 || row1 > h.mi_rows as usize || col1 > h.mi_cols as usize {
             return Err(Error::Invalid("tile outside the frame"));
@@ -462,23 +620,8 @@ impl FrameState {
         ];
         let mut cdef_idx: Vec<i8> = charged.vec(n)?;
         cdef_idx.fill(-1);
-        let mut lr_unit_rows = [0; 3];
-        let mut lr_unit_cols = [0; 3];
-        for plane in 0..num_planes {
-            if h.frame_restoration_type[plane] != RESTORE_NONE {
-                let (sx, sy) = if plane == 0 {
-                    (0, 0)
-                } else {
-                    (subsampling_x, subsampling_y)
-                };
-                let unit_size = usize::from(h.loop_restoration_size[plane]).max(1);
-                let round2 = |x: usize, s: usize| (x + ((1 << s) >> 1)) >> s;
-                lr_unit_rows[plane] =
-                    count_units_in_frame(unit_size, round2(h.frame_height as usize, sy));
-                lr_unit_cols[plane] =
-                    count_units_in_frame(unit_size, round2(h.upscaled_width as usize, sx));
-            }
-        }
+        let shape = Shape::of(h, seq, (mi_rows, mi_cols), (luma_w, luma_h));
+        let (lr_unit_rows, lr_unit_cols) = (shape.lr_unit_rows, shape.lr_unit_cols);
         let units = |plane: usize| lr_unit_rows[plane] * lr_unit_cols[plane];
         let lr_type = [
             charged.vec(units(0))?,
@@ -551,6 +694,9 @@ impl FrameState {
             bit_depth: seq.bit_depth,
             curr_frame,
             lr_frame: Vec::new(),
+            tile_scratch: None,
+            frame_cdf: None,
+            shape,
         })
     }
 }
@@ -616,6 +762,66 @@ mod tests {
         assert!(s.lr_type[1].is_empty());
         drop(s);
         assert_eq!(ledger.left(), before);
+    }
+
+    #[test]
+    fn reused_state_is_cleared_like_a_new_one() {
+        let seq = SequenceHeader::parse(&crate::seq::tests::still_sequence_header(), 0).unwrap();
+        let h = FrameHeader {
+            frame_width: 64,
+            frame_height: 32,
+            upscaled_width: 64,
+            mi_cols: 16,
+            mi_rows: 8,
+            frame_restoration_type: [crate::consts::RESTORE_WIENER, RESTORE_NONE, RESTORE_NONE],
+            loop_restoration_size: [64, 0, 0],
+            ..FrameHeader::default()
+        };
+        let ledger = Arc::new(Ledger::default());
+        ledger.reset(1 << 20, 0).unwrap();
+        let mut s = FrameState::new(&h, &seq, &ledger).unwrap();
+        let fresh = FrameState::new(&h, &seq, &ledger).unwrap();
+        s.mi_sizes.fill(3);
+        s.skips.fill(true);
+        s.y_modes.fill(5);
+        s.tx_sizes.fill(2);
+        s.delta_lfs.fill([1; 4]);
+        s.loopfilter_tx_sizes[1].fill(4);
+        s.cdef_idx.fill(2);
+        s.lr_type[0].fill(1);
+        s.lr_wiener[0].fill([[3; 3]; 2]);
+        s.lr_sgr_xqd[0].fill([4; 2]);
+        s.curr_frame[0].px.fill(9);
+        s.mi_row0 = 7;
+        let before = ledger.left();
+        let r = FrameState::reuse(Some(s), &h, &seq, &ledger).unwrap();
+        // Same arrays: nothing more is charged.
+        assert_eq!(ledger.left(), before);
+        assert_eq!(r.mi_sizes, fresh.mi_sizes);
+        assert_eq!(r.skips, fresh.skips);
+        assert_eq!(r.y_modes, fresh.y_modes);
+        assert_eq!(r.tx_sizes, fresh.tx_sizes);
+        assert_eq!(r.delta_lfs, fresh.delta_lfs);
+        assert_eq!(r.loopfilter_tx_sizes, fresh.loopfilter_tx_sizes);
+        assert_eq!(r.cdef_idx, fresh.cdef_idx);
+        assert_eq!(r.lr_type, fresh.lr_type);
+        assert_eq!(r.lr_wiener, fresh.lr_wiener);
+        assert_eq!(r.lr_sgr_xqd, fresh.lr_sgr_xqd);
+        assert_eq!(r.mi_row0, 0);
+        assert_eq!(r.mi_row_starts, fresh.mi_row_starts);
+        assert_eq!(r.curr_frame.len(), fresh.curr_frame.len());
+        for (p, q) in r.curr_frame.iter().zip(&fresh.curr_frame) {
+            assert_eq!((p.width, p.height, &p.px), (q.width, q.height, &q.px));
+        }
+        // Another shape gets new arrays.
+        let wide = FrameHeader {
+            frame_width: 128,
+            upscaled_width: 128,
+            mi_cols: 32,
+            ..h.clone()
+        };
+        let w = FrameState::reuse(Some(r), &wide, &seq, &ledger).unwrap();
+        assert_eq!(w.mi_sizes.len(), 8 * 32);
     }
 
     #[test]

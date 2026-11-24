@@ -171,6 +171,13 @@ cdf_context! {
     }
 }
 
+/// Only the name: the arrays are too large to print.
+impl std::fmt::Debug for CdfContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CdfContext")
+    }
+}
+
 impl CdfContext {
     /// Spec 6.8.2 `load_cdfs( ctx )`: copies the CDFs saved for a reference frame (`saved`) and
     /// then sets the last entry of every array, the symbol counter, to 0.
@@ -194,6 +201,12 @@ impl CdfContext {
         let mut tile = self.save_cdfs();
         tile.intra_frame_y_mode_cdf = DEFAULT_INTRA_FRAME_Y_MODE_CDF;
         tile
+    }
+
+    /// [`CdfContext::init_symbol_cdfs`] into an existing context (no allocation).
+    pub(crate) fn init_symbol_cdfs_into(&self, tile: &mut CdfContext) {
+        tile.clone_from(self);
+        tile.intra_frame_y_mode_cdf = DEFAULT_INTRA_FRAME_Y_MODE_CDF;
     }
 
     /// The counter-clearing step of spec 6.8.2 `load_cdfs`: sets the last entry of every CDF

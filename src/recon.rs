@@ -32,6 +32,7 @@ pub(crate) struct ReconParams {
 
 /// Working buffers of [`reconstruct`], kept by the tile decoder so that no block zeroes them
 /// (every entry is written before it is read).
+#[derive(Debug)]
 pub(crate) struct ItxScratch {
     /// `Dequant` of the coded region, layout `transform::DQ_STRIDE`.
     dq: [i32; DQ_LEN],

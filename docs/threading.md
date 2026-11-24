@@ -153,6 +153,15 @@ extra memory is at most `threads` bands, a plane of the largest size per stage a
 filters' small scratch buffers (the loop restoration windows, a few KiB per 64-sample block) are
 not charged, as in the serial path. One thread allocates no band.
 
+A tile state's planes come from the ledger's pool and go back to it when the state drops, still
+charged (docs/limits.md, "Buffer reuse"); the pool gives way to any charge that does not fit, so
+the peak argument above is unchanged. What a call with more than one thread allocates that a
+`max_threads = 1` call does not: the team's worker threads (their stacks, `std::thread::scope`)
+and its result slots, the wrapup's shared buffer lists, the private band of every wrapup item, and
+per tile the mode-info arrays and tile decoder buffers of its tile-sized state (the bands' sample
+buffers and the tile states' planes come from the pool when it holds one of the size). So only a
+`max_threads = 1` call of the same shape as the previous one allocates nothing (`tests/alloc.rs`).
+
 ## Tests
 
 - `parallel.rs`: the schedulers in isolation: peak live items and distinct threads for

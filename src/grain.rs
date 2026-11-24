@@ -11,7 +11,7 @@ use crate::consts::MC_IDENTITY;
 use crate::decoder::check_cancel;
 use crate::error::Error;
 use crate::header::FilmGrainParams;
-use crate::ledger::Ledger;
+use crate::ledger::{Buf, Ledger};
 use crate::parallel::run_parallel;
 use crate::simd::Simd;
 use crate::simd::grain::{blend_chroma, blend_luma};
@@ -58,9 +58,10 @@ impl Rng {
     }
 }
 
-/// The three grain templates (spec LumaGrain, CbGrain, CrGrain) with their row strides.
+/// The three grain templates (spec LumaGrain, CbGrain, CrGrain) with their row strides (on the
+/// stack: 72 KB; a chroma template uses the start of its array).
 struct Grain {
-    data: [Vec<i32>; 3],
+    data: [[i32; LUMA_W * LUMA_H]; 3],
     stride: [usize; 3],
 }
 
@@ -76,7 +77,7 @@ fn generate_grain(p: &FilmGrainParams, inp: &GrainInput, grain_min: i32, grain_m
     let chroma_h = if inp.subsampling_y { 38 } else { LUMA_H };
 
     let mut rng = Rng(seed);
-    let mut luma = vec![0i32; LUMA_W * LUMA_H];
+    let mut luma = [0i32; LUMA_W * LUMA_H];
     if p.num_y_points > 0 {
         for v in luma.iter_mut() {
             *v = round2(
@@ -105,24 +106,30 @@ fn generate_grain(p: &FilmGrainParams, inp: &GrainInput, grain_min: i32, grain_m
         }
     }
 
-    let mut cb = Vec::new();
-    let mut cr = Vec::new();
+    let mut cb = [0i32; LUMA_W * LUMA_H];
+    let mut cr = [0i32; LUMA_W * LUMA_H];
     if !inp.mono_chrome {
-        let make = |seed_xor: u32, wanted: bool| {
+        let make = |v: &mut [i32], seed_xor: u32, wanted: bool| {
             let mut rng = Rng(seed ^ seed_xor);
-            let mut v = vec![0i32; chroma_w * chroma_h];
             if wanted {
-                for g in v.iter_mut() {
+                for g in v[..chroma_w * chroma_h].iter_mut() {
                     *g = round2(
                         i32::from(GAUSSIAN_SEQUENCE[rng.get(11) as usize]),
                         white_shift,
                     );
                 }
             }
-            v
         };
-        cb = make(0xb524, p.num_cb_points > 0 || p.chroma_scaling_from_luma);
-        cr = make(0x49d8, p.num_cr_points > 0 || p.chroma_scaling_from_luma);
+        make(
+            &mut cb[..],
+            0xb524,
+            p.num_cb_points > 0 || p.chroma_scaling_from_luma,
+        );
+        make(
+            &mut cr[..],
+            0x49d8,
+            p.num_cr_points > 0 || p.chroma_scaling_from_luma,
+        );
         for y in 3..chroma_h {
             for x in 3..chroma_w - 3 {
                 let mut s0 = 0i32;
@@ -366,7 +373,7 @@ fn build_stripe(
     sw: usize,
     grain_min: i32,
     grain_max: i32,
-    stripe: &mut [Vec<i32>; 3],
+    stripe: &mut [impl std::ops::DerefMut<Target = [i32]>; 3],
 ) {
     let mut rng = Rng(u32::from(p.grain_seed));
     rng.0 ^= (((luma_num * 37 + 178) & 255) << 8) as u32;
@@ -428,8 +435,8 @@ fn build_stripe(
 /// threads (`parallel::run_parallel`, one scope). A band builds its own stripe and, with
 /// overlap, the stripe above it (each stripe seeds its own generator), so the bands are
 /// independent and the output is the same for every thread count. The stripe buffers of a band
-/// are charged to `ledger` while the band runs and allocated fallibly; `cancel` is checked
-/// before each band. `simd` picks the blend kernels.
+/// come from the ledger's pool (or are allocated fallibly) and are charged to `ledger` while
+/// they live; `cancel` is checked before each band. `simd` picks the blend kernels.
 pub(crate) fn apply_film_grain(
     p: &FilmGrainParams,
     input: &GrainInput,
@@ -492,20 +499,22 @@ pub(crate) fn apply_film_grain(
     run_parallel(bands, max_threads, |b| {
         check_cancel(cancel)?;
         let stripes = if p.overlap_flag && b > 0 { 2 } else { 1 };
-        let _held = ledger.charge(
-            ((stripes * 34 * num_planes + 1) * sw)
-                .checked_mul(size_of::<i32>())
-                .ok_or(Error::AllocLimit)?,
-        )?;
-        let mut cur: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-        let mut prev: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-        for plane in 0..num_planes {
-            cur[plane] = zeros(34 * sw)?;
-            if stripes == 2 {
-                prev[plane] = zeros(34 * sw)?;
-            }
-        }
-        let mut row = zeros(sw)?;
+        // The stripe buffers from the ledger's pool, charged while they live (empty for a plane
+        // the frame does not have).
+        let len = |plane: usize, n: usize| if plane < num_planes { n } else { 0 };
+        let n = 34 * sw;
+        let mut cur: [Buf<i32>; 3] = [
+            ledger.zeros(len(0, n))?,
+            ledger.zeros(len(1, n))?,
+            ledger.zeros(len(2, n))?,
+        ];
+        let p_n = if stripes == 2 { n } else { 0 };
+        let mut prev: [Buf<i32>; 3] = [
+            ledger.zeros(len(0, p_n))?,
+            ledger.zeros(len(1, p_n))?,
+            ledger.zeros(len(2, p_n))?,
+        ];
+        let mut row = ledger.zeros::<i32>(sw)?;
         build_stripe(
             b, p, &grain, subs, num_planes, w, sw, grain_min, grain_max, &mut cur,
         );
@@ -574,14 +583,6 @@ pub(crate) fn apply_film_grain(
         Ok(())
     })?;
     Ok(())
-}
-
-/// `n` zeros, allocated fallibly (the bytes are charged by the caller).
-fn zeros(n: usize) -> Result<Vec<i32>, Error> {
-    let mut v = Vec::new();
-    v.try_reserve_exact(n).map_err(|_| Error::OutOfMemory)?;
-    v.resize(n, 0);
-    Ok(v)
 }
 
 #[cfg(test)]

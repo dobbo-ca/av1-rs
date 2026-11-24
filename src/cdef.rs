@@ -67,8 +67,18 @@ pub(crate) fn cdef_frame(
     if !cdef_on(fs, curr, seq, fh, out) {
         return Ok(());
     }
-    let mut views: Vec<View<'_>> = out.iter_mut().take(num_planes).map(View::of).collect();
-    cdef_rows(fs, curr, seq, fh, 0..fs.mi_rows, &mut views, cancel)
+    // At most 3 planes: the views live on the stack, so the call allocates nothing.
+    let mut planes = out.iter_mut().take(num_planes).map(View::of);
+    let mut views: [View<'_>; 3] = std::array::from_fn(|_| {
+        planes.next().unwrap_or(View {
+            px: &mut [],
+            stride: 0,
+            x0: 0,
+            y0: 0,
+        })
+    });
+    let n = num_planes.min(3);
+    cdef_rows(fs, curr, seq, fh, 0..fs.mi_rows, &mut views[..n], cancel)
 }
 
 /// True when [`cdef_frame`] filters (it copies otherwise): CDEF is on for the frame, and every
@@ -234,9 +244,7 @@ pub(crate) fn cdef_alloc(
 /// # Errors
 /// `AllocLimit` or `OutOfMemory` from the plane allocations.
 pub(crate) fn cdef_planes(curr: &[Plane], ledger: &Arc<Ledger>) -> Result<Vec<Plane>, Error> {
-    let mut out = Vec::new();
-    out.try_reserve_exact(curr.len())
-        .map_err(|_| Error::OutOfMemory)?;
+    let mut out = ledger.planes(curr.len())?;
     for p in curr {
         let mut q = Plane::new(p.width, p.height, ledger)?;
         q.stride = p.stride;
