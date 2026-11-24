@@ -215,6 +215,22 @@ fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
     // when there are at least as many tiles as threads.
     let max_threads = ctx.limits.max_threads.max(1);
     let workers = max_threads.min(grid.tiles.len());
+    // Every worker's `item_bytes` call has its own budget, and a multi-extent item is copied
+    // outside the ledger: the eighth of `max_alloc` is split between the workers, so the copies
+    // that are live at once stay within it.
+    let ilimits = isobmff::Limits {
+        max_alloc: ctx.ilimits.max_alloc / workers,
+        ..*ctx.ilimits
+    };
+    let ctx = &Ctx {
+        heif: ctx.heif,
+        file: ctx.file,
+        options: ctx.options,
+        limits: ctx.limits,
+        ilimits: &ilimits,
+        ledger: Arc::clone(&ctx.ledger),
+        cancel: ctx.cancel,
+    };
     let inner = Limits {
         max_threads: (max_threads / workers).max(1),
         ..*ctx.limits

@@ -141,3 +141,18 @@ fn avif_item_with_a_bad_id_is_an_error() {
     // An Exif item is not an image.
     assert!(av1::decode_avif_item(&heif, &file, 2, &o, &l, &cancel).is_err());
 }
+
+// Item bytes are read under an eighth of `max_alloc` (shared by the grid workers): a cap that
+// leaves less than the item size is an error, not a decode.
+#[test]
+fn avif_item_bytes_over_the_split_are_an_error() {
+    let file = tiny_avif();
+    let cancel = AtomicBool::new(false);
+    let heif = av1::isobmff::parse(&file, &av1::isobmff::Limits::default(), &cancel).unwrap();
+    let o = Options::default();
+    let l = Limits {
+        max_alloc: 16,
+        ..Limits::default()
+    };
+    assert!(av1::decode_avif_item(&heif, &file, heif.primary, &o, &l, &cancel).is_err());
+}
