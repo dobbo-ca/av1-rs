@@ -572,7 +572,8 @@ mod tests {
             let start = next(end_y + 9) as isize - 8;
             let st = Stripe {
                 start,
-                end: start + 1 + next(64) as isize,
+                // `StripeEndY` as the spec sets it: 32 or 64 rows after `StripeStartY`.
+                end: start + if next(2) == 0 { 31 } else { 63 },
                 end_x: end_x as isize,
                 end_y: end_y as isize,
             };

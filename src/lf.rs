@@ -605,9 +605,15 @@ mod tests {
                 }
             }
             for plane in 0..3 {
+                // As in `loop_filter_rows`: chroma positions step by the subsampling.
+                let (rs, cs) = if plane == 0 {
+                    (1, 1)
+                } else {
+                    (1 << fs.subsampling_y, 1 << fs.subsampling_x)
+                };
                 for pass in 0..2 {
-                    for row in 0..fs.mi_rows {
-                        for col in 0..fs.mi_cols {
+                    for row in (0..fs.mi_rows).step_by(rs) {
+                        for col in (0..fs.mi_cols).step_by(cs) {
                             let got = edge_params(&fs, &fh, plane, pass, row, col)
                                 .map(|e| (e.x, e.y, e.size, e.lvl));
                             let want = edge_params_spec(&fs, &fh, plane, pass, row, col);
