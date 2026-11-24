@@ -32,9 +32,11 @@ copy, the colour maps, the coefficient and level buffers, about 27 KB per tile d
 charged. The output planes are charged
 from when they are built until the
 temporal unit returns; `decode` keeps every frame it collects charged (for the capacity of its
-planes, which may be pooled buffers larger than the samples) until it returns. AVIF: one
+planes, which may be pooled buffers larger than the samples, plus a fixed per-frame overhead for
+the `Frame`, its plane list and allocator chunks) until it returns. AVIF: one
 ledger per `decode_avif` call covers every item decoder, the grid canvas, the item copy and the
-primary image (docs/threading.md).
+primary image (docs/threading.md); it gets three quarters of `max_alloc`, and the `isobmff`
+parse and item reads an eighth each.
 
 Not charged, because their size does not depend on the input: the loop restoration source window
 (70 x 70 `i32` on the stack, reused for every block), the stack buffers

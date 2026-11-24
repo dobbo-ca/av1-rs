@@ -283,6 +283,9 @@ pub fn decode(
         let out = decoder.decode_temporal_unit(unit, format, cancel)?;
         // Every frame collected so far stays booked: the output of the call counts too.
         decoder.hold_output(&out)?;
+        frames
+            .try_reserve(out.len())
+            .map_err(|_| Error::OutOfMemory)?;
         frames.extend(out);
     }
     Ok(frames)

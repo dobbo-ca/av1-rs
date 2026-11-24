@@ -17,7 +17,8 @@ crate denies `unsafe` outside `src/simd` (docs/safety.md).
   as many tiles as threads), and all inner decoders share one ledger (the one of the whole
   `decode_avif` call), so `max_alloc` covers them
   together. The assembled canvas, the temporal-unit copy of each item and the primary image held
-  while the alpha item decodes are charged to it too. Item bytes inside `isobmff` and a decoded
+  while the alpha item decodes are charged to it too. Item bytes inside `isobmff` (an eighth of
+  `max_alloc`, split between the workers, and kept out of the ledger's share) and a decoded
   tile waiting for the canvas lock are not.
 
 - **Film grain** (`grain.rs`, `apply_film_grain`). The frame is cut into bands of 32 luma rows

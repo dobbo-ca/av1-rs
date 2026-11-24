@@ -39,6 +39,15 @@ struct Pending {
 /// Most plane lists of recycled frames a decoder keeps.
 const SPARE_LISTS: usize = 16;
 
+/// Heap an output frame holds besides its samples, booked with them: two `Frame` slots (a
+/// growing `Vec<Frame>` doubles), its list of `planes` entries, and an allocator chunk (32 bytes)
+/// for the list and for each sample buffer, so a stream of tiny frames cannot outgrow
+/// `max_alloc`.
+fn frame_overhead(planes: usize) -> usize {
+    const CHUNK: usize = 32;
+    2 * size_of::<Frame>() + planes.saturating_mul(size_of::<Plane>() + CHUNK) + CHUNK
+}
+
 /// What an output frame needs to know about itself, from its frame header or, for a
 /// `show_existing_frame`, from its reference slot.
 struct Shown {
@@ -266,11 +275,14 @@ impl Decoder {
         self.ledger.release(std::mem::take(&mut self.ready_bytes));
     }
 
-    /// Books the samples of `frames` (returned by this decoder) on its ledger until the decoder
-    /// drops: [`crate::decode`] keeps every frame of the call, so they count against `max_alloc`.
+    /// Books the heap of `frames` (returned by this decoder) on its ledger until the decoder
+    /// drops: the capacity of their sample buffers plus [`frame_overhead`]. [`crate::decode`]
+    /// keeps every frame of the call, so they count against `max_alloc`.
     pub(crate) fn hold_output(&self, frames: &[Frame]) -> Result<(), Error> {
         for f in frames {
-            self.ledger.reserve(crate::avif::frame_bytes(f))?;
+            self.ledger.reserve(
+                crate::avif::frame_bytes(f).saturating_add(frame_overhead(f.planes.capacity())),
+            )?;
         }
         Ok(())
     }
@@ -630,6 +642,11 @@ impl Decoder {
         planes: &[WorkPlane],
         cancel: &AtomicBool,
     ) -> Result<Frame, Error> {
+        // The frame's slot in `ready` and its plane list, booked until the unit is handed out.
+        let overhead = frame_overhead(planes.len());
+        self.ledger.reserve(overhead)?;
+        self.ready_bytes += overhead;
+        self.ready.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
         let seq = self
             .seq
             .as_ref()
