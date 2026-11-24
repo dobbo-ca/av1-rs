@@ -52,7 +52,7 @@ impl WienerK {
             hf: [hf[0] as i32, hf[1] as i32, hf[2] as i32, hf[3] as i32],
             vf: [vf[0] as i32, vf[1] as i32, vf[2] as i32, vf[3] as i32],
             round0: round0 as i32,
-            round1: round1 as i32,
+            round1,
             lo: -offset,
             hi: limit - offset,
             max: (1 << bd) - 1,
