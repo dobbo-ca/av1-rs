@@ -48,3 +48,10 @@ path = "fuzz_targets/simd_grain.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "simd_lr"
+path = "fuzz_targets/simd_lr.rs"
+test = false
+doc = false
+bench = false

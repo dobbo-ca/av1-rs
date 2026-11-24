@@ -15,6 +15,7 @@ use crate::error::Error;
 use crate::frame::{FrameState, Plane};
 use crate::header::FrameHeader;
 use crate::seq::SequenceHeader;
+use crate::simd::lr as simd_lr;
 use std::sync::atomic::AtomicBool;
 
 /// `Sgr_Params` (spec 7.17.3): `{ r0, e0, r1, e1 }` per `lr_sgr_set`.
@@ -38,7 +39,7 @@ pub(crate) const SGR_PARAMS: [[u8; 4]; 16] = [
 ];
 
 /// Widest block filtered at once.
-const BLOCK_W: usize = 64;
+pub(crate) const BLOCK_W: usize = 64;
 
 /// `Round2( x, n )` for signed `x` (arithmetic shift), `n` may be 0.
 fn round2(x: i64, n: usize) -> i64 {
@@ -58,7 +59,8 @@ struct Stripe {
 }
 
 /// Get source sample process (spec 7.17.6) for the `(w + 6) x (h + 6)` samples around the block
-/// at (`x`, `y`): sample `(r, c)` of the result is `get_source_sample( plane, x + c - 3, y + r - 3 )`.
+/// at (`x`, `y`) into `win` (reused from block to block): sample `(r, c)` is
+/// `get_source_sample( plane, x + c - 3, y + r - 3 )`.
 fn source_window(
     cdef: &Plane,
     curr: &Plane,
@@ -67,9 +69,10 @@ fn source_window(
     y: usize,
     w: usize,
     h: usize,
-) -> Vec<i32> {
+    win: &mut Vec<i32>,
+) {
     let ww = w + 6;
-    let mut win = vec![0i32; ww * (h + 6)];
+    win.clear();
     for r in 0..h + 6 {
         let mut yy = (y as isize + r as isize - 3).clamp(0, st.end_y);
         let src = if yy < st.start {
@@ -82,16 +85,15 @@ fn source_window(
             cdef
         };
         let row = &src.px[yy as usize * src.stride..];
-        for c in 0..ww {
+        win.extend((0..ww).map(|c| {
             let xx = (x as isize + c as isize - 3).clamp(0, st.end_x) as usize;
-            win[r * ww + c] = i32::from(row[xx]);
-        }
+            i32::from(row[xx])
+        }));
     }
-    win
 }
 
 /// Wiener coefficient process (spec 7.17.5).
-fn wiener_coefficients(coeff: &[i8; 3]) -> [i64; 7] {
+pub(crate) fn wiener_coefficients(coeff: &[i8; 3]) -> [i64; 7] {
     let mut filter = [0i64; 7];
     filter[3] = 128;
     for i in 0..3 {
@@ -105,7 +107,7 @@ fn wiener_coefficients(coeff: &[i8; 3]) -> [i64; 7] {
 
 /// Wiener filter process (spec 7.17.4) on the `w` x `h` block at (`x`, `y`) of `dst`; `win` is the
 /// source window of that block, `lr` is `LrWiener[ plane ][ unitRow ][ unitCol ]`.
-fn wiener_filter(
+pub(crate) fn wiener_filter(
     win: &[i32],
     w: usize,
     h: usize,
@@ -230,7 +232,7 @@ fn box_filter(
 }
 
 /// Self guided filter process (spec 7.17.2) on the `w` x `h` block at (`x`, `y`) of `dst`.
-fn self_guided_filter(
+pub(crate) fn self_guided_filter(
     win: &[i32],
     w: usize,
     h: usize,
@@ -279,6 +281,9 @@ pub(crate) fn lr_frame(
     cancel: &AtomicBool,
 ) -> Result<(), Error> {
     let bd = usize::from(seq.bit_depth);
+    let simd = crate::simd::best();
+    // The source window of the current block (at most 70 x 70 samples).
+    let mut win = Vec::new();
     let planes = fs
         .num_planes
         .min(3)
@@ -358,15 +363,16 @@ pub(crate) fn lr_frame(
                 let h = y1 - y0 + 1;
                 for x in (x0..=x1).step_by(BLOCK_W) {
                     let w = BLOCK_W.min(x1 - x + 1);
-                    let win = source_window(cdef, curr, &st, x, y0, w, h);
+                    source_window(cdef, curr, &st, x, y0, w, h, &mut win);
                     if r_type == RESTORE_WIENER {
                         if let Some(lr) = fs.lr_wiener[plane].get(idx) {
-                            wiener_filter(&win, w, h, bd, lr, dst, x, y0);
+                            simd_lr::wiener(simd, &win, w, h, bd, lr, dst, x, y0);
                         }
                     } else if let (Some(&set), Some(xqd)) =
                         (fs.lr_sgr_set[plane].get(idx), fs.lr_sgr_xqd[plane].get(idx))
                     {
-                        self_guided_filter(&win, w, h, bd, usize::from(set), xqd, dst, x, y0);
+                        let set = usize::from(set);
+                        simd_lr::self_guided(simd, &win, w, h, bd, set, xqd, dst, x, y0);
                     }
                 }
             }
@@ -442,7 +448,8 @@ mod tests {
             end_x: 7,
             end_y: 15,
         };
-        let win = source_window(&cdef, &curr, &st, 0, 4, 2, 6);
+        let mut win = Vec::new();
+        source_window(&cdef, &curr, &st, 0, 4, 2, 6, &mut win);
         let col = |r: usize| win[r * 8 + 3];
         // Window rows are source rows 1..=12: rows 1..=3 curr (row 1 clamped to start - 2 = 2),
         // rows 4..=9 cdef, rows 10..=12 curr.

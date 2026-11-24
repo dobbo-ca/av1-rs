@@ -83,3 +83,38 @@ pub fn grain(data: &[u8]) {
         assert_eq!(got, want_c, "chroma {simd:?} {b:?}");
     }
 }
+
+/// Loop restoration (`simd::lr`): one block from the bytes (bit depth, size, column, Wiener taps,
+/// self guided set and weights, then the window samples, cycled), both filters on every tier
+/// against scalar.
+pub fn lr(data: &[u8]) {
+    let byte = |i: usize| data.get(i).copied().unwrap_or(0);
+    let bd = [8, 10, 12][usize::from(byte(0) % 3)];
+    let w = usize::from(byte(1) % 64) + 1;
+    let h = usize::from(byte(2) % 64) + 1;
+    let x = usize::from(byte(3) % 16);
+    let set = usize::from(byte(4) % 16);
+    let coef = [
+        [byte(5) as i8, byte(6) as i8, byte(7) as i8],
+        [byte(8) as i8, byte(9) as i8, byte(10) as i8],
+    ];
+    let xqd = [byte(11) as i8, byte(12) as i8];
+    // Bit 0 set: every sample is 0 or the maximum (from bit 0 of its bytes).
+    let extremes = byte(13) & 1 == 1;
+    let rest = data.get(14..).unwrap_or(&[]);
+    let max = (1i32 << bd) - 1;
+    let win: Vec<i32> = (0..(w + 6) * (h + 6))
+        .map(|k| {
+            let v = match rest.len() {
+                0 => 0,
+                n => i32::from(u16::from_le_bytes([rest[2 * k % n], rest[(2 * k + 1) % n]])),
+            };
+            match (extremes, v & 1) {
+                (true, 1) => max,
+                (true, _) => 0,
+                _ => v & max,
+            }
+        })
+        .collect();
+    crate::simd::lr::cross_check(&win, w, h, bd, &coef, set, &xqd, x);
+}
