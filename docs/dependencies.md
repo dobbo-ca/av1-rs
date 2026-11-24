@@ -7,4 +7,8 @@ The crate depends on `isobmff` (our container parser, pinned by rev) and otherwi
 - The AV1 specification (`github.com/AOMediaCodec/av1-spec`, Copyright 2018 The Alliance for
   Open Media): the source of truth; every table is transcribed from it (NOTICE).
 - dav1d and rav1d (BSD-2-Clause): read as design guides. Ported parts are listed here and in
-  NOTICE, and named in the file that carries them. None so far.
+  NOTICE, and named in the file that carries them:
+  - `src/simd/cdef/{mod,avx2,neon}.rs`: the CDEF filter design of dav1d's `src/cdef_tmpl.c`
+    and `src/x86/cdef*.asm` (a padded 16-bit block with the sentinel `0x8000` for unavailable
+    taps; signed max and unsigned min skip it). Copyright © 2018, VideoLAN and dav1d authors;
+    Copyright © 2018, Two Orioles, LLC.

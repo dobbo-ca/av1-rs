@@ -118,3 +118,101 @@ pub fn lr(data: &[u8]) {
         .collect();
     crate::simd::lr::cross_check(&win, w, h, bd, &coef, set, &xqd, x);
 }
+/// CDEF (`src/simd/cdef`): the direction search and the filter of one block, every tier against
+/// scalar. Bytes 0..8: bit depth, plane, subsampling, mi grid, block position, strengths,
+/// damping, direction, stride padding; the rest: the samples, two bytes each, repeated.
+pub fn cdef(data: &[u8]) {
+    use crate::cdef::{FilterCtx, cdef_direction, cdef_filter};
+    use crate::frame::Plane;
+    use crate::ledger::Ledger;
+    use crate::simd::{available, cdef as k};
+    use std::sync::Arc;
+
+    let Some((head, samples)) = data.split_first_chunk::<8>() else {
+        return;
+    };
+    let n = samples.len();
+    if n == 0 {
+        return;
+    }
+    let bd = [8u32, 10, 12, 8][usize::from(head[0] & 3)];
+    let cs = bd - 8;
+    let plane = usize::from((head[0] >> 2) & 3) % 3;
+    let sub = [(0, 0), (1, 1), (1, 0), (0, 1)][usize::from((head[0] >> 4) & 3)];
+    let mi_rows = 2 + 2 * usize::from(head[1] & 3);
+    let mi_cols = 2 + usize::from((head[1] >> 2) & 7);
+    let r = (usize::from(head[2] & 15) % mi_rows) & !1;
+    let c = (usize::from(head[2] >> 4) % mi_cols) & !1;
+    let pri = match head[3] >> 6 {
+        0 => 0,
+        // The largest luma strength after the variance adjustment.
+        1 => ((15 << cs) * 16 + 8) >> 4,
+        _ => i32::from(head[3] & 15) << cs,
+    };
+    let sec = [0, 1, 2, 4][usize::from(head[4] & 3)] << cs;
+    let damping = 3 + i32::from((head[4] >> 2) & 3) + cs as i32 - i32::from(plane > 0);
+    let dir = usize::from(head[5] & 7);
+    let pad = usize::from(head[5] >> 3);
+    let (sx, sy) = if plane == 0 { (0, 0) } else { sub };
+    let (w, h) = ((mi_cols * 4) >> sx, (mi_rows * 4) >> sy);
+    let ledger = Arc::new(Ledger::default());
+    if ledger.reset(1 << 20, 0).is_err() {
+        return;
+    }
+    let mk = || -> Option<Plane> {
+        let mut p = Plane::new(w + pad, h, &ledger).ok()?;
+        p.width = w;
+        Some(p)
+    };
+    let Some(mut src) = mk() else {
+        return;
+    };
+    let max = (1u16 << bd) - 1;
+    for (i, v) in src.px.iter_mut().enumerate() {
+        *v = u16::from_le_bytes([samples[(2 * i) % n], samples[(2 * i + 1) % n]]) & max;
+    }
+
+    let want = cdef_direction(&src, r, c, bd);
+    for s in available() {
+        assert_eq!(k::direction(s, &src, r, c, bd), want, "{s:?}");
+    }
+
+    let ctx = FilterCtx {
+        mi_rows,
+        mi_cols,
+        coeff_shift: cs,
+    };
+    let (Some(mut want), Some(mut got)) = (mk(), mk()) else {
+        return;
+    };
+    want.px.copy_from_slice(&src.px);
+    cdef_filter(
+        &ctx,
+        &src,
+        &mut want,
+        plane,
+        sub,
+        r,
+        c,
+        (pri, sec),
+        damping,
+        dir,
+    );
+    for s in available() {
+        got.px.copy_from_slice(&src.px);
+        k::filter(
+            s,
+            &ctx,
+            &src,
+            &mut got,
+            plane,
+            sub,
+            r,
+            c,
+            (pri, sec),
+            damping,
+            dir,
+        );
+        assert_eq!(got.px, want.px, "{s:?}");
+    }
+}

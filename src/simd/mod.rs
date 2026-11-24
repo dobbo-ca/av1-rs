@@ -14,6 +14,7 @@
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod arm;
+pub(crate) mod cdef;
 pub(crate) mod grain;
 pub(crate) mod lf;
 pub(crate) mod lr;

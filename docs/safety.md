@@ -54,6 +54,7 @@ Production code passes `simd::best()`; tests loop over `simd::available()`.
 | `lf` | `lf::sample_filter` | One run of samples along an edge (7.14.6): masks, narrow filter, 6/8/16 wide filters, vertical and horizontal, 8/10/12-bit; lanes along the edge, the samples across it gathered into a 14-row buffer in safe code | AVX2 (16 lanes), NEON (8 lanes); AVX-512 runs the AVX2 kernel |
 | `grain` | `grain::blend_luma_row`, `grain::blend_chroma_row` | `blend_luma`, `blend_chroma`: the film grain noise blend of one row (scaling lookup, `round2( scale * noise, ScalingShift )`, clip, chroma merge and chroma scaling from luma), 8/10/12-bit, all subsamplings. The scale is looked up in `grain::scale_table` (`scale_lut` at every sample value), so the high bit depth interpolation is exact by construction; the x86 helper `gather256_i32` masks every index to the 4096-entry table before the gather. The grain template generation (auto-regression) and the stripe building stay scalar (once per frame, and a copy) | AVX2 (8 lanes), NEON (4 lanes); AVX-512 runs the AVX2 kernel |
 | `lr` | `lr::wiener_filter`, `lr::self_guided_filter` | `wiener`, `self_guided`: loop restoration of one block of at most 64 x 64 samples inside one stripe, from the source window that `lr::source_window` gathers (stripe edge rules unchanged): the Wiener filter and the self guided filter (box sums r = 1 and r = 2, the a/b computation, the weighted combination). The arithmetic is in 32-bit lanes; the module doc gives the bounds that make it exact. Blocks narrower than one vector use the oracle | AVX2 (8 x i32), NEON (4 x i32); AVX-512 runs the AVX2 kernel |
+| `cdef` | `cdef::cdef_direction`, `cdef::cdef_filter` | `direction` (7.15.2, one 8x8 luma block), `filter` (7.15.3, one 8x8, 4x4, 4x8 or 8x4 block), 8/10/12-bit. The filter copies the block and a 2-sample border into a padded 16-bit block with the sentinel `0x8000` for unavailable taps (dav1d's design, see NOTICE), so the kernel has no per-tap check. The dispatch takes the oracle for a block whose premises do not hold (block not fully inside `MiRows` x `MiCols`, a sample of 4096 or more, strengths above 255, a plane too short); decoded frames always meet them (`MiRows` and `MiCols` are even, samples fit the bit depth) | AVX2 (16 lanes), NEON (8 lanes); AVX-512 runs the AVX2 kernels |
 
 Tiers not written:
 
@@ -65,6 +66,9 @@ Tiers not written:
 - `lr` AVX-512: a block row is at most 64 samples, so 16-lane vectors would save at most half of
   the vector ops while the fixed per-block work (window gather, the stack buffers) stays; it is
   worth writing only if the bench shows loop restoration still high in the profile after AVX2.
+- `cdef` AVX-512: a block is 16 to 64 samples and each tap row is a separate 8- or 4-sample
+  load, so 512-bit vectors would only add lane inserts (the direction search is one 8x8 block,
+  128-bit rows).
 
 ## Kernels kept and dropped
 
@@ -75,6 +79,7 @@ that were tried and dropped are listed here with their numbers.
 |---|---|---|
 | `grain` blend | AVX2, AVX-512 (runs AVX2) | Kept, not slower than scalar. Only the bench class `grain` has film grain (2 frames, about 17 ms, near the bench's 1 ms resolution). Tier table: scalar 18, avx2 17, avx512 17 ms (main before the change: 18, 17, 18). The gain is below what the bench can resolve. |
 | `lr` wiener, self guided | AVX2, AVX-512 (runs AVX2) | Kept. Tier table (bench run 45324834732), scalar / avx2 / avx512 ms: avif8 144 / 115 / 115, avifhi 356 / 276 / 276, allintra 858 / 821 / 818, tiles8 565 / 535 / 535, tiles10 579 / 553 / 555 (main 68e575a before the change: avif8 138 / 131 / 131, avifhi 338 / 308 / 308, allintra 824 / 826 / 825, tiles8 537 / 511 / 552, tiles10 553 / 532 / 537). avx2 / scalar went from 94% to 79% on avif8 and from 91% to 77% on avifhi; the other classes are within the runner noise (dav1d itself ran about 3% slower on this run). NEON is not benched (the bench runs on x86_64 only). |
+| `cdef` direction, filter | AVX2, AVX-512 (runs AVX2) | Kept. Tier table (bench run 45331809157), scalar / avx2 / avx512 ms: allintra 837 / 593 / 591, avif8 139 / 83 / 83, avifhi 343 / 231 / 235, tiles8 542 / 233 / 235, tiles10 558 / 235 / 236 (the `lr` bench before the change, scalar / avx2: allintra 858 / 821, avif8 144 / 115, avifhi 356 / 276, tiles8 565 / 535, tiles10 579 / 553). avx2 / scalar went from 96% to 71% on allintra, 80% to 60% on avif8, 78% to 67% on avifhi 95% to 43% on tiles8 and 96% to 42% on tiles10. AVX-512 runs the same kernel and is within the noise of AVX2. NEON is not benched (the bench runs on x86_64 only). |
 
 ## Hostile input
 

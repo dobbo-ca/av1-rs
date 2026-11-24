@@ -1,7 +1,8 @@
 //! CDEF, the constrained directional enhancement filter (spec 7.15): per 8x8 block a direction
 //! and variance search on luma (7.15.2) and the directional primary / secondary tap filter on
 //! every plane (7.15.3). Reads `CurrFrame` (after the loop filter), writes `CdefFrame`.
-//! Written from the spec text; no code ported from dav1d or rav1d.
+//! Written from the spec text; this scalar code is the oracle of the SIMD kernels in
+//! `src/simd/cdef` (which follow the dav1d design, see there).
 
 use crate::bits::floor_log2;
 use crate::consts::{BLOCK_8X8, BLOCK_64X64, MI_SIZE};
@@ -10,6 +11,7 @@ use crate::error::Error;
 use crate::frame::{FrameState, Plane};
 use crate::header::FrameHeader;
 use crate::seq::SequenceHeader;
+use crate::simd;
 use crate::tables::NUM_4X4_BLOCKS_WIDE;
 use std::sync::atomic::AtomicBool;
 
@@ -23,13 +25,13 @@ const CDEF_UV_DIR: [[[u8; 8]; 2]; 2] = [
 const DIV_TABLE: [i64; 9] = [0, 840, 420, 280, 210, 168, 140, 120, 105];
 
 /// `Cdef_Pri_Taps` (spec 7.15.3).
-const CDEF_PRI_TAPS: [[i32; 2]; 2] = [[4, 2], [3, 3]];
+pub(crate) const CDEF_PRI_TAPS: [[i32; 2]; 2] = [[4, 2], [3, 3]];
 
 /// `Cdef_Sec_Taps` (spec 7.15.3).
 const CDEF_SEC_TAPS: [[i32; 2]; 2] = [[2, 1], [2, 1]];
 
 /// `Cdef_Directions[ dir ][ k ] = [ dy, dx ]` (spec 7.15.3).
-const CDEF_DIRECTIONS: [[[i32; 2]; 2]; 8] = [
+pub(crate) const CDEF_DIRECTIONS: [[[i32; 2]; 2]; 8] = [
     [[-1, 1], [-2, 2]],
     [[0, 1], [-1, 2]],
     [[0, 1], [0, 2]],
@@ -90,6 +92,7 @@ pub(crate) fn cdef_frame(
     let step4 = NUM_4X4_BLOCKS_WIDE[BLOCK_8X8];
     let cdef_mask4 = !(NUM_4X4_BLOCKS_WIDE[BLOCK_64X64] - 1);
     let coeff_shift = u32::from(seq.bit_depth).saturating_sub(8);
+    let best = simd::best();
     for r in (0..mi_rows).step_by(step4) {
         if r.is_multiple_of(16) {
             check_cancel(cancel)?;
@@ -108,7 +111,8 @@ pub(crate) fn cdef_frame(
             if sk(r, c) && sk(r + 1, c) && sk(r, c + 1) && sk(r + 1, c + 1) {
                 continue;
             }
-            let (y_dir, var) = cdef_direction(&fs.curr_frame[0], r, c, u32::from(seq.bit_depth));
+            let (y_dir, var) =
+                simd::cdef::direction(best, &fs.curr_frame[0], r, c, u32::from(seq.bit_depth));
             let mut pri_str = i32::from(fh.cdef_y_pri_strength[idx]) << coeff_shift;
             let sec_str = i32::from(fh.cdef_y_sec_strength[idx]) << coeff_shift;
             let dir = if pri_str == 0 { 0 } else { y_dir };
@@ -128,7 +132,8 @@ pub(crate) fn cdef_frame(
                 mi_cols,
                 coeff_shift,
             };
-            cdef_filter(
+            simd::cdef::filter(
+                best,
                 &ctx,
                 &fs.curr_frame[0],
                 &mut out[0],
@@ -152,7 +157,8 @@ pub(crate) fn cdef_frame(
             };
             let damping = i32::from(fh.cdef_damping) + coeff_shift as i32 - 1;
             for plane in 1..num_planes.min(3) {
-                cdef_filter(
+                simd::cdef::filter(
+                    best,
                     &ctx,
                     &fs.curr_frame[plane],
                     &mut out[plane],
@@ -194,15 +200,15 @@ pub(crate) fn cdef_alloc(
 }
 
 /// The frame facts the filter needs.
-struct FilterCtx {
-    mi_rows: usize,
-    mi_cols: usize,
-    coeff_shift: u32,
+pub(crate) struct FilterCtx {
+    pub(crate) mi_rows: usize,
+    pub(crate) mi_cols: usize,
+    pub(crate) coeff_shift: u32,
 }
 
 /// CDEF direction process (spec 7.15.2) for the 8x8 luma block at 4x4 position (`r`, `c`):
 /// returns (`yDir`, `var`).
-fn cdef_direction(luma: &Plane, r: usize, c: usize, bit_depth: u32) -> (usize, i64) {
+pub(crate) fn cdef_direction(luma: &Plane, r: usize, c: usize, bit_depth: u32) -> (usize, i64) {
     let mut cost = [0i64; 8];
     let mut partial = [[0i64; 15]; 8];
     let (x0, y0) = (c * MI_SIZE, r * MI_SIZE);
@@ -275,7 +281,7 @@ fn constrain(diff: i32, threshold: i32, damping: i32) -> i32 {
 /// `src` (`CurrFrame`), writes `dst` (`CdefFrame`). `sub` is `(subsampling_x, subsampling_y)`,
 /// `strengths` is `(priStr, secStr)`. `is_inside_filter_region` is the whole frame, so a tap is
 /// available when its sample lies inside the `MiRows` x `MiCols` area.
-fn cdef_filter(
+pub(crate) fn cdef_filter(
     ctx: &FilterCtx,
     src: &Plane,
     dst: &mut Plane,
