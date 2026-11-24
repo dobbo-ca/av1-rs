@@ -18,7 +18,16 @@ All threading is safe Rust (`std::thread::scope`, a `Mutex`, atomics); the crate
   while the alpha item decodes are charged to it too. Item bytes inside `isobmff` and a decoded
   tile waiting for the canvas lock are not.
 
-Not parallel: the OBU parse, the wrapup, film grain, output. Frames of a stream decode one after
+- **Film grain** (`grain.rs`, `apply_film_grain`). The frame is cut into bands of 32 luma rows
+  (one noise stripe each), run by `run_parallel` on `min(max_threads, bands)` threads. A band
+  builds its own stripe and, with overlap, the stripe above it: the generator is seeded per
+  stripe, so a band reads only the grain templates, the input frame and its stripes, and writes
+  only its own rows of the output (each band owns its `chunks_mut` of every plane, behind a
+  `Mutex` the band locks once). The output is the same for every thread count; the unit test
+  `every_tier_and_thread_count_matches_the_reference` checks 1, 2, 3 threads against the
+  whole-frame noise image of the spec.
+
+Not parallel: the OBU parse, the wrapup, output. Frames of a stream decode one after
 another (a later frame may reference an earlier one).
 
 ## The scheduler
@@ -34,7 +43,7 @@ returned, and a serial run would have stopped at that same item. (`Cancelled` fr
 cancel flag and `AllocLimit` from the shared ledger depend on timing by nature.) The cancel flag is
 checked before every tile and once per superblock row inside a tile, in every worker, and on the
 calling thread once per 64-row band in every wrapup stage (loop filter, CDEF, superres, loop
-restoration) and in film grain.
+restoration); in film grain, before every band, in every worker.
 
 ## Tile decode and the byte-identity argument
 

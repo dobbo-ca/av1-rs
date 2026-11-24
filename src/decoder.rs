@@ -576,7 +576,15 @@ impl Decoder {
                 let o0 = it.next().unwrap_or_default();
                 let o1 = it.next().unwrap_or_default();
                 let o2 = it.next().unwrap_or_default();
-                apply_film_grain(&h.film_grain, &input, [o0, o1, o2], &self.ledger, cancel)?;
+                apply_film_grain(
+                    &h.film_grain,
+                    &input,
+                    [o0, o1, o2],
+                    &self.ledger,
+                    cancel,
+                    self.limits.max_threads,
+                    crate::simd::best(),
+                )?;
             }
             for (g, p) in grained.iter().zip(planes) {
                 out.push(self.public_plane(g, p.width, p.height, s.bit_depth)?);

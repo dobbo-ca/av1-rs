@@ -22,8 +22,10 @@ rectangle, plus the loop restoration unit arrays of the frame), all in the same 
 wrapup, `CdefFrame` (same size as `CurrFrame`), the upscaled planes (exact size) when superres
 is on, and the `LrFrame` planes (exact size). The peak is `CurrFrame` + `CdefFrame` + up to two
 exact-size planes sets + the arrays; a frame over `max_alloc` fails with `AllocLimit` before the
-tile decode starts or at the wrapup, never after exceeding it. The film grain noise buffers are
-charged while grain is applied. The output planes are charged from when they are built until the
+tile decode starts or at the wrapup, never after exceeding it. Film grain charges, per band of 32
+luma rows while the band runs, its noise stripe and the one above it (34 rows of about `width + 34`
+`i32` per plane each) plus one row: at most one band per worker. The output planes are charged
+from when they are built until the
 temporal unit returns; `decode` keeps every frame it collects charged until it returns. AVIF: one
 ledger per `decode_avif` call covers every item decoder, the grid canvas, the item copy and the
 primary image (docs/threading.md).

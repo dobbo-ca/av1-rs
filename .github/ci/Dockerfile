@@ -12,7 +12,7 @@ WORKDIR /src
 COPY tests/fuzz/Cargo.toml tests/fuzz/Cargo.lock tests/fuzz/
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src tests/fuzz/fuzz_targets && touch src/lib.rs \
-    && for t in probe decode avif simd_lf; do touch tests/fuzz/fuzz_targets/$t.rs; done
+    && for t in probe decode avif simd_lf simd_grain; do touch tests/fuzz/fuzz_targets/$t.rs; done
 # isobmff-rs is a private dobbo-ca port: the dobbo-ca-ci-read App token reaches this one RUN as
 # the BuildKit secret gh_token, and the insteadOf rewrite is removed in the same command.
 RUN --mount=type=secret,id=gh_token \
