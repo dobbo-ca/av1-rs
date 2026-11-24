@@ -69,6 +69,7 @@ that were tried and dropped are listed here with their numbers.
 
 | Kernel | Tier | Result |
 |---|---|---|
+| `grain` blend | AVX2, AVX-512 (runs AVX2) | Kept, not slower than scalar. Only the bench class `grain` has film grain (2 frames, about 17 ms, near the bench's 1 ms resolution). Tier table: scalar 18, avx2 17, avx512 17 ms (main before the change: 18, 17, 18). The gain is below what the bench can resolve. |
 
 ## Hostile input
 
