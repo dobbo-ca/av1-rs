@@ -71,7 +71,7 @@ an item keeps it. The stages and their items (`Wrap::item`):
 | Loop filter, horizontal edges | plane x column strip (one per thread, 64-column units) | mode info | the strip's columns of `CurrFrame` |
 | CDEF | 64-row band (all planes) | `CurrFrame` | the band's rows of `CdefFrame` |
 | Superres | plane x 64-row band, `CdefFrame` then (with loop restoration) `CurrFrame` | the input plane | the band's rows of the upscaled plane |
-| Loop restoration | plane x stripe | upscaled `CdefFrame` and `CurrFrame` | the stripe's rows of `LrFrame` |
+| Loop restoration | plane x stripe | upscaled `CdefFrame` and `CurrFrame` (without superres the two frames themselves) | the stripe's rows of `LrFrame` |
 
 - **Loop filter** (7.14): the spec filters, per plane, all vertical edges, then all horizontal
   edges, in raster order. A vertical edge reads and writes the samples of its own (four) rows

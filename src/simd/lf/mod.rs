@@ -111,26 +111,31 @@ fn chunks<const L: usize>(
         // `px[first + j * step]` (j in 0..2m) is row 7 - m + j of lane 0.
         let first = e.pos + k0 * e.along - m * e.step;
         let mut s = [[0u16; L]; ROWS];
-        for j in 0..2 * m {
-            let row = &mut s[7 - m + j];
-            if e.along == 1 {
+        if e.along == 1 {
+            for j in 0..2 * m {
                 let b = first + j * e.step;
-                row[..cnt].copy_from_slice(&px[b..b + cnt]);
-            } else {
-                for l in 0..cnt {
-                    row[l] = px[first + l * e.along + j * e.step];
+                s[7 - m + j][..cnt].copy_from_slice(&px[b..b + cnt]);
+            }
+        } else {
+            // `step` is 1 here (`vector_taps`): the window of each lane is one slice.
+            for l in 0..cnt {
+                let b = first + l * e.along;
+                for (j, &v) in px[b..b + 2 * m].iter().enumerate() {
+                    s[7 - m + j][l] = v;
                 }
             }
         }
         kernel(&mut s);
-        for j in 0..2 * m {
-            let row = &s[7 - m + j];
-            if e.along == 1 {
+        if e.along == 1 {
+            for j in 0..2 * m {
                 let b = first + j * e.step;
-                px[b..b + cnt].copy_from_slice(&row[..cnt]);
-            } else {
-                for l in 0..cnt {
-                    px[first + l * e.along + j * e.step] = row[l];
+                px[b..b + cnt].copy_from_slice(&s[7 - m + j][..cnt]);
+            }
+        } else {
+            for l in 0..cnt {
+                let b = first + l * e.along;
+                for (j, d) in px[b..b + 2 * m].iter_mut().enumerate() {
+                    *d = s[7 - m + j][l];
                 }
             }
         }

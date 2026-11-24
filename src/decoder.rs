@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use crate::bits::BitReader;
-use crate::cdef::{cdef_alloc, cdef_frame, cdef_on, cdef_planes, cdef_rows};
+use crate::cdef::{cdef_alloc, cdef_on, cdef_planes, cdef_rows};
 use crate::cdf::CdfContext;
 use crate::consts::*;
 use crate::error::Error;
@@ -882,7 +882,7 @@ struct Wrap<'a> {
     curr: RwLock<Vec<WorkPlane>>,
     /// `CdefFrame`.
     cdef: RwLock<Vec<WorkPlane>>,
-    /// `UpscaledCdefFrame` (exact size; a copy of `CdefFrame` without superres).
+    /// `UpscaledCdefFrame` (exact size; superres only, `CdefFrame` is read as it is without).
     up_cdef: RwLock<Vec<WorkPlane>>,
     /// `UpscaledCurrFrame` (superres with loop restoration only).
     up_curr: RwLock<Vec<WorkPlane>>,
@@ -918,33 +918,33 @@ impl Wrap<'_> {
             team.run(Job::LfRows, fs.num_planes * bands)?;
             team.run(Job::LfCols, fs.num_planes * self.strips(fs))?;
         }
-        let mut cdef = cdef_planes(&read_lock(&self.curr), self.ledger)?;
+        // `CdefFrame` starts as a copy of `CurrFrame`, which it stays with CDEF off.
+        let cdef = cdef_planes(&read_lock(&self.curr), self.ledger)?;
         let on = cdef_on(fs, &read_lock(&self.curr), seq, h, &cdef);
-        if !on {
-            // CDEF off: `CdefFrame` is a copy of `CurrFrame`.
-            cdef_frame(fs, &read_lock(&self.curr), seq, h, &mut cdef, cancel)?;
-        }
         *write_lock(&self.cdef) = cdef;
         if on {
             team.run(Job::Cdef, bands)?;
         }
-        let row_bands = fs.num_planes * fs.frame_height.div_ceil(64);
-        if h.frame_width != h.upscaled_width {
-            *write_lock(&self.up_cdef) = exact_planes(fs, None)?;
-            team.run(Job::UpCdef, row_bands)?;
-            write_lock(&self.cdef).clear();
+        let lr_items = fs.num_planes.min(3) * stripes(fs);
+        if h.frame_width == h.upscaled_width {
+            // No superres: loop restoration reads `CdefFrame` and `CurrFrame` as they are.
+            *lock(&self.out) = exact_planes(fs, Some(read_lock(&self.cdef).as_slice()))?;
             if h.uses_lr {
-                *write_lock(&self.up_curr) = exact_planes(fs, None)?;
-                team.run(Job::UpCurr, row_bands)?;
+                team.run(Job::Lr, lr_items)?;
             }
-        } else {
-            *write_lock(&self.up_cdef) = exact_planes(fs, Some(read_lock(&self.cdef).as_slice()))?;
+            return Ok(std::mem::take(&mut *lock(&self.out)));
         }
+        let row_bands = fs.num_planes * fs.frame_height.div_ceil(64);
+        *write_lock(&self.up_cdef) = exact_planes(fs, None)?;
+        team.run(Job::UpCdef, row_bands)?;
+        write_lock(&self.cdef).clear();
         if !h.uses_lr {
             return Ok(std::mem::take(&mut *write_lock(&self.up_cdef)));
         }
+        *write_lock(&self.up_curr) = exact_planes(fs, None)?;
+        team.run(Job::UpCurr, row_bands)?;
         *lock(&self.out) = exact_planes(fs, Some(read_lock(&self.up_cdef).as_slice()))?;
-        team.run(Job::Lr, fs.num_planes.min(3) * stripes(fs))?;
+        team.run(Job::Lr, lr_items)?;
         Ok(std::mem::take(&mut *lock(&self.out)))
     }
 
@@ -1022,8 +1022,13 @@ impl Wrap<'_> {
             let curr = read_lock(&self.curr);
             let p = curr.get(plane).ok_or(Error::Invalid("plane missing"))?;
             let (y0, y1) = band_rows(b, bands, sy, p.height);
-            let mut buf = WorkPlane::new(p.stride, y1 - y0, self.ledger)?;
-            buf.px.copy_from_slice(rows_of(p, y0, y1)?);
+            let buf = WorkPlane::copy_of(
+                rows_of(p, y0, y1)?,
+                p.stride,
+                p.stride,
+                y1 - y0,
+                self.ledger,
+            )?;
             (buf, y0, y1)
         };
         let rows = 16 * b..(16 * b + 16).min(fs.mi_rows);
@@ -1075,15 +1080,8 @@ impl Wrap<'_> {
             } else {
                 ((c1 * MI_SIZE) >> sx).clamp(x0, p.stride)
             };
-            let w = x1 - x0;
-            let mut buf = WorkPlane::new(w, p.height, self.ledger)?;
-            for (y, row) in buf.px.chunks_exact_mut(w.max(1)).enumerate() {
-                let start = y * p.stride;
-                row.copy_from_slice(
-                    p.px.get(start + x0..start + x1)
-                        .ok_or(Error::Invalid("plane smaller than its size"))?,
-                );
-            }
+            let src = p.px.get(x0..).unwrap_or_default();
+            let buf = WorkPlane::copy_of(src, p.stride, x1 - x0, p.height, self.ledger)?;
             (buf, x0, x1, p.height)
         };
         let mut v = View {
@@ -1128,8 +1126,13 @@ impl Wrap<'_> {
             let (_, sy) = subsampling(fs, plane);
             let (y0, y1) = band_rows(b, bands, sy, p.height);
             // The band starts as the copy of `CurrFrame` that unfiltered blocks keep.
-            let mut buf = WorkPlane::new(p.stride, y1 - y0, self.ledger)?;
-            buf.px.copy_from_slice(rows_of(p, y0, y1)?);
+            let buf = WorkPlane::copy_of(
+                rows_of(p, y0, y1)?,
+                p.stride,
+                p.stride,
+                y1 - y0,
+                self.ledger,
+            )?;
             bufs.push((buf, y0, y1));
         }
         {
@@ -1206,11 +1209,11 @@ impl Wrap<'_> {
         let fs = self.state()?;
         let ns = stripes(fs);
         let (plane, n) = (i / ns, i % ns);
-        let cdef = read_lock(&self.up_cdef);
-        let curr = if self.h.frame_width != self.h.upscaled_width {
-            read_lock(&self.up_curr)
+        // Without superres the upscaled frames are `CdefFrame` and `CurrFrame` themselves.
+        let (cdef, curr) = if self.h.frame_width != self.h.upscaled_width {
+            (read_lock(&self.up_cdef), read_lock(&self.up_curr))
         } else {
-            read_lock(&self.curr)
+            (read_lock(&self.cdef), read_lock(&self.curr))
         };
         // `LrFrame` has `num_planes` planes of `exact_size`.
         if plane >= fs.num_planes.min(3).min(cdef.len()).min(curr.len()) {
@@ -1224,9 +1227,12 @@ impl Wrap<'_> {
         let Some((y0, y1)) = g.stripe_rows(n) else {
             return Ok(());
         };
-        // `LrFrame` starts as `UpscaledCdefFrame` (exact size too).
-        let mut buf = WorkPlane::new(w, y1 + 1 - y0, self.ledger)?;
-        buf.px.copy_from_slice(rows_of(c, y0, y1 + 1)?);
+        // `LrFrame` starts as `UpscaledCdefFrame`, and only this item writes the stripe's rows.
+        let mut buf = {
+            let out = lock(&self.out);
+            let p = out.get(plane).ok_or(Error::Invalid("plane missing"))?;
+            WorkPlane::copy_of(rows_of(p, y0, y1 + 1)?, w, w, y1 + 1 - y0, self.ledger)?
+        };
         let mut v = View {
             stride: w,
             px: buf.px.as_mut_slice(),
@@ -1305,15 +1311,10 @@ fn exact_planes(fs: &FrameState, src: Option<&[WorkPlane]>) -> Result<Vec<WorkPl
     let mut out = fs.ledger.planes(fs.num_planes)?;
     for i in 0..fs.num_planes {
         let (w, ht) = exact_size(fs, i);
-        let mut p = WorkPlane::new(w, ht, &fs.ledger)?;
-        if let Some(s) = src.and_then(|s| s.get(i)) {
-            for y in 0..ht {
-                let from =
-                    s.px.get(y * s.stride..y * s.stride + w)
-                        .ok_or(Error::Invalid("plane smaller than its size"))?;
-                p.px[y * w..(y + 1) * w].copy_from_slice(from);
-            }
-        }
+        let p = match src.and_then(|s| s.get(i)) {
+            Some(s) => WorkPlane::copy_of(&s.px, s.stride, w, ht, &fs.ledger)?,
+            None => WorkPlane::new(w, ht, &fs.ledger)?,
+        };
         out.push(p);
     }
     Ok(out)
@@ -1338,35 +1339,28 @@ fn wrapup(
 ) -> Result<Vec<WorkPlane>, Error> {
     loop_filter_frame(fs, seq, h, cancel)?;
     let cdef = cdef_alloc(fs, seq, h, cancel)?;
-    let (up_cdef, up_curr) = if h.frame_width != h.upscaled_width {
-        let mut up_cdef = exact_planes(fs, None)?;
-        upscale(&cdef, fs, seq, h, &mut up_cdef, cancel)?;
+    if h.frame_width == h.upscaled_width {
+        // No superres: `UpscaledCdefFrame` and `UpscaledCurrFrame` are `CdefFrame` and
+        // `CurrFrame`, which loop restoration reads as they are.
+        let mut out = exact_planes(fs, Some(cdef.as_slice()))?;
+        if h.uses_lr {
+            lr_frame(fs, seq, h, &cdef, &fs.curr_frame, &mut out, cancel)?;
+        }
         fs.ledger.put_planes(cdef);
-        let up_curr = if h.uses_lr {
-            let mut p = exact_planes(fs, None)?;
-            upscale(&fs.curr_frame, fs, seq, h, &mut p, cancel)?;
-            Some(p)
-        } else {
-            None
-        };
-        (up_cdef, up_curr)
-    } else {
-        let p = exact_planes(fs, Some(cdef.as_slice()))?;
-        fs.ledger.put_planes(cdef);
-        (p, None)
-    };
+        return Ok(out);
+    }
+    let mut up_cdef = exact_planes(fs, None)?;
+    upscale(&cdef, fs, seq, h, &mut up_cdef, cancel)?;
+    fs.ledger.put_planes(cdef);
     if !h.uses_lr {
         return Ok(up_cdef);
     }
+    let mut up_curr = exact_planes(fs, None)?;
+    upscale(&fs.curr_frame, fs, seq, h, &mut up_curr, cancel)?;
     let mut out = exact_planes(fs, Some(up_cdef.as_slice()))?;
-    match &up_curr {
-        Some(c) => lr_frame(fs, seq, h, &up_cdef, c, &mut out, cancel)?,
-        None => lr_frame(fs, seq, h, &up_cdef, &fs.curr_frame, &mut out, cancel)?,
-    }
+    lr_frame(fs, seq, h, &up_cdef, &up_curr, &mut out, cancel)?;
     fs.ledger.put_planes(up_cdef);
-    if let Some(c) = up_curr {
-        fs.ledger.put_planes(c);
-    }
+    fs.ledger.put_planes(up_curr);
     Ok(out)
 }
 

@@ -46,9 +46,8 @@ pub(crate) const CDEF_DIRECTIONS: [[[i32; 2]; 2]; 8] = [
 ];
 
 /// The CDEF process (spec 7.15): reads `curr` (`CurrFrame`), writes `CdefFrame` into `out`,
-/// which must have the same planes, widths, heights and strides as `curr` (a plane that does
-/// not match is left untouched). `out` is first a copy of the input; with `enable_cdef` off,
-/// `coded_lossless` or `allow_intrabc` it stays that copy.
+/// which must be a copy of `curr` ([`cdef_planes`]): the filtered blocks are written over it,
+/// and with `enable_cdef` off, `coded_lossless` or `allow_intrabc` it stays that copy.
 pub(crate) fn cdef_frame(
     fs: &FrameState,
     curr: &[Plane],
@@ -58,12 +57,6 @@ pub(crate) fn cdef_frame(
     cancel: &AtomicBool,
 ) -> Result<(), Error> {
     let num_planes = usize::from(seq.num_planes).min(curr.len()).min(out.len());
-    for plane in 0..num_planes {
-        let (src, dst) = (&curr[plane], &mut out[plane]);
-        if src.stride == dst.stride && src.px.len() == dst.px.len() {
-            dst.px.copy_from_slice(&src.px);
-        }
-    }
     if !cdef_on(fs, curr, seq, fh, out) {
         return Ok(());
     }
@@ -223,8 +216,8 @@ pub(crate) fn cdef_rows(
     Ok(())
 }
 
-/// `CdefFrame` as new planes: allocates planes shaped like `fs.curr_frame` (charged to the
-/// frame's ledger), then runs [`cdef_frame`] into them.
+/// `CdefFrame` as new planes: copies `fs.curr_frame` (charged to the frame's ledger), then
+/// runs [`cdef_frame`] on the copy.
 ///
 /// # Errors
 /// `AllocLimit` or `OutOfMemory` from the plane allocations.
@@ -239,15 +232,17 @@ pub(crate) fn cdef_alloc(
     Ok(out)
 }
 
-/// Zeroed planes shaped like `curr` (sizes and strides), charged to `ledger`.
+/// A copy of `curr` (sizes, strides and samples), charged to `ledger`: `CdefFrame` before
+/// the filter.
 ///
 /// # Errors
-/// `AllocLimit` or `OutOfMemory` from the plane allocations.
+/// `AllocLimit` or `OutOfMemory` from the plane allocations; `Invalid` for a plane shorter
+/// than its stride times its height (never one from `Plane::new`).
 pub(crate) fn cdef_planes(curr: &[Plane], ledger: &Arc<Ledger>) -> Result<Vec<Plane>, Error> {
     let mut out = ledger.planes(curr.len())?;
     for p in curr {
-        let mut q = Plane::new(p.width, p.height, ledger)?;
-        q.stride = p.stride;
+        let mut q = Plane::copy_of(&p.px, p.stride, p.stride, p.height, ledger)?;
+        q.width = p.width;
         out.push(q);
     }
     Ok(out)
