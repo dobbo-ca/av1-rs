@@ -141,4 +141,4 @@ not returned and there is no option for them yet (a known gap against the owner 
 callers can use the re-exported `isobmff::parse` on the same file.
 
 `decode_avif_item` decodes any image item of such a parse (same paths, no alpha, no re-parse); its
-`max_alloc` is the peak of the call, an eighth for the item byte reads and the rest for the ledger.
+`max_alloc` is the peak of the call, an eighth for the item byte reads (split between the grid workers, so the copies live at once stay within it) and the rest for the ledger.
