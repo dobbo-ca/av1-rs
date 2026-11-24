@@ -157,19 +157,25 @@ impl Ledger {
         })
     }
 
-    /// Keeps `v`, charged `charged` bytes, for a later [`Ledger::take`].
+    /// Keeps `v`, charged `charged` bytes, for a later [`Ledger::take`]; frees it when the pool
+    /// list cannot grow (it never grows infallibly).
     pub(crate) fn give<T: Pooled>(&self, v: Vec<T>, charged: usize) {
         if v.capacity() == 0 {
             self.release(charged);
             return;
         }
         let mut p = self.lock();
-        p.bytes += charged as u64;
         let bin = T::bin(&mut p);
         if bin.capacity() == 0 {
             let _ = bin.try_reserve(POOL_SLOTS);
         }
+        if bin.try_reserve(1).is_err() {
+            drop(p);
+            self.release(charged);
+            return;
+        }
         bin.push((v, charged));
+        p.bytes += charged as u64;
     }
 
     /// Charges `v` (a buffer handed back by the caller) and keeps it; drops it when it does not
@@ -195,7 +201,9 @@ impl Ledger {
         if p.sets.capacity() == 0 {
             let _ = p.sets.try_reserve(POOL_SLOTS);
         }
-        p.sets.push(v);
+        if p.sets.try_reserve(1).is_ok() {
+            p.sets.push(v);
+        }
     }
 
     /// Books `n` bytes, or `AllocLimit` when they do not fit.
@@ -355,5 +363,23 @@ mod tests {
         assert!(p.capacity() >= 3);
         l.put_planes(p);
         assert!(l.planes(2).unwrap().capacity() >= 3);
+    }
+
+    #[test]
+    fn pool_lists_grow_past_their_first_slots() {
+        let l = Ledger::default();
+        l.reset(SMALL + 1000, 0).unwrap();
+        let n = 2 * POOL_SLOTS;
+        let bufs: Vec<_> = (0..n).map(|_| l.take::<u8>(4).unwrap()).collect();
+        for (v, c) in bufs {
+            l.give(v, c);
+        }
+        // Every buffer was pooled with its charge, none freed.
+        assert_eq!(l.used.load(Ordering::Relaxed), (SMALL + 4 * n) as u64);
+        assert_eq!(l.left(), 1000);
+        for _ in 0..n {
+            assert_eq!(l.take::<u8>(4).unwrap().1, 4);
+        }
+        assert_eq!(l.lock().u8s.len(), 0);
     }
 }

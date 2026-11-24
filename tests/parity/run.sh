@@ -238,7 +238,7 @@ full() {
   return $bad
 }
 
-SUBSET='size-(16x16|66x66|196x196|226x226)|quantizer-(00|31|63)|monochrome|film_grain-50|allintra|features__(annexb|section5)'
+SUBSET='size-(16x16|66x66|196x196|226x226)|quantizer-(00|31|63)|monochrome|film_grain-50|allintra|features__(annexb|section5)|fox\.profile2\.12bpc\.yuv(422\.odd-width\.odd-height|444)\.avif|fox\.profile1\.10bpc\.yuv444\.odd-width|422_oddwidth'
 
 ref() {
   rm -rf $W; mkdir -p $W/in "$1"
@@ -255,7 +255,7 @@ arm() {
   # The scalar tier on aarch64 too (the NEON tier is the default run above).
   AV1_SIMD=scalar qemu-aarch64 -L /usr/aarch64-linux-gnu "$(command -v av1-oracle-arm64)" $flag --threads 1 $W/in $W/arm-scalar || exit 1
   diff -r "$1" $W/arm-scalar || exit 1
-  [ "$(ls $W/in | wc -l)" -ge 50 ] || { echo "arm64 subset has only $(ls $W/in | wc -l) streams, want at least 50" >&2; exit 1; }
+  [ "$(ls $W/in | wc -l)" -ge 55 ] || { echo "arm64 subset has only $(ls $W/in | wc -l) streams, want at least 55" >&2; exit 1; }
   diff -r "$1" $W/arm && echo "arm64 matches x86_64 on $(ls $W/in | wc -l) streams"
 }
 

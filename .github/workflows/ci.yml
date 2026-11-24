@@ -43,7 +43,7 @@ jobs:
           secrets: |
             gh_token=${{ steps.app.outputs.token }}
 
-  # The library tests on aarch64 under qemu-user (the NEON kernel tests join when SIMD lands).
+  # The library tests (SIMD kernel, cross-tier and dispatch tests) on aarch64 under qemu-user, with the NEON tier and with the scalar tier.
   arm64:
     if: github.event_name != 'pull_request'
     runs-on: github-arc-runner-set

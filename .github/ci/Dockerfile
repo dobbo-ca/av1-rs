@@ -35,6 +35,10 @@ RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
 RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --all-targets -- -D warnings \
     && cargo clippy --locked --lib --features fuzzing -- -D warnings
+# The fuzz targets (their own workspace, built for fuzzing only by fuzz.yml) must still compile.
+RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
+    find src examples tests -name '*.rs' -exec touch {} + \
+    && cargo check --locked --manifest-path tests/fuzz/Cargo.toml --target-dir target/fuzz-check
 RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
 RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
@@ -169,7 +173,7 @@ COPY . .
 RUN cargo +nightly fuzz build --fuzz-dir tests/fuzz --target aarch64-unknown-linux-gnu -s none
 
 # Benchmark (bench.yml) and profile (profile.yml) binaries: av1-oracle (the default release
-# build), av1-oracle-v4 (the release-binary flags of docs/conventions.md: x86-64-v4 with the
+# build), av1-oracle-v4 (the release-binary flags: x86-64-v4 with the
 # false-deps features, fat LTO, panic=abort) and av1-avifx (extracts AVIF items for the classes).
 FROM oracles AS bench-bin
 COPY . .

@@ -2,7 +2,8 @@
 
 A pure-Rust AV1 **intra-only** decoder for AVIF stills and AV1 key frames, bit-exact to the AV1
 Bitstream & Decoding Process Specification. Inter frames are refused with `Error::InterFrame`
-(the frames before them are kept). No C code, no unsafe code, every allocation bounded by
+(the frames before them are kept). No C code, no `unsafe` outside the SIMD load/store helpers and
+dispatch fns (docs/safety.md), every allocation bounded by
 `Limits`. AV1 is royalty-free (AOM patent licence); the owner reviews licensing before Dobbo
 Drive goes public.
 
