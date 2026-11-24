@@ -62,3 +62,10 @@ path = "fuzz_targets/simd_cdef.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "simd_ipred"
+path = "fuzz_targets/simd_ipred.rs"
+test = false
+doc = false
+bench = false

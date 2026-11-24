@@ -16,6 +16,7 @@
 pub(crate) mod arm;
 pub(crate) mod cdef;
 pub(crate) mod grain;
+pub(crate) mod ipred;
 pub(crate) mod lf;
 pub(crate) mod lr;
 #[cfg(target_arch = "x86_64")]
