@@ -2,8 +2,9 @@
 //!
 //! The 1D transforms work in place on an array `T` of up to 64 values and follow the spec's
 //! butterfly steps one to one. The 2D process (7.13.3) runs the row transforms, clamps, then the
-//! column transforms. The output is the spec's `Residual` array *before* the flips of 7.12.3,
-//! which `recon::reconstruct` applies when it writes samples.
+//! column transforms, and [`inverse_transform_add`] adds the result to the samples with the
+//! flips and the clip of 7.12.3. That function is the scalar oracle of the SIMD kernels in
+//! `simd::itx`.
 //!
 //! Out-of-range values: the spec only requires intermediate values to fit a bit width for
 //! conforming streams. For non-conforming streams this code behaves like dav1d (the CI oracle):
@@ -35,8 +36,8 @@ pub(crate) static FLIP_LR: [bool; 16] = [
     false, true,
 ];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
     Dct,
     Adst,
     Identity,
@@ -58,10 +59,10 @@ static COS128_LOOKUP: [i32; 65] = [
     1567, 1474, 1380, 1285, 1189, 1092, 995, 897, 799, 700, 601, 501, 401, 301, 201, 101, 0,
 ];
 
-const SINPI_1_9: i64 = 1321;
-const SINPI_2_9: i64 = 2482;
-const SINPI_3_9: i64 = 3344;
-const SINPI_4_9: i64 = 3803;
+pub(crate) const SINPI_1_9: i64 = 1321;
+pub(crate) const SINPI_2_9: i64 = 2482;
+pub(crate) const SINPI_3_9: i64 = 3344;
+pub(crate) const SINPI_4_9: i64 = 3803;
 
 /// Spec `Round2( x, n )` for signed values.
 fn round2(x: i32, n: u32) -> i32 {
@@ -69,12 +70,12 @@ fn round2(x: i32, n: u32) -> i32 {
 }
 
 /// Spec `brev( numBits, x )` for `1 <= num_bits <= 6`.
-fn brev(num_bits: u32, x: i32) -> i32 {
+pub(crate) fn brev(num_bits: u32, x: i32) -> i32 {
     ((x as u32).reverse_bits() >> (32 - num_bits)) as i32
 }
 
 /// Spec 7.13.2.1 `cos128( angle )`.
-fn cos128(angle: i32) -> i32 {
+pub(crate) fn cos128(angle: i32) -> i32 {
     let a = angle & 255;
     match a {
         0..=64 => COS128_LOOKUP[a as usize],
@@ -85,7 +86,7 @@ fn cos128(angle: i32) -> i32 {
 }
 
 /// Spec 7.13.2.1 `sin128( angle )`.
-fn sin128(angle: i32) -> i32 {
+pub(crate) fn sin128(angle: i32) -> i32 {
     cos128(angle - 64)
 }
 
@@ -500,84 +501,182 @@ fn transform_1d(t: &mut T, kind: Kind, n: u32, r: u32) {
     }
 }
 
-/// Spec 7.13.3 2D inverse transform process.
-///
-/// `dequant` and `residual` are `h * w` row-major with `w = 1 << Tx_Width_Log2[ tx_sz ]` and
-/// `h = 1 << Tx_Height_Log2[ tx_sz ]`; entries of `dequant` outside the top-left
-/// `min(32, w) x min(32, h)` must be zero. The caller guarantees `tx_sz < 19`, `tx_type < 16`,
-/// `bit_depth` in 8..=12 and both slices at least `w * h` long (otherwise nothing is written).
-/// `residual` is the spec's `Residual` before the flips of 7.12.3.
-pub(crate) fn inverse_transform_2d(
-    dequant: &[i32],
-    residual: &mut [i32],
-    tx_sz: usize,
-    tx_type: usize,
-    lossless: bool,
-    bit_depth: u32,
-) {
-    let (Some(&log2_w), Some(&log2_h)) = (TX_WIDTH_LOG2.get(tx_sz), TX_HEIGHT_LOG2.get(tx_sz))
-    else {
-        return;
-    };
-    let (log2_w, log2_h) = (log2_w as u32, log2_h as u32);
-    let (Some(&row_kind), Some(&col_kind)) = (ROW_KIND.get(tx_type), COL_KIND.get(tx_type)) else {
-        return;
-    };
-    let (w, h) = (1usize << log2_w, 1usize << log2_h);
-    if dequant.len() < w * h || residual.len() < w * h {
-        return;
-    }
-    let tw = w.min(32);
-    let row_shift = if lossless {
-        0
-    } else {
-        TRANSFORM_ROW_SHIFT[tx_sz]
-    };
-    let col_shift = if lossless { 0 } else { 4 };
-    let row_clamp_range = bit_depth + 8;
-    let col_clamp_range = (bit_depth + 6).max(16);
-    let col_lo = -(1i32 << (col_clamp_range - 1));
-    let col_hi = (1i32 << (col_clamp_range - 1)) - 1;
-    let rect = log2_w.abs_diff(log2_h) == 1;
+/// Stride of the dequantized coefficients: `dq[ j * DQ_STRIDE + i ]` is `Dequant[ i ][ j ]`
+/// (column-major, so a SIMD row pass loads one coefficient of consecutive rows at once). Only
+/// the top-left 32x32 can be nonzero.
+pub(crate) const DQ_STRIDE: usize = 32;
+pub(crate) const DQ_LEN: usize = 32 * DQ_STRIDE;
+/// Stride of the row pass output: `mid[ i * MID_STRIDE + j ]` for row `i < 32`, column `j < w`.
+pub(crate) const MID_STRIDE: usize = 64;
+pub(crate) const MID_LEN: usize = 32 * MID_STRIDE;
 
-    for i in 0..h {
-        let out = &mut residual[i * w..(i + 1) * w];
+/// Everything the 2D inverse transform of one block needs besides the buffers, validated by
+/// [`Plan::new`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Plan {
+    pub log2_w: u32,
+    pub log2_h: u32,
+    pub row_kind: Kind,
+    pub col_kind: Kind,
+    /// The coded region: `Dequant[ i ][ j ]` is zero for `i >= rows` or `j >= cols`;
+    /// `1 <= rows <= Min( 32, h )`, `1 <= cols <= Min( 32, w )`.
+    pub rows: usize,
+    pub cols: usize,
+    /// `Transform_Row_Shift[ txSz ]`, 0 when lossless.
+    pub row_shift: u32,
+    /// `Abs( log2W - log2H ) == 1`.
+    pub rect: bool,
+    pub lossless: bool,
+    pub flip_ud: bool,
+    pub flip_lr: bool,
+    pub bit_depth: u32,
+}
+
+impl Plan {
+    /// `None` unless `tx_sz < 19`, `tx_type < 16`, `bit_depth` is in 8..=12 and the coded region
+    /// is valid (see [`Plan::rows`]).
+    pub(crate) fn new(
+        tx_sz: usize,
+        tx_type: usize,
+        lossless: bool,
+        bit_depth: u32,
+        rows: usize,
+        cols: usize,
+    ) -> Option<Self> {
+        let log2_w = *TX_WIDTH_LOG2.get(tx_sz)? as u32;
+        let log2_h = *TX_HEIGHT_LOG2.get(tx_sz)? as u32;
+        let row_kind = *ROW_KIND.get(tx_type)?;
+        let col_kind = *COL_KIND.get(tx_type)?;
+        let (w, h) = (1usize << log2_w, 1usize << log2_h);
+        if !(8..=12).contains(&bit_depth)
+            || rows == 0
+            || cols == 0
+            || rows > h.min(32)
+            || cols > w.min(32)
+        {
+            return None;
+        }
+        Some(Self {
+            log2_w,
+            log2_h,
+            row_kind,
+            col_kind,
+            rows,
+            cols,
+            row_shift: if lossless {
+                0
+            } else {
+                TRANSFORM_ROW_SHIFT[tx_sz]
+            },
+            rect: log2_w.abs_diff(log2_h) == 1,
+            lossless,
+            flip_ud: FLIP_UD[tx_type],
+            flip_lr: FLIP_LR[tx_type],
+            bit_depth,
+        })
+    }
+
+    pub(crate) fn w(&self) -> usize {
+        1 << self.log2_w
+    }
+
+    pub(crate) fn h(&self) -> usize {
+        1 << self.log2_h
+    }
+
+    /// The row clamping range `BitDepth + 8`.
+    pub(crate) fn row_r(&self) -> u32 {
+        self.bit_depth + 8
+    }
+
+    /// The column clamping range `Max( BitDepth + 6, 16 )`; the row output is clamped to it.
+    pub(crate) fn col_r(&self) -> u32 {
+        (self.bit_depth + 6).max(16)
+    }
+}
+
+/// `v` clamped to a signed `r`-bit range.
+fn clamp_bits(v: i32, r: u32) -> i32 {
+    v.clamp(-(1 << (r - 1)), (1 << (r - 1)) - 1)
+}
+
+/// The residual of a DCT_DCT block whose only nonzero coefficient is the DC `dc` (not
+/// lossless): every sample gets this value. The 1D DCT of `[ v, 0, .. ]` is flat: the first
+/// butterfly gives `( v * 2896 + 2048 ) >> 12` twice, every later step pairs it with a zero, and
+/// the Hadamard steps only clamp it to `r` bits. So this is the full transform's arithmetic for
+/// one sample, bit for bit.
+pub(crate) fn dc_only(p: &Plan, dc: i32) -> i32 {
+    let half = |v: i32| ((i64::from(v) * 2896 + 2048) >> 12) as i32;
+    let mut v = dc;
+    if p.rect {
+        v = half(v);
+    }
+    v = clamp_bits(half(v), p.row_r());
+    v = clamp_bits(round2(v, p.row_shift), p.col_r());
+    round2(clamp_bits(half(v), p.col_r()), 4)
+}
+
+/// Spec 7.13.3 2D inverse transform process followed by the sample update of 7.12.3 (flips,
+/// add, clip to `BitDepth`). This is the scalar oracle of `simd::itx`.
+///
+/// `dq` holds `Dequant` (layout [`DQ_STRIDE`]) for the coded region `p.rows x p.cols`; `mid`
+/// is scratch. The block is `px[ i * stride + j ]` for `i < h`, `j < w`; the caller guarantees
+/// `px.len() >= ( h - 1 ) * stride + w`. Only the coded rows are row-transformed (the rows below
+/// are zero), and only the coded columns are read.
+pub(crate) fn inverse_transform_add(
+    p: &Plan,
+    dq: &[i32; DQ_LEN],
+    mid: &mut [i32; MID_LEN],
+    px: &mut [u16],
+    stride: usize,
+) {
+    let (w, h) = (p.w(), p.h());
+    let col_shift = if p.lossless { 0 } else { 4 };
+    let col_lo = -(1i32 << (p.col_r() - 1));
+    let col_hi = (1i32 << (p.col_r() - 1)) - 1;
+
+    for i in 0..p.rows {
+        let out = &mut mid[i * MID_STRIDE..i * MID_STRIDE + w];
         let mut t: T = [0; 64];
-        if i < 32 {
-            t[..tw].copy_from_slice(&dequant[i * w..i * w + tw]);
+        for j in 0..p.cols {
+            t[j] = dq[j * DQ_STRIDE + i];
         }
         // Every 1D transform maps an all-zero row to zeros.
-        if t[..w].iter().all(|&v| v == 0) {
+        if t[..p.cols].iter().all(|&v| v == 0) {
             out.fill(0);
             continue;
         }
-        if rect {
+        if p.rect {
             for v in &mut t[..w] {
                 *v = ((i64::from(*v) * 2896 + 2048) >> 12) as i32;
             }
         }
-        if lossless {
+        if p.lossless {
             inverse_walsh_hadamard(&mut t, 2);
         } else {
-            transform_1d(&mut t, row_kind, log2_w, row_clamp_range);
+            transform_1d(&mut t, p.row_kind, p.log2_w, p.row_r());
         }
         for j in 0..w {
-            out[j] = round2(t[j], row_shift).clamp(col_lo, col_hi);
+            out[j] = round2(t[j], p.row_shift).clamp(col_lo, col_hi);
         }
     }
 
+    let max = (1i32 << p.bit_depth) - 1;
     for j in 0..w {
         let mut t: T = [0; 64];
-        for i in 0..h {
-            t[i] = residual[i * w + j];
+        for i in 0..p.rows {
+            t[i] = mid[i * MID_STRIDE + j];
         }
-        if lossless {
+        if p.lossless {
             inverse_walsh_hadamard(&mut t, 0);
         } else {
-            transform_1d(&mut t, col_kind, log2_h, col_clamp_range);
+            transform_1d(&mut t, p.col_kind, p.log2_h, p.col_r());
         }
+        let x = if p.flip_lr { w - j - 1 } else { j };
         for i in 0..h {
-            residual[i * w + j] = round2(t[i], col_shift);
+            let y = if p.flip_ud { h - i - 1 } else { i };
+            let s = &mut px[y * stride + x];
+            *s = (i32::from(*s) + round2(t[i], col_shift)).clamp(0, max) as u16;
         }
     }
 }
@@ -587,13 +686,96 @@ mod tests {
     use super::*;
     use crate::consts::IDTX;
 
+    /// The residual (row-major, after the flips) of the `Dequant` entries `(row, col, value)`:
+    /// the samples start at mid-range, so a residual within +-2^(bd-1) is not clipped.
+    fn residual(
+        tx_sz: usize,
+        tx_type: usize,
+        lossless: bool,
+        bd: u32,
+        coefs: &[(usize, usize, i32)],
+    ) -> Vec<i32> {
+        let (w, h) = (
+            1usize << TX_WIDTH_LOG2[tx_sz],
+            1usize << TX_HEIGHT_LOG2[tx_sz],
+        );
+        let mut dq = [0; DQ_LEN];
+        let (mut rows, mut cols) = (1, 1);
+        for &(i, j, v) in coefs {
+            dq[j * DQ_STRIDE + i] = v;
+            rows = rows.max(i + 1);
+            cols = cols.max(j + 1);
+        }
+        let p = Plan::new(tx_sz, tx_type, lossless, bd, rows, cols).unwrap();
+        let base = 1u16 << (bd - 1);
+        let mut px = vec![base; w * h];
+        inverse_transform_add(&p, &dq, &mut [0; MID_LEN], &mut px, w);
+        px.iter().map(|&v| i32::from(v) - i32::from(base)).collect()
+    }
+
     fn run(tx_sz: usize, tx_type: usize, lossless: bool, bd: u32, dc: i32) -> Vec<i32> {
-        let n = (1usize << TX_WIDTH_LOG2[tx_sz]) * (1usize << TX_HEIGHT_LOG2[tx_sz]);
-        let mut dq = vec![0; n];
-        dq[0] = dc;
-        let mut res = vec![7; n];
-        inverse_transform_2d(&dq, &mut res, tx_sz, tx_type, lossless, bd);
-        res
+        residual(tx_sz, tx_type, lossless, bd, &[(0, 0, dc)])
+    }
+
+    /// The DC fast path gives the samples of the full transform, for every size, bit depth and
+    /// DC up to the dequantizer clamp, clipping included.
+    #[test]
+    fn dc_only_matches_full_transform() {
+        for bd in [8u32, 10, 12] {
+            let lim = 1i32 << (bd + 7);
+            for tx_sz in 0..19 {
+                for dc in [1, -1, 7, -100, 1000, -4321, lim / 3, lim - 1, -lim] {
+                    let p = Plan::new(tx_sz, 0, false, bd, 1, 1).unwrap();
+                    let (w, h) = (p.w(), p.h());
+                    let mut dq = [0; DQ_LEN];
+                    dq[0] = dc;
+                    let max = (1i32 << bd) - 1;
+                    let start: Vec<u16> =
+                        (0..w * h).map(|k| ((k * 37) as i32 % max) as u16).collect();
+                    let mut full = start.clone();
+                    inverse_transform_add(&p, &dq, &mut [0; MID_LEN], &mut full, w);
+                    let d = dc_only(&p, dc);
+                    let fast: Vec<u16> = start
+                        .iter()
+                        .map(|&s| (i32::from(s) + d).clamp(0, max) as u16)
+                        .collect();
+                    assert_eq!(full, fast, "bd {bd} tx_sz {tx_sz} dc {dc}");
+                }
+            }
+        }
+    }
+
+    /// Transforming only the coded region gives what the whole (zero-padded) region gives.
+    #[test]
+    fn coded_region_matches_full_region() {
+        let mut s = 7u32;
+        for tx_sz in 0..19 {
+            for tx_type in 0..16 {
+                let p = Plan::new(tx_sz, tx_type, false, 10, 1, 1).unwrap();
+                let (w, h) = (p.w(), p.h());
+                let (rows, cols) = (1 + tx_type % h.min(32), 1 + (tx_type * 5) % w.min(32));
+                let mut dq = [0; DQ_LEN];
+                for j in 0..cols {
+                    for i in 0..rows {
+                        s ^= s << 13;
+                        s ^= s >> 17;
+                        s ^= s << 5;
+                        dq[j * DQ_STRIDE + i] = (s % 2001) as i32 - 1000;
+                    }
+                }
+                let run = |rows, cols| {
+                    let p = Plan::new(tx_sz, tx_type, false, 10, rows, cols).unwrap();
+                    let mut px = vec![512u16; w * h];
+                    inverse_transform_add(&p, &dq, &mut [0; MID_LEN], &mut px, w);
+                    px
+                };
+                assert_eq!(
+                    run(rows, cols),
+                    run(h.min(32), w.min(32)),
+                    "{tx_sz} {tx_type}"
+                );
+            }
+        }
     }
 
     /// A DC-only DCT_DCT block is flat; the value follows from the spec's rounding steps
@@ -642,10 +824,7 @@ mod tests {
     fn wht_single_ac_coefficient() {
         // Row 0: T = [0, 16, 0, 0] >> 2 gives a = 0, c = 4; a = 4, d = 0, e = 2, b = 2, c = -2,
         // a = 2, d = -2 -> [2, 2, -2, -2]. Each column [r, 0, 0, 0] gives a flat r / 2.
-        let mut dq = vec![0; 16];
-        dq[1] = 16;
-        let mut res = vec![0; 16];
-        inverse_transform_2d(&dq, &mut res, 0, 0, true, 8);
+        let res = residual(0, 0, true, 8, &[(0, 1, 16)]);
         for row in res.chunks(4) {
             assert_eq!(row, [1, 1, -1, -1]);
         }
@@ -654,15 +833,15 @@ mod tests {
     #[test]
     fn identity_scaling() {
         // IDTX 4x4: 1000 -> 1414 (x 5793 / 4096) -> 2000, then Round2( 2000, 4 ) = 125.
-        let res = run(0, IDTX, false, 8, 1000);
+        let res = run(0, IDTX, false, 12, 1000);
         assert_eq!(res[0], 125);
         assert!(res[1..].iter().all(|&r| r == 0));
         // IDTX 8x8: x2 in the row, row shift 1, x2 in the column, Round2( 2000, 4 ) = 125.
-        let res = run(1, IDTX, false, 8, 1000);
+        let res = run(1, IDTX, false, 12, 1000);
         assert_eq!(res[0], 125);
         assert!(res[1..].iter().all(|&r| r == 0));
         // IDTX 32x32: x4, row shift 2, x4, Round2( 4000, 4 ) = 250.
-        let res = run(3, IDTX, false, 8, 1000);
+        let res = run(3, IDTX, false, 12, 1000);
         assert_eq!(res[0], 250);
     }
 
@@ -690,21 +869,24 @@ mod tests {
         // Hostile extremes: every coefficient at the clamp limits for a 12-bit stream.
         for tx_sz in 0..19 {
             for tx_type in 0..16 {
-                let n = (1usize << TX_WIDTH_LOG2[tx_sz]) * (1usize << TX_HEIGHT_LOG2[tx_sz]);
-                let w = 1usize << TX_WIDTH_LOG2[tx_sz];
-                let mut dq = vec![0; n];
-                for i in 0..n {
-                    let (r, c) = (i / w, i % w);
-                    if r < 32 && c < 32 {
-                        dq[i] = if i & 1 == 0 {
+                let (w, h) = (
+                    1usize << TX_WIDTH_LOG2[tx_sz],
+                    1usize << TX_HEIGHT_LOG2[tx_sz],
+                );
+                let (rows, cols) = (h.min(32), w.min(32));
+                let mut dq = [0; DQ_LEN];
+                for i in 0..rows {
+                    for j in 0..cols {
+                        dq[j * DQ_STRIDE + i] = if (i + j) & 1 == 0 {
                             (1 << 19) - 1
                         } else {
                             -(1 << 19)
                         };
                     }
                 }
-                let mut res = vec![0; n];
-                inverse_transform_2d(&dq, &mut res, tx_sz, tx_type, false, 12);
+                let p = Plan::new(tx_sz, tx_type, false, 12, rows, cols).unwrap();
+                let mut px = vec![0u16; w * h];
+                inverse_transform_add(&p, &dq, &mut [0; MID_LEN], &mut px, w);
             }
         }
     }

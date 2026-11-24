@@ -31,8 +31,9 @@ ledger per `decode_avif` call covers every item decoder, the grid canvas, the it
 primary image (docs/threading.md).
 
 Not charged, because their size does not depend on the input: the loop restoration source window
-(at most 70 x 70 `i32`, one per `lr_frame` call, reused for every block) and the stack buffers
-of the loop restoration SIMD kernels (about 70 KB).
+(at most 70 x 70 `i32`, one per `lr_frame` call, reused for every block), the stack buffers
+of the loop restoration SIMD kernels (about 70 KB) and, per tile decoder, the colour map
+buffers and the 12 KiB reconstruction scratch (`recon::ItxScratch`).
 
 ## Compute is not limited
 
