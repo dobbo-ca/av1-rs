@@ -74,6 +74,7 @@ that were tried and dropped are listed here with their numbers.
 | Kernel | Tier | Result |
 |---|---|---|
 | `grain` blend | AVX2, AVX-512 (runs AVX2) | Kept, not slower than scalar. Only the bench class `grain` has film grain (2 frames, about 17 ms, near the bench's 1 ms resolution). Tier table: scalar 18, avx2 17, avx512 17 ms (main before the change: 18, 17, 18). The gain is below what the bench can resolve. |
+| `lr` wiener, self guided | AVX2, AVX-512 (runs AVX2) | Kept. Tier table (bench run 45324834732), scalar / avx2 / avx512 ms: avif8 144 / 115 / 115, avifhi 356 / 276 / 276, allintra 858 / 821 / 818, tiles8 565 / 535 / 535, tiles10 579 / 553 / 555 (main 68e575a before the change: avif8 138 / 131 / 131, avifhi 338 / 308 / 308, allintra 824 / 826 / 825, tiles8 537 / 511 / 552, tiles10 553 / 532 / 537). avx2 / scalar went from 94% to 79% on avif8 and from 91% to 77% on avifhi; the other classes are within the runner noise (dav1d itself ran about 3% slower on this run). NEON is not benched (the bench runs on x86_64 only). |
 
 ## Hostile input
 
