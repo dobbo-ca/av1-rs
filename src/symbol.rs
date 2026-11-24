@@ -5,8 +5,9 @@
 //! dav1d authors, Copyright 2018-2019, Two Orioles, LLC; BSD-2-Clause, see NOTICE and
 //! docs/dependencies.md): `SymbolValue` is the top 16 bits of a 64-bit window whose lower bits
 //! hold the next bits of the tile data, inverted, refilled a byte at a time; the renormalisation
-//! shifts by `leading_zeros`; the symbol search compares the value with every partition point
-//! at once instead of stopping at the first one; `read_bool` has its own fast path. The CDFs
+//! shifts by `leading_zeros`; the symbol search stops at the first partition point at or below
+//! the value (`search`; the SIMD tiers then adapt the row, `simd::entropy::decode_symbol`);
+//! `read_bool` has its own fast path. The CDFs
 //! keep this crate's convention (the spec's values, ending in 32768, then the counter).
 //!
 //! The arithmetic is the spec's, so every symbol and every state equal those of the bit by bit
@@ -110,48 +111,27 @@ impl<'a> SymbolDecoder<'a> {
         }
     }
 
-    /// Spec 8.2.6 without the CDF update: decodes one symbol from `cdf` (N + 1 entries).
-    /// Returns 0 for a slice shorter than 3 entries, which no caller passes.
+    /// Spec 8.2.6 `read_symbol( cdf )`. `cdf` has N + 1 entries: N cumulative values in the
+    /// spec's representation (the last one is 32768) followed by the adaptation counter.
+    /// The cdf is adapted unless `disable_cdf_update` was set. Returns 0 and reads nothing for
+    /// a slice shorter than 3 entries, which no caller passes.
     ///
-    /// For a CDF of the spec's form (non-decreasing, at most 32768, the last value 32768) the
-    /// partition point `cur` falls strictly with the symbol, so the symbol is the number of
-    /// points above `SymbolValue`; any other CDF gives some symbol below N and no panic.
+    /// The search and the update run in `simd::entropy::decode_symbol`: for a CDF of the
+    /// spec's form (non-decreasing, at most 32768, the last value 32768) the partition point
+    /// `cur` falls strictly with the symbol; any other CDF gives some symbol below N and no
+    /// panic.
     #[inline]
-    fn decode(&mut self, cdf: &[u16]) -> usize {
-        let n = cdf.len().saturating_sub(1);
-        if n < 2 {
+    pub(crate) fn read_symbol(&mut self, cdf: &mut [u16]) -> usize {
+        if cdf.len() < 3 {
             return 0;
         }
         let c = (self.dif >> 48) as u32;
-        let r = self.rng >> 8;
-        // `cur` of the spec for `symbol` = i.
-        let cur = |i: usize| -> u32 {
-            let f = 32768u32.saturating_sub(u32::from(cdf[i]));
-            ((r * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB * (n - 1 - i) as u32
-        };
-        let symbol: usize = (0..n - 1).map(|i| usize::from(c < cur(i))).sum();
-        let prev = if symbol == 0 {
-            self.rng
-        } else {
-            cur(symbol - 1)
-        };
-        let v = cur(symbol);
+        let (symbol, prev, v) =
+            simd::entropy::decode_symbol(self.simd, cdf, c, self.rng, !self.disable_cdf_update);
         self.norm(
             self.dif.wrapping_sub(u64::from(v) << 48),
             prev.wrapping_sub(v) & 0xffff,
         );
-        symbol
-    }
-
-    /// Spec 8.2.6 `read_symbol( cdf )`. `cdf` has N + 1 entries: N cumulative values in the
-    /// spec's representation (the last one is 32768) followed by the adaptation counter.
-    /// The cdf is adapted unless `disable_cdf_update` was set.
-    #[inline]
-    pub(crate) fn read_symbol(&mut self, cdf: &mut [u16]) -> usize {
-        let symbol = self.decode(cdf);
-        if !self.disable_cdf_update {
-            simd::entropy::adapt_cdf(self.simd, cdf, symbol);
-        }
         symbol
     }
 
@@ -174,7 +154,8 @@ impl<'a> SymbolDecoder<'a> {
     }
 
     /// Spec 8.2.5 `read_literal( n )`, the `L(n)` descriptor: n bools, most significant first.
-    /// `n` must be at most 32.
+    /// `n` must be at most 32. A loop of the equiprobable [`SymbolDecoder::read_bool`].
+    #[inline]
     pub(crate) fn read_literal(&mut self, n: u32) -> u32 {
         let mut x = 0;
         for _ in 0..n {
@@ -243,6 +224,36 @@ fn exit_ok(data: &[u8], pos: i64, symbol_max_bits: i64) -> bool {
         return false;
     }
     (trailing_bit_position + 1..padding_end_position).all(|i| bit(i) == Some(0))
+}
+
+/// `cur` of spec 8.2.6 for symbol `i` of an N-symbol CDF whose value `i` is `x`, with
+/// `r = SymbolRange >> 8`. A value above 32768 (not of the spec's form) counts as 32768, as in
+/// the SIMD tiers. At most 65340, so it fits 16 bits.
+#[inline]
+fn cur(r: u32, x: u16, n: usize, i: usize) -> u32 {
+    let f = 32768u32.saturating_sub(u32::from(x));
+    ((r * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB * (n - 1 - i) as u32
+}
+
+/// The symbol search of spec 8.2.6 on `cdf` (N values, then the counter) for
+/// `SymbolValue` = `c` and `SymbolRange` = `rng` (the scalar tier of
+/// `simd::entropy::decode_symbol`; dav1d's `msac_decode_symbol_adapt`): the first symbol below
+/// N - 1 whose `cur` is at most `c`, else N - 1, stopping there (most symbols are small).
+/// Returns the symbol, the `cur` before it (`rng` for symbol 0) and its own `cur`; `(0, rng,
+/// 0)` for N = 0.
+#[inline]
+pub(crate) fn search(cdf: &[u16], c: u32, rng: u32) -> (usize, u32, u32) {
+    let n = cdf.len().saturating_sub(1);
+    let r = rng >> 8;
+    let mut prev = rng;
+    for (i, &x) in cdf[..n].iter().enumerate() {
+        let v = cur(r, x, n, i);
+        if c >= v || i + 1 == n {
+            return (i, prev, v);
+        }
+        prev = v;
+    }
+    (0, rng, 0)
 }
 
 /// The adaptation rate of spec 8.2.6 for a CDF of `n` symbols whose counter is `count`.

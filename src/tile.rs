@@ -1269,7 +1269,7 @@ impl<'a> TileDecoder<'a> {
                 delta_q_abs = delta_q_abs_bits + (1 << delta_q_rem_bits) + 1;
             }
             if delta_q_abs != 0 {
-                let sign = self.sd.read_literal(1) != 0;
+                let sign = self.sd.read_bool();
                 let reduced = if sign { -delta_q_abs } else { delta_q_abs };
                 self.current_q_index =
                     (self.current_q_index + (reduced << self.fh.delta_q_res)).clamp(1, 255);
@@ -1311,7 +1311,7 @@ impl<'a> TileDecoder<'a> {
                     delta_lf_abs
                 };
                 if delta_lf_abs != 0 {
-                    let sign = self.sd.read_literal(1) != 0;
+                    let sign = self.sd.read_bool();
                     let reduced = if sign { -delta_lf_abs } else { delta_lf_abs };
                     let max = MAX_LOOP_FILTER as i32;
                     self.delta_lf[i] =
@@ -1491,7 +1491,7 @@ impl<'a> TileDecoder<'a> {
                     if idx >= n {
                         break;
                     }
-                    if self.sd.read_literal(1) != 0 {
+                    if self.sd.read_bool() {
                         colors[idx] = cached;
                         idx += 1;
                     }
@@ -1534,7 +1534,7 @@ impl<'a> TileDecoder<'a> {
                     if idx >= n {
                         break;
                     }
-                    if self.sd.read_literal(1) != 0 {
+                    if self.sd.read_bool() {
                         colors[idx] = cached;
                         idx += 1;
                     }
@@ -1560,14 +1560,14 @@ impl<'a> TileDecoder<'a> {
                 self.palette_colors_u = colors;
 
                 let mut v_colors = [0u16; 8];
-                if self.sd.read_literal(1) != 0 {
+                if self.sd.read_bool() {
                     let min_bits = bit_depth - 4;
                     let max_val_v = 1i32 << bit_depth;
                     let palette_bits = min_bits + self.sd.read_literal(2);
                     v_colors[0] = self.sd.read_literal(bit_depth) as u16;
                     for idx in 1..n {
                         let mut palette_delta_v = self.sd.read_literal(palette_bits) as i32;
-                        if palette_delta_v != 0 && self.sd.read_literal(1) != 0 {
+                        if palette_delta_v != 0 && self.sd.read_bool() {
                             palette_delta_v = -palette_delta_v;
                         }
                         let mut val = i32::from(v_colors[idx - 1]) + palette_delta_v;
@@ -1963,7 +1963,7 @@ fn decode_subexp_bool(sd: &mut SymbolDecoder<'_>, num_syms: i32, k: u32) -> i32 
         if num_syms <= mk + 3 * a {
             return sd.read_ns((num_syms - mk).max(1) as u32) as i32 + mk;
         }
-        if sd.read_literal(1) != 0 {
+        if sd.read_bool() {
             i += 1;
             mk += a;
         } else {

@@ -270,11 +270,12 @@ pub fn threads(data: &[u8]) {
 }
 
 /// `simd_entropy`: the symbol reader against the spec's bit by bit reader
-/// (`symbol::oracle`), with the CDF adaptation of every tier, and the CDF adaptation of every
-/// tier against scalar on rows of any values. The first 8 bytes seed the reads and the CDFs
-/// (bit 0: CDF updates disabled); the rest is the tile data and the rows.
+/// (`symbol::oracle`), with the symbol search and CDF adaptation of every tier, and the search
+/// and adaptation of every tier against scalar on rows of any values. The first 8 bytes seed
+/// the reads and the CDFs (bit 0: CDF updates disabled); the rest is the tile data and the
+/// rows.
 pub fn entropy(data: &[u8]) {
-    use crate::symbol::{adapt_cdf, check_against_oracle};
+    use crate::symbol::{XorShift, adapt_cdf, check_against_oracle, search};
     // The codec seeds are large; 4 KiB of tile data is plenty and keeps each run short.
     let data = &data[..data.len().min(8 + 4096)];
     let (seed, stream) = data.split_at(data.len().min(8));
@@ -290,17 +291,25 @@ pub fn entropy(data: &[u8]) {
         .iter()
         .map(|&b| u16::from_le_bytes(b))
         .collect();
+    let mut rng = XorShift(seed);
     for len in 3..=17 {
         let Some(row) = values.get(..len) else {
             break;
         };
-        for sym in 0..len {
+        for _ in 0..len {
+            let c = rng.next_u32() >> 16;
+            let range = rng.next_u32() >> 16;
+            let update = rng.next_u32() & 1 != 0;
             let mut want = row.to_vec();
-            adapt_cdf(&mut want, sym);
+            let want_out = search(&want, c, range);
+            if update {
+                adapt_cdf(&mut want, want_out.0);
+            }
             for &simd in &crate::simd::available() {
                 let mut got = row.to_vec();
-                crate::simd::entropy::adapt_cdf(simd, &mut got, sym);
-                assert_eq!(got, want, "{:?} len {len} sym {sym}", simd.tier());
+                let got_out = crate::simd::entropy::decode_symbol(simd, &mut got, c, range, update);
+                assert_eq!(got_out, want_out, "{:?} len {len}", simd.tier());
+                assert_eq!(got, want, "{:?} len {len}", simd.tier());
             }
         }
     }
