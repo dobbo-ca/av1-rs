@@ -10,7 +10,9 @@ crate forbids `unsafe`.
 - **The pixel work of one frame** (`decoder.rs`, `decode_frame`): the tiles, then the wrapup
   (loop filter, CDEF, superres, loop restoration), as stages of one team of threads (below).
   The team has `min(max_threads, max(tiles, 64-row bands x planes))` threads; with one, the
-  frame decodes on the calling thread exactly as before (`wrapup` on whole planes).
+  frame decodes on the calling thread exactly as before (`wrapup` on whole planes). A frame of
+  one tile (most AVIF stills, the `allintra` streams) is row pipelined instead: one thread
+  decodes the tile while the others filter the rows it has finished ("Row pipelining").
 - **Tiles of an AVIF grid** (`avif.rs`, `decode_grid`). Each grid tile is a coded item with its own
   `Decoder`; they run on `min(max_threads, tiles)` threads and are pasted into the output as they
   finish. Each inner decode gets `max_threads / workers` threads (so one when the grid has at least
@@ -30,8 +32,8 @@ crate forbids `unsafe`.
   whole-frame noise image of the spec.
 
 Not parallel: the OBU parse, output. Frames of a stream decode one after another (a
-later frame may reference an earlier one). The stages of a frame run one after another: a stage
-starts when every item of the one before has finished (no row pipelining between stages).
+later frame may reference an earlier one). The stages of a frame of several tiles run one after
+another: a stage starts when every item of the one before has finished.
 
 ## The schedulers
 
@@ -98,9 +100,59 @@ of `CurrFrame` first. So threads only wait for each other's copies, and no threa
 already holds (the calling thread holds none while it runs a stage). The buffers are allocated by
 the calling thread between stages, in the order of the serial `wrapup`.
 
-Not done: row pipelining (starting the filters of a superblock row while later rows still decode,
-as dav1d does). It needs the loop filter's horizontal edges in row order across bands, which
-the stage split above avoids; the stages are parallel each, with a barrier between them.
+## Row pipelining
+
+A frame of one tile decodes serially (one symbol decoder), so the stages above would leave every
+other thread idle until the tile is done. Such a frame (`decode_frame` with more than one thread
+and one tile) runs one stage, `Job::Pipe`, with one item per thread: item 0 decodes the tile
+(`Wrap::pipe_decode`), the others take filter tasks as their inputs become final
+(`Wrap::pipe_filter`). Output and errors are those of the serial path.
+
+- **Hand over.** The tile decode works on its own frame state, as in the serial path, because
+  intra prediction reads the unfiltered samples above. After each superblock row
+  (`TileDecoder::decode_tile` calls back) it copies the 64-row bands it has finished into the
+  shared state: the mode info rows (`FrameState::copy_rows`, plus all loop restoration units)
+  into a second frame state the filters read (`shadow`), the samples into the shared
+  `CurrFrame` the loop filter works on. It takes both write locks with `try_write`; when a
+  filter task holds one it decodes on and hands over after the next row, waiting for the locks
+  then, so the filters lag at most one more superblock row. After the last row it hands over
+  the rest. A band is never written by the tile decode after it is handed over: blocks do not
+  cross superblocks, and the mode info rows of a band (the chroma `LoopfilterTxSizes` at their
+  subsampled rows, the loop restoration units of the rows read so far) are final when the
+  superblock row ends.
+- **Tasks** (`Task`, `Progress`), per 64-row band `b` (16 mode info rows; chroma rows shifted
+  by the subsampling, the last band to the plane end), each started when what it reads is final:
+
+  | Task | Starts after | Reads | Writes |
+  |---|---|---|---|
+  | `V( plane, b )` vertical edges | band `b` handed over | its rows | its rows of `CurrFrame` |
+  | `H( plane, b )` horizontal edges | `V( plane, b )`, `H( plane, b - 1 )` | its rows and 8 above | the same rows |
+  | `C( b )` CDEF, every plane | `H( p, b + 1 )` for every plane (no loop filter: band `b + 1` handed over) | `CurrFrame` rows `b` +- 2 | its rows of `CdefFrame` |
+  | `U( b )` superres, or the exact-size copy | `C( b )` | its rows of `CdefFrame` (and `CurrFrame`) | its rows of the upscaled planes |
+  | `L( plane, n )` loop restoration stripe | `U( 0 ..= n )` | the stripe, 3 rows around it | its rows of `LrFrame` |
+
+  Horizontal edges go down a plane in band order, which is the spec's raster order: an edge
+  reaches at most 7 rows above it (into the band above, so `H` copies 8 rows above its band) and
+  none below its band (an edge sits at a multiple of its filter size, which is at least its
+  reach). They run after the vertical edges of their band and the band above, which is all the
+  spec's "all vertical edges first" needs, since a vertical edge touches its own row only.
+  CDEF reads 2 rows below its band, which the horizontal edges at the top of the next band
+  write, hence `H( b + 1 )`; after that no task writes those rows (`H( b + 2 )` starts 8 rows
+  above band `b + 2`). Stripe `n` covers luma rows `64n - 8 .. 64n + 56` and reads 2 rows below
+  (from `UpscaledCurrFrame`), all in bands `<= n`; its loop restoration units start at or above
+  the stripe, so their parameters are in the bands handed over. A plane without loop
+  restoration takes its `UpscaledCdefFrame` plane as `LrFrame` at the end.
+- **Locks.** The buffers are the `RwLock`s of the stages above, used the same way (an item copies
+  its band out and in; readers hold the lock for the item). A task takes the `shadow` read lock
+  first, for its whole run, and the sample locks inside; the tile decode takes `shadow` and then
+  `CurrFrame` for writing, so it never waits on a task that waits on it. The tasks of a lane
+  (kind and plane) start in index order; `Progress` (a `Mutex` and a `Condvar`) holds which are
+  started and done. A task error or a failed tile decode sets `failed`: the threads stop taking
+  tasks and the tile decode stops after the row; the frame returns the tile decode's error when
+  it failed by itself, the failed task's otherwise. The guard `Abort`
+  sets `failed` when a thread leaves early, so no thread waits for a task that will not come.
+  The cancel flag is checked by the tile decode once per superblock row and by every filter
+  task.
 
 ## Tile decode and the byte-identity argument
 
@@ -143,7 +195,11 @@ allocated and released when the state drops, so the ledger peak covers all threa
 most one tile state at a time, so the extra memory is at most `workers` tile-sized states on top of
 the frame state. That is below the peak of the wrapup (`CurrFrame` + `CdefFrame` + ...) for frames
 with more tiles than threads; a frame that does not fit fails with `AllocLimit`, exactly like one
-that does not fit the wrapup. `max_threads = 1` and single-tile frames allocate nothing extra.
+that does not fit the wrapup. `max_threads = 1` allocates nothing extra. A pipelined single-tile
+frame allocates, before its tile decode starts, the shadow frame state (mode info arrays and a
+second `CurrFrame`, the one the filters work on) and all the wrapup buffers at once (`CdefFrame`,
+the exact-size planes), since every filter runs from the first band on; its tasks hold private
+bands as the wrapup items do.
 
 The wrapup allocates its frame buffers in the same order as the serial path. On top, each
 wrapup item holds its private band while it runs, charged to the same ledger: 64 rows of one
@@ -170,7 +226,8 @@ buffers and the tile states' planes come from the pool when it holds one of the 
   stage starts clean, `max_threads = 1` runs on the caller's thread only, charged allocations stay
   within the ledger and a refusal is `AllocLimit`.
 - `decoder.rs`: `tiles_decode_the_same_for_every_thread_count` runs the real tile phase and
-  wrapup over a 3 x 2 tile frame (pseudo-random tile data, loop restoration on) with 1, 2, 3, 6, 8
+  wrapup over a 3 x 2 tile frame (pseudo-random tile data, the loop filter, CDEF and loop
+  restoration on) with 1, 2, 3, 6, 8
   threads and compares every array and plane; `tile_threads_stay_within_max_alloc` checks the
   ledger peak for several `max_alloc` including a refusal that only the threaded path hits.
   `wrapup_is_the_same_for_every_thread_count` builds frames whose tiles are done
@@ -179,7 +236,14 @@ buffers and the tile states' planes come from the pool when it holds one of the 
   compares `LrFrame` and the filtered `CurrFrame` of 2, 3 and 8 threads with 1;
   `wrapup_threads_stay_within_max_alloc` checks the ledger peak for `max_alloc` from 1 KiB up and
   1, 2, 3, 8 threads, and that every byte is released; `team_size_stays_within_max_threads`;
-  `wrapup_threads_honour_the_cancel_flag`.
+  `wrapup_threads_honour_the_cancel_flag` (also on a pipelined frame).
+  Row pipelining: `pipelined_tile_decodes_the_same_for_every_thread_count` decodes a one-tile
+  200x136 frame (3 bands; the loop filter, CDEF and loop restoration on, superres and 128x128
+  superblocks by seed) with 1, 2, 3, 8 threads and compares every array and plane;
+  `pipelined_tile_stays_within_max_alloc` checks the ledger peak and the release for `max_alloc`
+  from 1 KiB up; `pipeline_tasks_respect_their_inputs` drives `Progress` alone, handing over
+  bands and finishing tasks in first-in and last-in order, and checks that every task starts
+  only after the tasks of the table above and that all of them run.
 - The fuzz target `simd_threads` (docs/fuzzing.md) runs `wrapup_frame` on any input with 1, 2
   and 3 threads and asserts the same output.
 - There is no tile corpus in the unit tests (no fixtures in `tests/`). The corpus check is the parity

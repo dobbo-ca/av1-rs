@@ -15,7 +15,7 @@
 //! ```ignore
 //! let td = TileDecoder::new(tile_bytes, tile_row, tile_col, &frame_cdfs, &mut frame_state,
 //!                           &frame_header, &seq)?;
-//! td.decode_tile(&cancel)?;
+//! td.decode_tile(&cancel, &mut |_, _| Ok(()))?;
 //! ```
 //!
 //! `tile_bytes` is the tile's data (`tileSize` bytes of `tile_group_obu`), `frame_cdfs` the
@@ -551,11 +551,20 @@ impl<'a> TileDecoder<'a> {
     /// The tile's final CDFs are not kept (no intra frame loads them); its buffers go back to
     /// the frame state's [`TileScratch`] for the next tile.
     ///
+    /// `row_done( state, end )` is called after each superblock row with the frame state and
+    /// the mode info row the superblock row ends at (the pipelined frame decode hands the
+    /// finished rows to the filters with it, docs/threading.md); an error from it stops the
+    /// decode and is returned.
+    ///
     /// # Errors
     /// `Cancelled` when `cancel` is set (checked once per superblock row), `Invalid` for a
     /// syntax value the spec forbids or for trailing bits that break the exit process's
-    /// conformance requirement.
-    pub(crate) fn decode_tile(mut self, cancel: &AtomicBool) -> Result<(), Error> {
+    /// conformance requirement, and the errors of `row_done`.
+    pub(crate) fn decode_tile(
+        mut self,
+        cancel: &AtomicBool,
+        row_done: &mut dyn FnMut(&FrameState, usize) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         self.clear_above_context();
         self.delta_lf = [0; FRAME_LF_COUNT];
         for plane in 0..self.fs.num_planes {
@@ -582,6 +591,7 @@ impl<'a> TileDecoder<'a> {
                 self.read_lr(r, c, sb_size)?;
                 self.decode_partition(r, c, sb_size)?;
             }
+            row_done(&*self.fs, (r + sb_size4).min(self.mi_row_end))?;
         }
         let TileDecoder {
             sd,

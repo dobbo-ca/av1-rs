@@ -10,6 +10,7 @@ use crate::header::FrameHeader;
 use crate::ledger::{Ledger, zeroed};
 use crate::seq::SequenceHeader;
 use crate::tile::TileScratch;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// One plane of samples, one `u16` per sample for every bit depth (rows are `stride` samples
@@ -567,6 +568,75 @@ impl FrameState {
                     *d = t.lr_sgr_xqd[plane].get(idx).copied().unwrap_or_default();
                 }
             }
+        }
+    }
+
+    /// Copies the mode info rows `rows` of every array of `src`, a state of the same shape, and
+    /// all of its loop restoration units into this state (not the samples). The pipelined frame
+    /// decode hands the rows a tile decode has finished to the filters with it
+    /// (docs/threading.md). An array whose size differs is skipped.
+    pub(crate) fn copy_rows(&mut self, src: &FrameState, rows: Range<usize>) {
+        fn copy<T: Copy>(dst: &mut [T], src: &[T], stride: usize, rows: Range<usize>) {
+            let at = rows.start * stride..rows.end * stride;
+            if let (Some(d), Some(s)) = (dst.get_mut(at.clone()), src.get(at)) {
+                d.copy_from_slice(s);
+            }
+        }
+        let (n, r) = (self.mi_cols, rows);
+        if src.mi_cols != n {
+            return;
+        }
+        copy(&mut self.mi_sizes, &src.mi_sizes, n, r.clone());
+        copy(&mut self.skips, &src.skips, n, r.clone());
+        copy(&mut self.is_inters, &src.is_inters, n, r.clone());
+        copy(&mut self.segment_ids, &src.segment_ids, n, r.clone());
+        copy(&mut self.y_modes, &src.y_modes, n, r.clone());
+        copy(&mut self.uv_modes, &src.uv_modes, n, r.clone());
+        copy(&mut self.ref_frames0, &src.ref_frames0, n, r.clone());
+        copy(&mut self.tx_sizes, &src.tx_sizes, n, r.clone());
+        copy(&mut self.inter_tx_sizes, &src.inter_tx_sizes, n, r.clone());
+        copy(&mut self.mvs, &src.mvs, n, r.clone());
+        copy(&mut self.tx_types, &src.tx_types, n, r.clone());
+        copy(&mut self.delta_lfs, &src.delta_lfs, n, r.clone());
+        copy(&mut self.cdef_idx, &src.cdef_idx, n, r.clone());
+        for i in 0..2 {
+            copy(
+                &mut self.palette_sizes[i],
+                &src.palette_sizes[i],
+                n,
+                r.clone(),
+            );
+            copy(
+                &mut self.palette_colors[i],
+                &src.palette_colors[i],
+                n,
+                r.clone(),
+            );
+        }
+        for plane in 0..3 {
+            // `LoopfilterTxSizes` of a chroma plane is stored at the subsampled row.
+            let sy = if plane == 0 { 0 } else { self.subsampling_y };
+            let tx_rows = (r.start >> sy)..((r.end + sy) >> sy);
+            let (d, s) = (
+                &mut self.loopfilter_tx_sizes[plane],
+                &src.loopfilter_tx_sizes[plane],
+            );
+            copy(d, s, n, tx_rows);
+            let len = self.lr_type[plane].len();
+            copy(&mut self.lr_type[plane], &src.lr_type[plane], 1, 0..len);
+            copy(&mut self.lr_wiener[plane], &src.lr_wiener[plane], 1, 0..len);
+            copy(
+                &mut self.lr_sgr_set[plane],
+                &src.lr_sgr_set[plane],
+                1,
+                0..len,
+            );
+            copy(
+                &mut self.lr_sgr_xqd[plane],
+                &src.lr_sgr_xqd[plane],
+                1,
+                0..len,
+            );
         }
     }
 

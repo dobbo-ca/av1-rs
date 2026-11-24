@@ -25,7 +25,11 @@ is on, and the `LrFrame` planes (exact size); with more than one thread, per run
 its private band (rows or a column strip of a plane, docs/threading.md). The peak is
 `CurrFrame` + `CdefFrame` + up to two exact-size planes sets + the arrays (+ the bands of the
 running filter items); a frame over `max_alloc` fails with `AllocLimit` before the
-tile decode starts or at the wrapup, never after exceeding it. Film grain charges, per band of 32
+tile decode starts or at the wrapup, never after exceeding it. A frame of one tile with more
+than one thread is pipelined (docs/threading.md, "Row pipelining") and allocates its filter
+buffers before the tile decode starts, all at once: a second `CurrFrame` and mode info arrays
+(the copy the filters read), `CdefFrame` and every exact-size plane set, so its peak is about one
+`CurrFrame` and two to three exact-size plane sets above the serial one. Film grain charges, per band of 32
 luma rows while the band runs, its noise stripe and the one above it (34 rows of about `width + 34`
 `i32` per plane each) plus one row: at most one band per worker. Fixed-size tile state (the CDF
 copy, the colour maps, the coefficient and level buffers, about 27 KB per tile decoder) is not

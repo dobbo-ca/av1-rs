@@ -24,7 +24,10 @@ use crate::superres::{upscale, upscale_rows};
 use crate::tile::TileDecoder;
 use crate::{ColorInfo, Format, Frame, FrameInfo, Metadata, Options, Plane, PlaneData};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{
+    Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    TryLockError,
+};
 
 /// A frame whose header was read and whose tile groups are still coming.
 #[derive(Debug)]
@@ -768,7 +771,8 @@ impl Decoder {
 /// frame decodes them in order on the calling thread, since intra block copy reads other
 /// tiles), then each filter in row bands, column strips or stripes. Every stage writes disjoint
 /// samples and keeps the spec order where it matters, so the result is the same for every
-/// `max_threads` (docs/threading.md).
+/// `max_threads` (docs/threading.md). A frame of one tile is row pipelined: the filters of a
+/// band start as soon as the tile decode has finished the rows they read.
 fn decode_frame(
     mut fs: FrameState,
     ledger: &Arc<Ledger>,
@@ -788,7 +792,18 @@ fn decode_frame(
         let tile_cols = h.tile_info.tile_cols.max(1);
         for t in tiles {
             let (row, col) = (t.tile_num / tile_cols, t.tile_num % tile_cols);
-            decode_tile(&mut fs, &frame_cdf, data, t, row, col, h, seq, cancel)?;
+            decode_tile(
+                &mut fs,
+                &frame_cdf,
+                data,
+                t,
+                row,
+                col,
+                h,
+                seq,
+                cancel,
+                &mut |_, _| Ok(()),
+            )?;
         }
         fs.lr_frame = wrapup(&mut fs, seq, h, cancel)?;
         fs.frame_cdf = Some(frame_cdf);
@@ -810,12 +825,18 @@ fn decode_frame(
         up_cdef: RwLock::new(Vec::new()),
         up_curr: RwLock::new(Vec::new()),
         out: Mutex::new(Vec::new()),
+        shadow: RwLock::new(None),
+        progress: Mutex::new(Progress::default()),
+        moved: Condvar::new(),
     };
     let item: &(dyn Fn(Job, usize) -> Result<(), Error> + Sync) = &|job, i| w.item(job, i);
     let planes = with_team(threads, item, |team| w.lead(team))?;
-    let mut fs =
-        w.fs.into_inner()
-            .ok_or(Error::Invalid("frame decode left no state"))?;
+    let fs = match w.fs.into_inner() {
+        Some(fs) => Some(fs),
+        // The pipelined decode leaves the frame state where the tile decode wrote it.
+        None => w.tiles_fs.into_inner().unwrap_or_else(|e| e.into_inner()),
+    };
+    let mut fs = fs.ok_or(Error::Invalid("frame decode left no state"))?;
     fs.curr_frame = w.curr.into_inner().unwrap_or_else(|e| e.into_inner());
     fs.lr_frame = planes;
     fs.frame_cdf = Some(w.frame_cdf);
@@ -829,7 +850,8 @@ fn team_size(max_threads: usize, fs: &FrameState, tiles: usize) -> usize {
     max_threads.max(1).min(tiles.max(bands))
 }
 
-/// `decode_tile()` of tile `t` (tile row `row`, column `col` of `fs`'s tiling) into `fs`.
+/// `decode_tile()` of tile `t` (tile row `row`, column `col` of `fs`'s tiling) into `fs`,
+/// calling `row_done` after each superblock row ([`TileDecoder::decode_tile`]).
 fn decode_tile(
     fs: &mut FrameState,
     frame_cdf: &CdfContext,
@@ -840,12 +862,13 @@ fn decode_tile(
     h: &FrameHeader,
     seq: &SequenceHeader,
     cancel: &AtomicBool,
+    row_done: &mut dyn FnMut(&FrameState, usize) -> Result<(), Error>,
 ) -> Result<(), Error> {
     check_cancel(cancel)?;
     let bytes = data
         .get(t.start..t.end)
         .ok_or(Error::Invalid("tile data outside the temporal unit"))?;
-    TileDecoder::new(bytes, row, col, frame_cdf, fs, h, seq)?.decode_tile(cancel)?;
+    TileDecoder::new(bytes, row, col, frame_cdf, fs, h, seq)?.decode_tile(cancel, row_done)?;
     Ok(())
 }
 
@@ -853,6 +876,7 @@ fn decode_tile(
 #[derive(Debug, Clone, Copy)]
 enum Job {
     Tile,
+    Pipe,
     LfRows,
     LfCols,
     Cdef,
@@ -888,12 +912,28 @@ struct Wrap<'a> {
     up_curr: RwLock<Vec<WorkPlane>>,
     /// `LrFrame` (loop restoration only).
     out: Mutex<Vec<WorkPlane>>,
+    /// A pipelined frame (one tile): the mode info the filters read, a copy of the rows the
+    /// tile decode (which works in `tiles_fs`) has handed over.
+    shadow: RwLock<Option<FrameState>>,
+    /// A pipelined frame: the bands handed over and the filter tasks started and done.
+    progress: Mutex<Progress>,
+    /// Signalled when `progress` changes.
+    moved: Condvar,
 }
 
 impl Wrap<'_> {
     /// The stages, in the order of [`wrapup`] and with its allocations in the same order (the
     /// private bands of the items come on top). Returns `LrFrame`.
+    ///
+    /// A frame of one tile is pipelined instead: one stage ([`Job::Pipe`]) in which one thread
+    /// decodes the tile and the others filter the bands it has finished
+    /// ([`Wrap::pipe_decode`], [`Wrap::pipe_filter`]).
     fn lead(&self, team: &Team<'_, Job>) -> Result<Vec<WorkPlane>, Error> {
+        if self.tiles.len() == 1 {
+            self.pipe_start()?;
+            team.run(Job::Pipe, self.threads)?;
+            return self.pipe_output();
+        }
         let (h, seq, cancel) = (self.h, self.seq, self.cancel);
         if h.allow_intrabc || self.tiles.len() <= 1 {
             let mut g = lock(&self.tiles_fs);
@@ -903,7 +943,18 @@ impl Wrap<'_> {
             let tile_cols = h.tile_info.tile_cols.max(1);
             for t in self.tiles {
                 let (row, col) = (t.tile_num / tile_cols, t.tile_num % tile_cols);
-                decode_tile(fs, &self.frame_cdf, self.data, t, row, col, h, seq, cancel)?;
+                decode_tile(
+                    fs,
+                    &self.frame_cdf,
+                    self.data,
+                    t,
+                    row,
+                    col,
+                    h,
+                    seq,
+                    cancel,
+                    &mut |_, _| Ok(()),
+                )?;
             }
         } else {
             team.run(Job::Tile, self.tiles.len())?;
@@ -928,7 +979,7 @@ impl Wrap<'_> {
         if on {
             team.run(Job::Cdef, bands)?;
         }
-        let row_bands = fs.num_planes * fs.frame_height.div_ceil(64);
+        let row_bands = fs.num_planes * bands.max(1);
         if h.frame_width != h.upscaled_width {
             *write_lock(&self.up_cdef) = exact_planes(fs, None)?;
             team.run(Job::UpCdef, row_bands)?;
@@ -950,24 +1001,305 @@ impl Wrap<'_> {
 
     /// Item `i` of stage `job`:
     /// - `Tile`: tile `i` of `tiles`.
+    /// - `Pipe`: item 0 decodes the one tile, the others run filter tasks.
     /// - `LfRows`: the vertical edges of plane `i / bands`, row band `i % bands` (16 mode info
     ///   rows; the last band runs to the plane end).
     /// - `LfCols`: the horizontal edges of plane `i / strips`, column strip `i % strips`.
     /// - `Cdef`: row band `i` of every plane.
-    /// - `UpCdef`, `UpCurr`: plane `i / bands`, 64-row band `i % bands` of the plane.
+    /// - `UpCdef`, `UpCurr`: plane `i / bands`, row band `i % bands` of the plane.
     /// - `Lr`: plane `i / stripes`, stripe `i % stripes`.
     ///
     /// An index past the bands of its plane does nothing.
     fn item(&self, job: Job, i: usize) -> Result<(), Error> {
         match job {
             Job::Tile => self.tile(i),
-            Job::LfRows => self.lf_rows(i),
+            Job::Pipe if i == 0 => self.pipe_decode(),
+            Job::Pipe => self.pipe_filter(),
+            Job::LfRows => self.lf_rows(self.state()?, i),
             Job::LfCols => self.lf_cols(i),
-            Job::Cdef => self.cdef_band(i),
-            Job::UpCdef => self.upscale_band(&self.cdef, &self.up_cdef, i),
-            Job::UpCurr => self.upscale_band(&self.curr, &self.up_curr, i),
-            Job::Lr => self.lr_band(i),
+            Job::Cdef => self.cdef_band(self.state()?, i, true),
+            Job::UpCdef => self.upscale_band(self.state()?, &self.cdef, &self.up_cdef, i),
+            Job::UpCurr => self.upscale_band(self.state()?, &self.curr, &self.up_curr, i),
+            Job::Lr => self.lr_band(self.state()?, i),
         }
+    }
+
+    /// Allocates the buffers of a pipelined frame, all at once: the shadow state (whose planes
+    /// become the filtered `CurrFrame`), `CdefFrame`, `UpscaledCdefFrame`, `UpscaledCurrFrame`
+    /// (superres with loop restoration) and `LrFrame` (loop restoration), and sets up the
+    /// tasks.
+    fn pipe_start(&self) -> Result<(), Error> {
+        let (h, seq) = (self.h, self.seq);
+        let mut sh = FrameState::new(h, seq, self.ledger)?;
+        let curr = std::mem::take(&mut sh.curr_frame);
+        let cdef = cdef_planes(&curr, self.ledger)?;
+        let on = cdef_on(&sh, &curr, seq, h, &cdef);
+        *write_lock(&self.up_cdef) = exact_planes(&sh, None)?;
+        if h.uses_lr {
+            if h.frame_width != h.upscaled_width {
+                *write_lock(&self.up_curr) = exact_planes(&sh, None)?;
+            }
+            *lock(&self.out) = exact_planes(&sh, None)?;
+        }
+        *lock(&self.progress) = Progress::new(&sh, lf_on(h), h.uses_lr, on)?;
+        *write_lock(&self.curr) = curr;
+        *write_lock(&self.cdef) = cdef;
+        *write_lock(&self.shadow) = Some(sh);
+        Ok(())
+    }
+
+    /// `LrFrame` of a pipelined frame once every task is done: a plane without loop
+    /// restoration is the `UpscaledCdefFrame` plane, which its (empty) tasks did not copy.
+    fn pipe_output(&self) -> Result<Vec<WorkPlane>, Error> {
+        let mut up_cdef = std::mem::take(&mut *write_lock(&self.up_cdef));
+        if !self.h.uses_lr {
+            return Ok(up_cdef);
+        }
+        let mut out = std::mem::take(&mut *lock(&self.out));
+        let g = read_lock(&self.shadow);
+        let fs = g
+            .as_ref()
+            .ok_or(Error::Invalid("frame filters before the tiles"))?;
+        let curr = if self.h.frame_width != self.h.upscaled_width {
+            read_lock(&self.up_curr)
+        } else {
+            read_lock(&self.curr)
+        };
+        for (plane, (o, c)) in out.iter_mut().zip(up_cdef.iter_mut()).enumerate() {
+            let u = curr.get(plane).ok_or(Error::Invalid("plane missing"))?;
+            let size = exact_size(fs, plane);
+            if lr_plane(fs, self.seq, self.h, plane, [&*c, u], size).is_none() {
+                std::mem::swap(o, c);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Item 0 of a pipelined frame: decodes the tile into `tiles_fs` and, after each superblock
+    /// row, hands the bands it finished to the filters ([`Wrap::hand_over`]; when a filter
+    /// holds a lock it goes on and hands them over after the next row, waiting for the lock
+    /// then). Stops early, without an error of its own, when a filter task failed.
+    fn pipe_decode(&self) -> Result<(), Error> {
+        let abort = Abort {
+            w: self,
+            done: false,
+        };
+        let mut g = lock(&self.tiles_fs);
+        let fs = g
+            .as_mut()
+            .ok_or(Error::Invalid("frame decode without a frame state"))?;
+        let t = self
+            .tiles
+            .first()
+            .ok_or(Error::Invalid("tile index out of range"))?;
+        let (h, seq) = (self.h, self.seq);
+        let tile_cols = h.tile_info.tile_cols.max(1);
+        let (row, col) = (t.tile_num / tile_cols, t.tile_num % tile_cols);
+        let bands = fs.mi_rows.div_ceil(16).max(1);
+        let (mut given, mut missed, mut stopped) = (0, false, false);
+        let r = decode_tile(
+            fs,
+            &self.frame_cdf,
+            self.data,
+            t,
+            row,
+            col,
+            h,
+            seq,
+            self.cancel,
+            &mut |dec, end| {
+                let done = if end >= dec.mi_rows { bands } else { end / 16 };
+                if done > given {
+                    // After one miss it waits, so the filters lag at most one more row.
+                    missed = !self.hand_over(dec, given, done, missed);
+                    if !missed {
+                        given = done;
+                        lock(&self.progress).ready = done;
+                        self.moved.notify_all();
+                    }
+                }
+                if lock(&self.progress).failed {
+                    stopped = true;
+                    return Err(Error::Cancelled);
+                }
+                Ok(())
+            },
+        );
+        if stopped {
+            // The failed filter task's error is the frame's.
+            return Ok(());
+        }
+        r?;
+        if given < bands {
+            self.hand_over(fs, given, bands, true);
+        }
+        let mut p = lock(&self.progress);
+        p.ready = bands;
+        p.decoded = true;
+        drop(p);
+        abort.disarm();
+        Ok(())
+    }
+
+    /// Copies bands `from..to` (`from < to`) of the tile decode's state `dec` into the shared
+    /// state: the mode info rows into `shadow`, the samples into `CurrFrame`. With `wait` false
+    /// it does nothing and returns false when a filter holds either lock.
+    fn hand_over(&self, dec: &FrameState, from: usize, to: usize, wait: bool) -> bool {
+        let guards = if wait {
+            Some((write_lock(&self.shadow), write_lock(&self.curr)))
+        } else {
+            try_write(&self.shadow).zip(try_write(&self.curr))
+        };
+        let Some((mut sh, mut curr)) = guards else {
+            return false;
+        };
+        let bands = dec.mi_rows.div_ceil(16).max(1);
+        if let Some(sh) = sh.as_mut() {
+            sh.copy_rows(dec, 16 * from..(16 * to).min(dec.mi_rows));
+        }
+        for (plane, (d, s)) in curr.iter_mut().zip(&dec.curr_frame).enumerate() {
+            let (_, sy) = subsampling(dec, plane);
+            let y0 = band_rows(from, bands, sy, s.height).0;
+            let y1 = band_rows(to - 1, bands, sy, s.height).1;
+            if let (Some(d), Some(s)) = (
+                d.px.get_mut(y0 * d.stride..y1 * d.stride),
+                s.px.get(y0 * s.stride..y1 * s.stride),
+            ) && d.len() == s.len()
+            {
+                d.copy_from_slice(s);
+            }
+        }
+        true
+    }
+
+    /// Items 1.. of a pipelined frame: run filter tasks as they become ready, until every task
+    /// is done or a thread failed.
+    fn pipe_filter(&self) -> Result<(), Error> {
+        loop {
+            let task = {
+                let mut p = lock(&self.progress);
+                loop {
+                    if p.failed || p.complete() {
+                        return Ok(());
+                    }
+                    if let Some(t) = p.next() {
+                        p.running += 1;
+                        break t;
+                    }
+                    if p.decoded && p.running == 0 {
+                        // Cannot happen: every band is in, so some task is ready.
+                        p.failed = true;
+                        drop(p);
+                        self.moved.notify_all();
+                        return Err(Error::Invalid("frame filters stalled"));
+                    }
+                    p = self.moved.wait(p).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            let abort = Abort {
+                w: self,
+                done: false,
+            };
+            self.task(task)?;
+            lock(&self.progress).finish(task);
+            abort.disarm();
+        }
+    }
+
+    /// Runs filter task `t` of a pipelined frame on the shadow state's mode info.
+    fn task(&self, t: Task) -> Result<(), Error> {
+        let g = read_lock(&self.shadow);
+        let fs = g
+            .as_ref()
+            .ok_or(Error::Invalid("frame filters before the tiles"))?;
+        let bands = fs.mi_rows.div_ceil(16).max(1);
+        match t {
+            Task::V(plane, b) => self.lf_rows(fs, plane * bands + b),
+            Task::H(plane, b) => self.lf_band(fs, plane, b),
+            Task::C(b) => {
+                let on = lock(&self.progress).cdef;
+                self.cdef_band(fs, b, on)
+            }
+            Task::U(b) if self.h.frame_width == self.h.upscaled_width => self.copy_band(fs, b),
+            Task::U(b) => {
+                for plane in 0..fs.num_planes {
+                    let i = plane * bands + b;
+                    self.upscale_band(fs, &self.cdef, &self.up_cdef, i)?;
+                    if self.h.uses_lr {
+                        self.upscale_band(fs, &self.curr, &self.up_curr, i)?;
+                    }
+                }
+                Ok(())
+            }
+            Task::L(plane, n) => self.lr_band(fs, plane * stripes(fs) + n),
+        }
+    }
+
+    /// Horizontal edges of row band `b` of one plane, after those of the band above: an edge
+    /// reaches at most 7 rows above it, and none past the band's end (it sits at a multiple of
+    /// its filter size, which is at least its reach), so the band is copied with 8 rows above.
+    fn lf_band(&self, fs: &FrameState, plane: usize, b: usize) -> Result<(), Error> {
+        if plane >= fs.num_planes || !lf_plane_on(self.h, plane) {
+            return Ok(());
+        }
+        let bands = fs.mi_rows.div_ceil(16).max(1);
+        let (_, sy) = subsampling(fs, plane);
+        let (mut buf, y0, y1) = {
+            let curr = read_lock(&self.curr);
+            let p = curr.get(plane).ok_or(Error::Invalid("plane missing"))?;
+            let (top, y1) = band_rows(b, bands, sy, p.height);
+            let y0 = top.saturating_sub(8);
+            let mut buf = WorkPlane::new(p.stride, y1 - y0, self.ledger)?;
+            buf.px.copy_from_slice(rows_of(p, y0, y1)?);
+            (buf, y0, y1)
+        };
+        let rows = 16 * b..(16 * b + 16).min(fs.mi_rows);
+        let mut v = View {
+            stride: buf.stride,
+            px: buf.px.as_mut_slice(),
+            x0: 0,
+            y0,
+        };
+        loop_filter_rows(
+            fs,
+            self.h,
+            plane,
+            1,
+            rows,
+            0..fs.mi_cols,
+            &mut v,
+            self.cancel,
+        )?;
+        let mut curr = write_lock(&self.curr);
+        let p = curr.get_mut(plane).ok_or(Error::Invalid("plane missing"))?;
+        rows_of_mut(p, y0, y1)?.copy_from_slice(&buf.px);
+        Ok(())
+    }
+
+    /// `UpscaledCdefFrame` without superres: row band `b` of every plane of `CdefFrame`, cut
+    /// to the exact size.
+    fn copy_band(&self, fs: &FrameState, b: usize) -> Result<(), Error> {
+        let bands = fs.mi_rows.div_ceil(16).max(1);
+        let mut bufs = Vec::with_capacity(fs.num_planes);
+        {
+            let cdef = read_lock(&self.cdef);
+            for (plane, p) in cdef.iter().enumerate().take(fs.num_planes) {
+                let (w, ht) = exact_size(fs, plane);
+                let (_, sy) = subsampling(fs, plane);
+                let (y0, y1) = band_rows(b, bands, sy, ht);
+                let mut buf = WorkPlane::new(w, y1 - y0, self.ledger)?;
+                for (y, row) in (y0..y1).zip(buf.px.chunks_exact_mut(w.max(1))) {
+                    row.copy_from_slice(row_of(p, y, w)?);
+                }
+                bufs.push((buf, y0, y1));
+            }
+        }
+        let mut out = write_lock(&self.up_cdef);
+        for (plane, (buf, y0, y1)) in bufs.iter().enumerate() {
+            let p = out.get_mut(plane).ok_or(Error::Invalid("plane missing"))?;
+            rows_of_mut(p, *y0, *y1)?.copy_from_slice(&buf.px);
+        }
+        Ok(())
     }
 
     /// The frame state after the tile stage.
@@ -1001,6 +1333,7 @@ impl Wrap<'_> {
             h,
             seq,
             self.cancel,
+            &mut |_, _| Ok(()),
         )?;
         let sb_size = if seq.use_128x128_superblock { 128 } else { 64 };
         if let Some(fs) = lock(&self.tiles_fs).as_mut() {
@@ -1010,8 +1343,7 @@ impl Wrap<'_> {
     }
 
     /// Vertical edges of one row band: each edge filters samples of its own rows only.
-    fn lf_rows(&self, i: usize) -> Result<(), Error> {
-        let fs = self.state()?;
+    fn lf_rows(&self, fs: &FrameState, i: usize) -> Result<(), Error> {
         let bands = fs.mi_rows.div_ceil(16).max(1);
         let (plane, b) = (i / bands, i % bands);
         if plane >= fs.num_planes || !lf_plane_on(self.h, plane) {
@@ -1116,8 +1448,7 @@ impl Wrap<'_> {
 
     /// CDEF of one row band of 8x8 blocks, every plane: reads `CurrFrame` (also outside the
     /// band), writes the band's rows of `CdefFrame`.
-    fn cdef_band(&self, b: usize) -> Result<(), Error> {
-        let fs = self.state()?;
+    fn cdef_band(&self, fs: &FrameState, b: usize, on: bool) -> Result<(), Error> {
         let (h, seq) = (self.h, self.seq);
         let bands = fs.mi_rows.div_ceil(16).max(1);
         let curr = read_lock(&self.curr);
@@ -1132,7 +1463,8 @@ impl Wrap<'_> {
             buf.px.copy_from_slice(rows_of(p, y0, y1)?);
             bufs.push((buf, y0, y1));
         }
-        {
+        // With `on` false (CDEF off), the band stays the copy.
+        if on {
             let mut views: Vec<View<'_>> = bufs
                 .iter_mut()
                 .map(|(buf, y0, _)| View {
@@ -1154,15 +1486,16 @@ impl Wrap<'_> {
         Ok(())
     }
 
-    /// Superres of one 64-row band of one plane, from `src` into the exact-size planes `dst`.
+    /// Superres of one row band (64 luma rows) of one plane, from `src` into the exact-size
+    /// planes `dst`.
     fn upscale_band(
         &self,
+        fs: &FrameState,
         src: &RwLock<Vec<WorkPlane>>,
         dst: &RwLock<Vec<WorkPlane>>,
         i: usize,
     ) -> Result<(), Error> {
-        let fs = self.state()?;
-        let bands = fs.frame_height.div_ceil(64).max(1);
+        let bands = fs.mi_rows.div_ceil(16).max(1);
         let (plane, b) = (i / bands, i % bands);
         let input = read_lock(src);
         // `dst` has `num_planes` planes of `exact_size`.
@@ -1170,7 +1503,8 @@ impl Wrap<'_> {
             return Ok(());
         }
         let (w, ht) = exact_size(fs, plane);
-        let (y0, y1) = ((64 * b).min(ht), (64 * b + 64).min(ht));
+        let (_, sy) = subsampling(fs, plane);
+        let (y0, y1) = band_rows(b, bands, sy, ht);
         if y0 == y1 {
             return Ok(());
         }
@@ -1201,9 +1535,8 @@ impl Wrap<'_> {
 
     /// Loop restoration of one stripe of one plane: reads `UpscaledCdefFrame` and
     /// `UpscaledCurrFrame` (also outside the stripe), writes the stripe's rows of `LrFrame`.
-    fn lr_band(&self, i: usize) -> Result<(), Error> {
+    fn lr_band(&self, fs: &FrameState, i: usize) -> Result<(), Error> {
         check_cancel(self.cancel)?;
-        let fs = self.state()?;
         let ns = stripes(fs);
         let (plane, n) = (i / ns, i % ns);
         let cdef = read_lock(&self.up_cdef);
@@ -1239,6 +1572,208 @@ impl Wrap<'_> {
         let p = out.get_mut(plane).ok_or(Error::Invalid("plane missing"))?;
         rows_of_mut(p, y0, y1 + 1)?.copy_from_slice(&buf.px);
         Ok(())
+    }
+}
+
+/// A filter task of a pipelined frame, on row band `b` (64 luma rows) or stripe `n`:
+/// `V( plane, b )` and `H( plane, b )` the vertical and horizontal loop filter edges, `C( b )`
+/// CDEF (every plane), `U( b )` superres (or the exact-size copy), `L( plane, n )` loop
+/// restoration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Task {
+    V(usize, usize),
+    H(usize, usize),
+    C(usize),
+    U(usize),
+    L(usize, usize),
+}
+
+/// The tasks of one kind (and plane) of a pipelined frame, started in index order.
+#[derive(Debug, Default)]
+struct Lane {
+    /// Tasks started.
+    started: usize,
+    /// Tasks done from 0 on, without a gap.
+    prefix: usize,
+    done: Vec<bool>,
+}
+
+impl Lane {
+    fn new(n: usize) -> Result<Lane, Error> {
+        let mut done = Vec::new();
+        done.try_reserve_exact(n).map_err(|_| Error::OutOfMemory)?;
+        done.resize(n, false);
+        Ok(Lane {
+            started: 0,
+            prefix: 0,
+            done,
+        })
+    }
+
+    /// Starts the next task when `ready` (and one is left); returns its index.
+    fn take(&mut self, ready: bool) -> Option<usize> {
+        if !ready || self.started >= self.done.len() {
+            return None;
+        }
+        self.started += 1;
+        Some(self.started - 1)
+    }
+
+    fn finish(&mut self, i: usize) {
+        if let Some(d) = self.done.get_mut(i) {
+            *d = true;
+        }
+        while self.done.get(self.prefix) == Some(&true) {
+            self.prefix += 1;
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.prefix == self.done.len()
+    }
+}
+
+/// The progress of a pipelined frame (docs/threading.md, "Row pipelining"): the bands the tile
+/// decode has handed over, and the filter tasks. A task starts when what it reads is final:
+///
+/// - `V( p, b )`: band `b` handed over.
+/// - `H( p, b )`: `V( p, b )` and `H( p, b - 1 )` done (the edges of a plane go down in order).
+/// - `C( b )`: `H( p, b + 1 )` done for every plane (CDEF reads 2 rows below the band, which
+///   the edges at the top of the next band write); without the loop filter, band `b + 1`
+///   handed over.
+/// - `U( b )`: `C( b )` done.
+/// - `L( p, n )`: `U( 0 ..= n )` done (stripe `n` and the 2 rows below it lie in band `n`).
+#[derive(Debug, Default)]
+struct Progress {
+    /// Bands handed over by the tile decode.
+    ready: usize,
+    /// The tile decode is over and every band handed over.
+    decoded: bool,
+    /// A thread failed: no task starts any more.
+    failed: bool,
+    /// Tasks running.
+    running: usize,
+    /// CDEF filters (otherwise `C` only copies).
+    cdef: bool,
+    v: Vec<Lane>,
+    h: Vec<Lane>,
+    c: Lane,
+    u: Lane,
+    l: Vec<Lane>,
+}
+
+impl Progress {
+    /// The tasks of the frame of state `fs`: loop filter lanes with `lf`, loop restoration
+    /// lanes with `lr`.
+    fn new(fs: &FrameState, lf: bool, lr: bool, cdef: bool) -> Result<Progress, Error> {
+        let bands = fs.mi_rows.div_ceil(16).max(1);
+        let lanes = |planes: usize, n: usize| -> Result<Vec<Lane>, Error> {
+            (0..planes).map(|_| Lane::new(n)).collect()
+        };
+        let lf_planes = if lf { fs.num_planes } else { 0 };
+        Ok(Progress {
+            cdef,
+            v: lanes(lf_planes, bands)?,
+            h: lanes(lf_planes, bands)?,
+            c: Lane::new(bands)?,
+            u: Lane::new(bands)?,
+            l: lanes(if lr { fs.num_planes.min(3) } else { 0 }, stripes(fs))?,
+            ..Progress::default()
+        })
+    }
+
+    /// Starts a task whose inputs are final, the last stages first.
+    fn next(&mut self) -> Option<Task> {
+        let bands = self.c.done.len();
+        let up = self.u.prefix;
+        for (p, l) in self.l.iter_mut().enumerate() {
+            let ok = up >= (l.started + 1).min(bands);
+            if let Some(n) = l.take(ok) {
+                return Some(Task::L(p, n));
+            }
+        }
+        let ok = self.c.done.get(self.u.started) == Some(&true);
+        if let Some(b) = self.u.take(ok) {
+            return Some(Task::U(b));
+        }
+        let need = (self.c.started + 2).min(bands);
+        let ok = if self.h.is_empty() {
+            self.ready >= need
+        } else {
+            self.h.iter().all(|l| l.prefix >= need)
+        };
+        if let Some(b) = self.c.take(ok) {
+            return Some(Task::C(b));
+        }
+        for (p, (h, v)) in self.h.iter_mut().zip(&self.v).enumerate() {
+            let ok = v.prefix > h.started && h.prefix == h.started;
+            if let Some(b) = h.take(ok) {
+                return Some(Task::H(p, b));
+            }
+        }
+        for (p, v) in self.v.iter_mut().enumerate() {
+            let ok = v.started < self.ready;
+            if let Some(b) = v.take(ok) {
+                return Some(Task::V(p, b));
+            }
+        }
+        None
+    }
+
+    /// Marks task `t` done.
+    fn finish(&mut self, t: Task) {
+        self.running = self.running.saturating_sub(1);
+        let (lane, i) = match t {
+            Task::V(p, b) => (self.v.get_mut(p), b),
+            Task::H(p, b) => (self.h.get_mut(p), b),
+            Task::C(b) => (Some(&mut self.c), b),
+            Task::U(b) => (Some(&mut self.u), b),
+            Task::L(p, n) => (self.l.get_mut(p), n),
+        };
+        if let Some(lane) = lane {
+            lane.finish(i);
+        }
+    }
+
+    /// Every task done.
+    fn complete(&self) -> bool {
+        self.v
+            .iter()
+            .chain(&self.h)
+            .chain(&self.l)
+            .chain([&self.c, &self.u])
+            .all(Lane::complete)
+    }
+}
+
+/// Marks a pipelined frame failed when dropped before [`Abort::disarm`] (its thread returned
+/// an error or panicked), so no thread waits for a band or a task that will not come.
+struct Abort<'w, 'a> {
+    w: &'w Wrap<'a>,
+    done: bool,
+}
+
+impl Abort<'_, '_> {
+    fn disarm(mut self) {
+        self.done = true;
+    }
+}
+
+impl Drop for Abort<'_, '_> {
+    fn drop(&mut self) {
+        if !self.done {
+            lock(&self.w.progress).failed = true;
+        }
+        self.w.moved.notify_all();
+    }
+}
+
+/// The write lock of `l`, or `None` while another thread holds it.
+fn try_write<T>(l: &RwLock<T>) -> Option<RwLockWriteGuard<'_, T>> {
+    match l.try_write() {
+        Ok(g) => Some(g),
+        Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
     }
 }
 
@@ -1843,35 +2378,60 @@ mod tests {
         );
     }
 
-    /// A 192x128 4:2:0 frame header with 3 x 2 tiles of 64x64, loop restoration on, and the
-    /// bytes of its tiles: pseudo-random data, which the symbol decoder reads as some valid
-    /// syntax (or a syntax error, the same for every thread count).
-    fn six_tiles(seed: u64) -> (FrameHeader, Vec<u8>, Vec<TileRange>) {
-        let h = FrameHeader {
-            frame_width: 192,
-            frame_height: 128,
-            upscaled_width: 192,
-            mi_cols: 48,
-            mi_rows: 32,
+    /// A 4:2:0 frame header with every in-loop filter on (loop filter, CDEF, loop restoration)
+    /// and `cols` x `rows` tiles of 64x64 (`size` the upscaled width and the height), and the
+    /// bytes of its tiles: pseudo-random data, `bytes` per tile, which the symbol decoder reads
+    /// as some valid syntax (or a syntax error, the same for every thread count).
+    fn filtered_frame(
+        seed: u64,
+        (width, height): (u32, u32),
+        superres_denom: u32,
+        (cols, rows): (usize, usize),
+        bytes: usize,
+    ) -> (FrameHeader, Vec<u8>, Vec<TileRange>) {
+        let frame_width = (width * 8 + superres_denom / 2) / superres_denom;
+        let (mi_cols, mi_rows) = (2 * ((frame_width + 7) >> 3), 2 * ((height + 7) >> 3));
+        let starts = |n: usize, end: u32| {
+            let v: Vec<u32> = (0..n as u32).map(|i| 16 * i).chain([end]).collect();
+            crate::header::Starts::of(&v)
+        };
+        let mut h = FrameHeader {
+            frame_width,
+            frame_height: height,
+            upscaled_width: width,
+            use_superres: superres_denom != 8,
+            superres_denom,
+            mi_cols,
+            mi_rows,
             base_q_idx: 60,
             tx_mode: TX_MODE_SELECT,
+            loop_filter_level: [24, 18, 12, 9],
+            loop_filter_sharpness: 2,
+            cdef_damping: 4,
+            cdef_bits: 2,
             frame_restoration_type: [RESTORE_WIENER, RESTORE_SGRPROJ, RESTORE_SWITCHABLE],
             loop_restoration_size: [64, 32, 32],
             uses_lr: true,
             tile_info: crate::header::TileInfo {
-                tile_cols: 3,
-                tile_rows: 2,
-                mi_col_starts: crate::header::Starts::of(&[0, 16, 32, 48]),
-                mi_row_starts: crate::header::Starts::of(&[0, 16, 32]),
+                tile_cols: cols,
+                tile_rows: rows,
+                mi_col_starts: starts(cols, mi_cols),
+                mi_row_starts: starts(rows, mi_rows),
                 ..Default::default()
             },
             ..FrameHeader::default()
         };
+        for i in 0..4 {
+            h.cdef_y_pri_strength[i] = [0, 3, 7, 15][i];
+            h.cdef_y_sec_strength[i] = [1, 0, 2, 4][i];
+            h.cdef_uv_pri_strength[i] = [2, 0, 5, 9][i];
+            h.cdef_uv_sec_strength[i] = [0, 2, 1, 4][i];
+        }
         let mut x = seed | 1;
         let (mut data, mut tiles) = (Vec::new(), Vec::new());
-        for tile_num in 0..6 {
+        for tile_num in 0..cols * rows {
             let start = data.len();
-            for _ in 0..2000 {
+            for _ in 0..bytes {
                 x ^= x << 13;
                 x ^= x >> 7;
                 x ^= x << 17;
@@ -1886,6 +2446,18 @@ mod tests {
         (h, data, tiles)
     }
 
+    /// 192x128 in 3 x 2 tiles of 64x64, every filter on.
+    fn six_tiles(seed: u64) -> (FrameHeader, Vec<u8>, Vec<TileRange>) {
+        filtered_frame(seed, (192, 128), 8, (3, 2), 2000)
+    }
+
+    /// 200x136 (3 row bands) in one tile, every filter on; superres (denominator 12) for odd
+    /// seeds.
+    fn one_tile(seed: u64) -> (FrameHeader, Vec<u8>, Vec<TileRange>) {
+        let denom = if seed % 2 == 1 { 12 } else { 8 };
+        filtered_frame(seed, (200, 136), denom, (1, 1), 16_000)
+    }
+
     /// The tiles and the wrapup of `six_tiles( seed )` with `threads` threads and `max_alloc`; the ledger is
     /// returned to read its peak.
     fn run_tiles(
@@ -1893,12 +2465,34 @@ mod tests {
         threads: usize,
         max_alloc: usize,
     ) -> (Result<FrameState, Error>, Arc<Ledger>) {
-        let seq = SequenceHeader::parse(&still_sequence_header(), 0).unwrap();
-        let (h, data, tiles) = six_tiles(seed);
+        run_frame(six_tiles(seed), false, threads, max_alloc, &cancel())
+    }
+
+    /// The pipelined decode of `one_tile( seed )` (128x128 superblocks for seeds 2 and 3 mod 4)
+    /// with `threads` threads, `max_alloc` and `stop`.
+    fn run_one_tile(
+        seed: u64,
+        threads: usize,
+        max_alloc: usize,
+        stop: &AtomicBool,
+    ) -> (Result<FrameState, Error>, Arc<Ledger>) {
+        run_frame(one_tile(seed), seed % 4 >= 2, threads, max_alloc, stop)
+    }
+
+    /// [`decode_frame`] of a frame from [`filtered_frame`].
+    fn run_frame(
+        (h, data, tiles): (FrameHeader, Vec<u8>, Vec<TileRange>),
+        sb128: bool,
+        threads: usize,
+        max_alloc: usize,
+        stop: &AtomicBool,
+    ) -> (Result<FrameState, Error>, Arc<Ledger>) {
+        let mut seq = SequenceHeader::parse(&still_sequence_header(), 0).unwrap();
+        seq.use_128x128_superblock = sb128;
         let ledger = Arc::new(Ledger::default());
         ledger.reset(max_alloc, 0).unwrap();
         let r = FrameState::new(&h, &seq, &ledger)
-            .and_then(|fs| decode_frame(fs, &ledger, threads, &h, &seq, &data, &tiles, &cancel()));
+            .and_then(|fs| decode_frame(fs, &ledger, threads, &h, &seq, &data, &tiles, stop));
         (r, ledger)
     }
 
@@ -1961,6 +2555,102 @@ mod tests {
                     ledger.left(),
                     max_alloc.saturating_sub(crate::ledger::SMALL)
                 );
+            }
+        }
+    }
+
+    /// One tile with every filter on, superres and 128x128 superblocks by seed: the pipelined
+    /// decode with 2, 3 and 8 threads gives the state of 1 thread.
+    #[test]
+    fn pipelined_tile_decodes_the_same_for_every_thread_count() {
+        let mut decoded = 0;
+        for seed in 1..=8 {
+            let (serial, _) = run_one_tile(seed, 1, 64 << 20, &cancel());
+            for threads in [2, 3, 8] {
+                let (par, ledger) = run_one_tile(seed, threads, 64 << 20, &cancel());
+                match (&serial, &par) {
+                    (Ok(a), Ok(b)) => assert_same_state(a, b),
+                    (Err(a), Err(b)) => assert_eq!(a, b),
+                    _ => panic!("seed {seed}: serial and {threads} threads differ in Ok or Err"),
+                }
+                assert!(ledger.peak() <= 64 << 20);
+                drop(par);
+                assert_eq!(ledger.left(), (64 << 20) - crate::ledger::SMALL);
+            }
+            decoded += usize::from(serial.is_ok());
+        }
+        assert!(decoded > 0);
+    }
+
+    #[test]
+    fn pipelined_tile_stays_within_max_alloc() {
+        for max_alloc in [1024, 100 << 10, 300 << 10, 600 << 10, 1 << 20, 4 << 20] {
+            for threads in [1, 2, 3, 8] {
+                let (r, ledger) = run_one_tile(1, threads, max_alloc, &cancel());
+                assert!(ledger.peak() <= max_alloc as u64);
+                assert!(r.is_ok() || r.as_ref().err() != Some(&Error::OutOfMemory));
+                drop(r);
+                assert_eq!(
+                    ledger.left(),
+                    max_alloc.saturating_sub(crate::ledger::SMALL)
+                );
+            }
+        }
+    }
+
+    /// The task order of a pipelined frame: whatever order the bands come in and the tasks
+    /// finish, every task runs once and only after the tasks it reads from.
+    #[test]
+    fn pipeline_tasks_respect_their_inputs() {
+        let seq = SequenceHeader::parse(&still_sequence_header(), 0).unwrap();
+        let (h, _, _) = one_tile(0);
+        let ledger = Arc::new(Ledger::default());
+        ledger.reset(64 << 20, 0).unwrap();
+        let fs = FrameState::new(&h, &seq, &ledger).unwrap();
+        let bands = fs.mi_rows.div_ceil(16);
+        for (lf, lr) in [(true, true), (false, true), (true, false)] {
+            for lifo in [false, true] {
+                let mut p = Progress::new(&fs, lf, lr, true).unwrap();
+                let mut running: Vec<Task> = Vec::new();
+                let mut done: Vec<Task> = Vec::new();
+                while !p.complete() {
+                    while let Some(t) = p.next() {
+                        let last = bands - 1;
+                        let ok = match t {
+                            Task::V(_, b) => b < p.ready,
+                            Task::H(q, b) => {
+                                done.contains(&Task::V(q, b))
+                                    && (b == 0 || done.contains(&Task::H(q, b - 1)))
+                            }
+                            Task::C(b) if lf => (0..fs.num_planes)
+                                .all(|q| done.contains(&Task::H(q, (b + 1).min(last)))),
+                            Task::C(b) => p.ready > (b + 1).min(last),
+                            Task::U(b) => done.contains(&Task::C(b)),
+                            Task::L(_, n) => (0..=n.min(last)).all(|b| done.contains(&Task::U(b))),
+                        };
+                        assert!(ok, "{t:?} started before its inputs");
+                        running.push(t);
+                    }
+                    // Finish one task (the newest or the oldest), or hand over a band.
+                    let t = if lifo {
+                        running.pop()
+                    } else {
+                        (!running.is_empty()).then(|| running.remove(0))
+                    };
+                    match t {
+                        Some(t) => {
+                            p.finish(t);
+                            done.push(t);
+                        }
+                        None => {
+                            assert!(p.ready < bands, "stalled with every band in");
+                            p.ready += 1;
+                        }
+                    }
+                }
+                let lanes = if lf { 2 * fs.num_planes * bands } else { 0 };
+                let lr_tasks = if lr { fs.num_planes * stripes(&fs) } else { 0 };
+                assert_eq!(done.len(), lanes + 2 * bands + lr_tasks);
             }
         }
     }
@@ -2036,6 +2726,9 @@ mod tests {
             let fs = FrameState::new(&h, &seq, &ledger).unwrap();
             let stop = AtomicBool::new(true);
             let r = decode_frame(fs, &ledger, threads, &h, &seq, &data, &tiles, &stop);
+            assert_eq!(r.err(), Some(Error::Cancelled));
+            // One tile: the pipelined decode.
+            let (r, _) = run_one_tile(2, threads, 64 << 20, &stop);
             assert_eq!(r.err(), Some(Error::Cancelled));
         }
     }
