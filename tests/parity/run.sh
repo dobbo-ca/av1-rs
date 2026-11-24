@@ -1,9 +1,11 @@
 #!/bin/sh
 # Parity gates of av1-rs (docs/parity.md). CI only, called by .github/ci/Dockerfile; needs
-# av1-oracle (examples/oracle.rs), dav1d and aomdec on PATH and the corpus in /data (/data.list).
+# av1-oracle (examples/oracle.rs), av1-avifx, dav1d, aomdec, avifdec and avifdec-new on PATH and
+# the corpus in /data (/data.list).
 #   run.sh full <report-dir>   av1-rs vs dav1d (every stream), aomdec and the published per-frame
-#                              md5 (libaom vectors), --threads 1 vs default threads, and the
-#                              scalar and AVX2 SIMD tiers vs the best tier (AV1_SIMD)
+#                              md5 (libaom vectors), the AVIF files vs avifdec and avifdec-new,
+#                              --threads 1 vs default threads, and the scalar and AVX2 SIMD
+#                              tiers vs the best tier (AV1_SIMD)
 #   run.sh ref <out-dir>       av1-oracle, one thread, on the arm64 subset
 #   run.sh arm <ref-dir>       av1-oracle-arm64 under qemu on the same subset vs <ref-dir>
 #   run.sh seeds <dst>         the corpus as fuzz seeds, one option byte (0x00) appended
@@ -63,10 +65,36 @@ fsize() {
   esac
 }
 
+# avifcmp <avifdec> <work-dir>: the whole AVIF image $p (grid assembled, before irot/imir/clap)
+# against an avifdec (libavif with dav1d); its y4m minus the header and the one FRAME line is the
+# same layout as .yuv, plus the alpha plane when there is one. A failure goes to
+# $REP/<avifdec>-failed.txt, and fails the gate unless tests/parity/<avifdec>-known-failures.txt
+# lists it, so a libavif update cannot silently drop files from the comparison. Status 0 when
+# compared.
+avifcmp() {
+  "$1" --jobs 1 "$p" "$2/$s.y4m" >/dev/null 2>&1 || {
+    echo "$f" >> "$REP/$1-failed.txt"
+    grep -qxF "$f" "tests/parity/$1-known-failures.txt" \
+      || echo "$f: $1 failed, not in $1-known-failures.txt" >> $W/d-avif
+    return 1
+  }
+  hl=$(head -n 1 "$2/$s.y4m" | wc -c)
+  tail -c +$((hl + 7)) "$2/$s.y4m" > "$2/$s.yuv"
+  # - color_grid_alpha_nogrid: the alpha items hang on the grid tiles, not on the grid;
+  #   libavif >= 1.0 assembles them into an alpha plane, av1-rs returns none: color planes only.
+  case $1:$f in avifdec-new:*color_grid_alpha_nogrid.avif)
+    head -c "$(wc -c < $W/r1/$s.yuv)" "$2/$s.yuv" > "$2/$s.c" && mv "$2/$s.c" "$2/$s.yuv" ;;
+  esac
+  cat $W/r1/$s.yuv $W/r1/$s.alpha.yuv > "$2/$s.ours" 2>/dev/null
+  cmp -s "$2/$s.yuv" $W/r1/$s.yuv || cmp -s "$2/$s.yuv" "$2/$s.ours" \
+    || echo "$f: differs from $1: $(mismatch "$2/$s.yuv" $W/r1/$s.yuv $W/r1/$s.frames)" >> $W/d-avif
+  return 0
+}
+
 full() {
   REP=$1 bad=0
-  rm -rf $W; mkdir -p "$REP" $W/in $W/r1 $W/rn $W/dav $W/aom $W/avd
-  rm -f "$REP/avifdec-failed.txt"
+  rm -rf $W; mkdir -p "$REP" $W/in $W/r1 $W/rn $W/dav $W/aom $W/avd $W/avn
+  rm -f "$REP/avifdec-failed.txt" "$REP/avifdec-new-failed.txt"
   inputs $W/in
   # AVIF: every coded item (av1C config OBUs + item bytes) becomes a Section 5 stream in the same
   # directory, so dav1d and aomdec check the AV1 decode of each item (examples/avifx.rs).
@@ -86,7 +114,7 @@ full() {
     AV1_SIMD=$t av1-oracle $flag --threads 1 $W/in $W/t-$t || bad=1
   done
   : > $W/d-dav1d; : > $W/d-aom; : > $W/d-md5; : > $W/d-err; : > $W/d-avif
-  frames=0 cmpd=0 itemd=0 aomd=0 md5d=0 avifd=0
+  frames=0 cmpd=0 itemd=0 aomd=0 md5d=0 avifd=0 avnd=0
   for p in $W/in/*; do
     f=$(basename "$p"); s=$(stem "$f")
     if [ "$MODE" = info ]; then out=$W/r1/$s.info; else out=$W/r1/$s.frames; fi
@@ -99,37 +127,34 @@ full() {
     fi
     # Known oracle differences (docs/parity.md, "Known oracle differences"):
     # - libavif poc_* files are security reproducers (hostile input): fuzz seeds, no oracle.
-    # - *_tile_shared_in_dimg: an item used twice in dimg; av1-rs refuses it, as libavif >= 1.1.1.
-    # - *_reversed_dimg_order: libavif 0.11 ignores the dimg order (fixed in 1.1.1).
     case $f in libavif__poc_*) continue ;; esac
-    # - animated_alpha_sample_without_shown_frame: the alpha item has no shown frame; av1-rs
-    #   returns no alpha, libavif 0.11 outputs one: compared through its items only.
+    # - animated_alpha_sample_without_shown_frame: the second sample of the alpha track has no
+    #   shown frame; av1-rs returns no alpha, both avifdecs output one: compared through its
+    #   items only.
     if [ -f $W/r1/$s.err ] && [ "$(cat $W/r1/$s.err)" != inter ]; then
       case $f in
         *_tile_shared_in_dimg.avif) ;;
         *) echo "$f: av1-rs error $(cat $W/r1/$s.err) ($(cat $W/r1/$s.why 2>/dev/null)) after $N frames" >> $W/d-err ;;
       esac
     fi
+    # - *_tile_shared_in_dimg: an item used twice in dimg; av1-rs and avifdec-new (libavif >= 1.1.1)
+    #   must both refuse it.
+    case $f in *_tile_shared_in_dimg.avif)
+      [ -f $W/r1/$s.err ] || echo "$f: av1-rs decoded it, want a refusal" >> $W/d-err
+      avifdec-new --jobs 1 "$p" $W/avn/$s.y4m >/dev/null 2>&1 \
+        && echo "$f: avifdec-new decoded it, want a refusal as av1-rs" >> $W/d-avif
+      continue ;;
+    esac
     [ "$N" -gt 0 ] || continue
-    # The whole AVIF image (grid assembled, before irot/imir/clap) against avifdec (libavif with
-    # dav1d); its y4m minus the header and the one FRAME line is the same layout as .yuv, plus
-    # the alpha plane when there is one.
     case $f in *.avif)
-      case $f in *_reversed_dimg_order.avif|*animated_alpha_sample_without_shown_frame.avif) continue ;; esac
-      # A failure not in avifdec-known-failures.txt fails the gate, so a libavif update cannot
-      # silently drop files from the comparison.
-      avifdec --jobs 1 "$p" $W/avd/$s.y4m >/dev/null 2>&1 || {
-        echo "$f" >> "$REP/avifdec-failed.txt"
-        grep -qxF "$f" tests/parity/avifdec-known-failures.txt \
-          || echo "$f: avifdec failed, not in avifdec-known-failures.txt" >> $W/d-avif
-        continue
-      }
-      hl=$(head -n 1 $W/avd/$s.y4m | wc -c)
-      tail -c +$((hl + 7)) $W/avd/$s.y4m > $W/avd/$s.yuv
-      cat $W/r1/$s.yuv $W/r1/$s.alpha.yuv > $W/avd/$s.ours 2>/dev/null
-      cmp -s $W/avd/$s.yuv $W/r1/$s.yuv || cmp -s $W/avd/$s.yuv $W/avd/$s.ours \
-        || echo "$f: differs from avifdec: $(mismatch $W/avd/$s.yuv $W/r1/$s.yuv $W/r1/$s.frames)" >> $W/d-avif
-      avifd=$((avifd + 1))
+      case $f in *animated_alpha_sample_without_shown_frame.avif) continue ;; esac
+      # - *_reversed_dimg_order: libavif 0.11 ignores the dimg order (fixed in 1.1.1), so only
+      #   avifdec-new compares it.
+      case $f in
+        *_reversed_dimg_order.avif) ;;
+        *) avifcmp avifdec $W/avd && avifd=$((avifd + 1)) ;;
+      esac
+      avifcmp avifdec-new $W/avn && avnd=$((avnd + 1))
       continue ;;
     esac
     frames=$((frames + N))
@@ -176,15 +201,18 @@ full() {
   done
   # Floors: a gate that compared (almost) nothing must not pass. Pin these from a green run.
   # A listed avifdec failure that decoded after all is a stale entry.
-  while IFS= read -r k; do
-    grep -qxF "$k" "$REP/avifdec-failed.txt" 2>/dev/null \
-      || echo "$k: listed in avifdec-known-failures.txt but avifdec decoded it" >> $W/d-avif
-  done < tests/parity/avifdec-known-failures.txt
+  for o in avifdec avifdec-new; do
+    while IFS= read -r k; do
+      grep -qxF "$k" "$REP/$o-failed.txt" 2>/dev/null \
+        || echo "$k: listed in $o-known-failures.txt but $o decoded it" >> $W/d-avif
+    done < tests/parity/$o-known-failures.txt
+  done
   # Every real stream outputs at least its first key frame; the extracted AVIF items are counted
   # apart, so they cannot make up for missing streams.
   [ "$cmpd" -ge 289 ] || echo "only $cmpd streams compared against dav1d, want at least 289" >> $W/d-err
   [ "$itemd" -ge 238 ] || echo "only $itemd AVIF items compared against dav1d, want at least 238" >> $W/d-err
   [ "$avifd" -ge 133 ] || echo "only $avifd AVIF files compared against avifdec, want at least 133" >> $W/d-err
+  [ "$avnd" -ge 134 ] || echo "only $avnd AVIF files compared against avifdec-new, want at least 134" >> $W/d-err
   [ "$frames" -ge 604 ] || echo "only $frames frames compared against dav1d, want at least 604" >> $W/d-err
   diff -r $W/r1 $W/rn > $W/d-threads
   : > $W/d-tiers
@@ -192,7 +220,7 @@ full() {
   {
     echo "## av1-rs parity ($MODE)"
     echo
-    echo "$n inputs (streams, AVIF files and their extracted items), $frames frames compared; $cmpd streams and $itemd AVIF items vs dav1d, $aomd vs aomdec, $md5d vs the published md5, $avifd AVIF files vs avifdec."
+    echo "$n inputs (streams, AVIF files and their extracted items), $frames frames compared; $cmpd streams and $itemd AVIF items vs dav1d, $aomd vs aomdec, $md5d vs the published md5, $avifd AVIF files vs avifdec, $avnd vs avifdec-new."
     echo
     echo "| gate | result |"
     echo "|---|---|"
@@ -204,6 +232,7 @@ full() {
   done
   echo >> "$REP/summary.md"
   [ -f "$REP/avifdec-failed.txt" ] && echo "avifdec (libavif 0.11) could not decode $(wc -l < "$REP/avifdec-failed.txt") AVIF files; av1-rs output for them is checked through their items only (avifdec-failed.txt)." >> "$REP/summary.md"
+  [ -f "$REP/avifdec-new-failed.txt" ] && echo "avifdec-new (libavif 1.4.2) could not decode $(wc -l < "$REP/avifdec-new-failed.txt") AVIF files (avifdec-new-failed.txt)." >> "$REP/summary.md"
   echo "Stop classes (av1-rs .err, one thread): $(for e in $W/r1/*.err; do [ -f "$e" ] && printf '%s\n' "$(cat "$e")"; done | sort | uniq -c | tr -s ' \n' ' ')" >> "$REP/summary.md"
   cat "$REP/summary.md"
   return $bad

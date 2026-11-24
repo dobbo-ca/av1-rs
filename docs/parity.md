@@ -8,6 +8,12 @@ tools, never as crate dependencies (.github/ci/Dockerfile, stages `oracles`, `pa
 - aomdec 3.6.0 (bookworm `aom-tools`) on the libaom test vectors: `aomdec --rawvideo --limit=N`.
 - The per-frame md5 that libaom publishes with each test vector (`<vector>.md5`, one line per
   frame; 4:2:0 only, as the md5 always covers three planes).
+- avifdec 0.11.1 (bookworm `libavif-bin`, libavif with dav1d) on the AVIF files:
+  `avifdec --jobs 1 <file> <s>.y4m`.
+- avifdec-new: avifdec of libavif v1.4.2 (commit `c5240fc79fe5c2407e10afd35f5505ef6333ea49`),
+  built from github.com/AOMediaCodec/libavif in the Dockerfile stage `avifdec-new` with bookworm's
+  `libdav1d-dev` (dav1d 1.0.0) as its only codec, on the same AVIF files with the same command.
+  libavif 1.1.1 and later follow the `dimg` order and refuse an item used in two `dimg` boxes.
 
 `N` is the number of frames av1-rs outputs: the leading intra frames of a stream (a stream with
 inter frames stops at the first one with `Error::InterFrame`, class `inter`). Any other error on
@@ -44,7 +50,7 @@ no Matroska input; dav1d-test-data has the same streams as IVF).
 
 Last green run on `main` (a5cb385, 2026-11-23): 679 inputs, 604 frames; 289 streams and 238 AVIF items bit-exact against dav1d, 518 inputs against aomdec, 236 libaom vectors against the published md5, 133 AVIF files against avifdec; every gate green, `--threads 1` equal to the default threads, aarch64 equal to x86_64 on the subset.
 
-The `parity` job on `main` gates: 289 streams (240 libaom + 49 dav1d-test-data) against dav1d, and against aomdec and the published md5 where those apply, and 151 AVIF files against avifdec (libavif with dav1d; a file avifdec cannot decode must be listed in `tests/parity/avifdec-known-failures.txt`, and a listed file that decodes fails the gate as a stale entry) plus every coded item against dav1d and aomdec. `run.sh` fails the job if fewer than 289 streams or 151 AVIF files are present, or if fewer than 289 streams, 238 extracted AVIF items, 604 frames or 133 AVIF files were actually compared (items are counted apart from streams). The exact counts of compared frames, streams and files are the first lines of the job `summary.md`; the known differences are listed below. Pin the floors in `run.sh` from the latest green run.
+The `parity` job on `main` gates: 289 streams (240 libaom + 49 dav1d-test-data) against dav1d, and against aomdec and the published md5 where those apply, and 151 AVIF files against avifdec and avifdec-new (a file an avifdec cannot decode must be listed in `tests/parity/avifdec-known-failures.txt` or `tests/parity/avifdec-new-known-failures.txt`, and a listed file that decodes fails the gate as a stale entry) plus every coded item against dav1d and aomdec. `run.sh` fails the job if fewer than 289 streams or 151 AVIF files are present, or if fewer than 289 streams, 238 extracted AVIF items, 604 frames, 133 AVIF files against avifdec or 134 against avifdec-new were actually compared (items are counted apart from streams). The exact counts of compared frames, streams and files are the first lines of the job `summary.md`; the known differences are listed below. Pin the floors in `run.sh` from the latest green run.
 
 ## Known oracle differences
 
@@ -55,15 +61,26 @@ The `parity` job on `main` gates: 289 streams (240 libaom + 49 dav1d-test-data) 
 - Superres floor: like libaom and dav1d, the coded width is never below Min(16, UpscaledWidth),
   and superres applies only when the coded and upscaled widths differ (dav1d issue 322; the spec
   text has no floor).
-- AVIF (`avifdec` is libavif 0.11.1 from bookworm): `sofa_grid1x5_420_reversed_dimg_order`
-  is not compared with avifdec, because libavif before 1.1.1 ignores the `dimg` order (HEIF says
-  the `dimg` order is the tile order; av1-rs follows it). `color_grid_alpha_grid_tile_shared_in_dimg`
-  uses one tile item twice in `dimg`; av1-rs refuses it, as libavif 1.1.1 and later do. The
-  libavif `poc_*` files are security reproducers: fuzz seeds, not compared. When an image has
+- AVIF (`avifdec` is libavif 0.11.1 from bookworm, `avifdec-new` libavif 1.4.2):
+  `sofa_grid1x5_420_reversed_dimg_order` is compared with avifdec-new only, because libavif
+  before 1.1.1 ignores the `dimg` order (HEIF says the `dimg` order is the tile order; av1-rs and
+  libavif 1.1.1 follow it). `color_grid_alpha_grid_tile_shared_in_dimg` uses one tile item twice
+  in `dimg`: av1-rs and avifdec-new must both refuse it (a decode by either fails the gate).
+  The libavif `poc_*` files are security reproducers: fuzz seeds, not compared. When an image has
   alpha, avifdec's y4m holds the color planes then the alpha plane, so the gate compares it with
-  `.yuv` followed by `.alpha.yuv`.
+  `.yuv` followed by `.alpha.yuv`. Files an avifdec refuses and av1-rs decodes are listed in
+  `tests/parity/avifdec-known-failures.txt` (0.11.1) and `tests/parity/avifdec-new-known-failures.txt`
+  (1.4.2: `alpha_noispe`, refused by libavif's strict mode; `color_grid_alpha_grid_shared_tiles`,
+  a tile shared by two grids; `sofa_grid1x5_420_dimg_repeat`, a tile repeated in one grid; and
+  `clap_irot_imir_non_essential`, `pyramid_pymd`, `seine_sdr_gainmap_gammazero` and
+  `supported_gainmap_writer_version_with_extra_bytes`, which the corpus pin (libavif main, newer
+  than 1.4.2) has and 1.4.2 refuses; avifdec 0.11.1 decodes and matches them).
+  `color_grid_alpha_nogrid` has its alpha items on the grid tiles, not on the grid: libavif >= 1.0
+  assembles them into an alpha plane, av1-rs (isobmff-rs `Image::alpha`) and avifdec 0.11.1 return
+  none, so against avifdec-new only its color planes are compared.
 - The Xiph AVIF files are layered (`a1lx`, 2 or 3 spatial layers in one item): as with the
   `svc-L2*` streams, av1-rs and dav1d output the base layer and aomdec the top layer, so these
-  items are compared with dav1d only. `animated_alpha_sample_without_shown_frame`: its alpha item
-  has no shown frame; av1-rs returns no alpha plane and libavif 0.11 outputs one, so the file is
-  compared through its items only.
+  items are compared with dav1d only. `animated_alpha_sample_without_shown_frame`: the second
+  sample of its alpha track has no shown frame; av1-rs returns no alpha plane, while both
+  avifdecs decode the first frame of the track with its alpha plane, so the file is compared
+  through its items only.

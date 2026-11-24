@@ -67,11 +67,32 @@ RUN --mount=type=cache,id=av1-rs-target-arm64,sharing=locked,target=/src/target 
     && cargo test --locked --release --target aarch64-unknown-linux-gnu --lib \
     && AV1_SIMD=scalar cargo test --locked --release --target aarch64-unknown-linux-gnu --lib
 
-# The C oracles (CI only, never linked into the crate): dav1d 1.0.0 and aomdec 3.6.0 from
-# bookworm. Nothing of the crate is copied here, so a crate change does not rebuild it.
-FROM toolchain AS oracles
-RUN apt-get update && apt-get install -y --no-install-recommends dav1d aom-tools libavif-bin \
+# avifdec-new: libavif v1.4.2 (commit c5240fc79fe5) built from source, a second AVIF oracle that
+# follows the dimg order (libavif >= 1.1.1). Its only codec is bookworm's libdav1d-dev (dav1d
+# 1.0.0). The apps need libargparse at the pin of libavif's cmake/Modules/LocalLibargparse.cmake,
+# fetched into ext/ beside it; the build runs without network. Based on the rust image only
+# because that image is already pulled: nothing of the crate is copied.
+FROM rust:1.99.1-bookworm AS avifdec-new
+RUN apt-get update && apt-get install -y --no-install-recommends cmake libdav1d-dev libpng-dev libjpeg-dev zlib1g-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
+RUN git clone -q --depth 1 --branch v1.4.2 https://github.com/AOMediaCodec/libavif.git /libavif \
+    && test "$(git -C /libavif rev-parse HEAD)" = c5240fc79fe5c2407e10afd35f5505ef6333ea49 \
+    && git init -q /libavif/ext/libargparse \
+    && git -C /libavif/ext/libargparse fetch -q --depth 1 https://github.com/kmurray/libargparse.git ee74d1b53bd680748af14e737378de57e2a0a954 \
+    && git -C /libavif/ext/libargparse checkout -q FETCH_HEAD
+RUN --network=none cmake -S /libavif -B /libavif/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+       -DAVIF_CODEC_DAV1D=SYSTEM -DAVIF_LIBYUV=OFF -DAVIF_BUILD_APPS=ON \
+    && cmake --build /libavif/build --target avifdec -j"$(nproc)" \
+    && cp /libavif/build/avifdec /usr/local/bin/avifdec-new
+
+# The C oracles (CI only, never linked into the crate): dav1d 1.0.0, aomdec 3.6.0 and avifdec
+# 0.11.1 from bookworm, and avifdec-new (above; it needs the bookworm libdav1d6, libpng16-16 and
+# libjpeg62-turbo). Nothing of the crate is copied here, so a crate change does not rebuild it.
+FROM toolchain AS oracles
+RUN apt-get update && apt-get install -y --no-install-recommends dav1d aom-tools libavif-bin libdav1d6 libpng16-16 libjpeg62-turbo \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=avifdec-new /usr/local/bin/avifdec-new /usr/local/bin/avifdec-new
+RUN avifdec-new --version
 ENV CARGO_NET_OFFLINE=true
 
 # The public corpus (tests/parity/corpus.txt, every file checked against its pinned hash) in a
