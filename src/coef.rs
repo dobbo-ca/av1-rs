@@ -22,7 +22,7 @@ use crate::consts::*;
 use crate::error::Error;
 use crate::predict::{IntraEdges, IntraParams, predict_cfl, predict_intra, predict_palette};
 use crate::quant::{ac_q, dc_q};
-use crate::recon::{ReconParams, reconstruct};
+use crate::recon::{ReconParams, reconstruct_region};
 use crate::scan::get_scan;
 use crate::tables::{
     ADJUSTED_TX_SIZE, BLOCK_HEIGHT, BLOCK_WIDTH, MAX_TX_SIZE_RECT, MODE_TO_TXFM,
@@ -252,8 +252,8 @@ pub(crate) const QUANT_LEN: usize = 1024;
 
 /// Zero columns right of, and zero rows below, the levels of a transform block in
 /// `TileDecoder::levels` (dav1d's approach): the largest offset of `Sig_Ref_Diff_Offset`
-/// (spec 9.3), so the context reads of `coeff_base_ctx` and `coeff_br_ctx` stay inside the
-/// padded block and read zero where the spec skips a position outside the block.
+/// (spec 9.3), so the context reads of `LevelCtx::base_ctx` and `LevelCtx::br_ctx` stay inside
+/// the padded block and read zero where the spec skips a position outside the block.
 const TX_PAD: usize = 4;
 
 /// The padded levels of the largest coded area (32x32).
@@ -309,61 +309,110 @@ fn coeff_base_eob_ctx(tx_sz: usize, c: usize) -> usize {
     }
 }
 
-/// `get_coeff_base_ctx( txSz, plane, x4, y4, pos, c, 0 )` (spec 9.3, `coeff_base`) for a
-/// transform class `tx_class` at (`row`, `col`). `levels` holds the levels decoded so far,
-/// padded (row stride `stride`, see [`TX_PAD`]).
-fn coeff_base_ctx(
-    levels: &[u8],
+/// The per-block setup of the `coeff_base` and `coeff_br` contexts (spec 9.3): the layout of
+/// the padded levels (see [`TX_PAD`]) and the neighbour offsets of the transform class as flat
+/// indices, so the coefficient loop does no table lookups for them.
+struct LevelCtx {
+    /// `bwl`: log2 of the coded width.
+    bwl: usize,
+    /// The row stride of the padded levels.
     stride: usize,
-    tx_sz: usize,
     tx_class: usize,
-    row: usize,
-    col: usize,
-) -> usize {
-    let i = row * stride + col;
-    let mag: usize = SIG_REF_DIFF_OFFSET[tx_class]
-        .iter()
-        .map(|off| usize::from(levels[i + off[0] * stride + off[1]].min(3)))
-        .sum();
-    let ctx = ((mag + 1) >> 1).min(4);
-    if tx_class == TX_CLASS_2D {
-        if row == 0 && col == 0 {
-            return 0;
-        }
-        return ctx + usize::from(COEFF_BASE_CTX_OFFSET[tx_sz][row.min(4)][col.min(4)]);
-    }
-    let idx = if tx_class == TX_CLASS_VERT { row } else { col };
-    ctx + COEFF_BASE_POS_CTX_OFFSET[idx.min(2)]
+    /// `Sig_Ref_Diff_Offset[ txClass ]` as offsets into the levels.
+    base_offs: [usize; 5],
+    /// `Mag_Ref_Offset_With_Tx_Class[ txClass ]` as offsets into the levels.
+    br_offs: [usize; 3],
+    /// `Coeff_Base_Ctx_Offset[ txSz ]`.
+    base_ctx_offset: [[u8; 5]; 5],
 }
 
-/// The `ctx` of `coeff_br` (spec 9.3) at (`row`, `col`), from the padded `levels` as for
-/// [`coeff_base_ctx`].
-fn coeff_br_ctx(levels: &[u8], stride: usize, tx_class: usize, row: usize, col: usize) -> usize {
-    let i = row * stride + col;
-    let mag: usize = MAG_REF_OFFSET_WITH_TX_CLASS[tx_class]
-        .iter()
-        .map(|off| {
-            usize::from(
-                levels[i + off[0] * stride + off[1]]
-                    .min((COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1) as u8),
-            )
-        })
-        .sum();
-    let mag = ((mag + 1) >> 1).min(6);
-    if row == 0 && col == 0 {
-        mag
-    } else if tx_class == TX_CLASS_2D {
-        if row < 2 && col < 2 {
+impl LevelCtx {
+    fn new(tx_sz: usize, tx_class: usize) -> LevelCtx {
+        let bwl = TX_WIDTH_LOG2[ADJUSTED_TX_SIZE[tx_sz]];
+        let stride = (1 << bwl) + TX_PAD;
+        LevelCtx {
+            bwl,
+            stride,
+            tx_class,
+            base_offs: SIG_REF_DIFF_OFFSET[tx_class].map(|o| o[0] * stride + o[1]),
+            br_offs: MAG_REF_OFFSET_WITH_TX_CLASS[tx_class].map(|o| o[0] * stride + o[1]),
+            base_ctx_offset: COEFF_BASE_CTX_OFFSET[tx_sz],
+        }
+    }
+
+    /// `get_coeff_base_ctx( txSz, plane, x4, y4, pos, c, 0 )` (spec 9.3, `coeff_base`) at
+    /// (`row`, `col`). `levels` holds the levels decoded so far, padded.
+    fn base_ctx(&self, levels: &[u8], row: usize, col: usize) -> usize {
+        let i = row * self.stride + col;
+        let mag: usize = self
+            .base_offs
+            .iter()
+            .map(|&o| usize::from(levels[i + o].min(3)))
+            .sum();
+        let ctx = ((mag + 1) >> 1).min(4);
+        if self.tx_class == TX_CLASS_2D {
+            if row == 0 && col == 0 {
+                return 0;
+            }
+            return ctx + usize::from(self.base_ctx_offset[row.min(4)][col.min(4)]);
+        }
+        let idx = if self.tx_class == TX_CLASS_VERT {
+            row
+        } else {
+            col
+        };
+        ctx + COEFF_BASE_POS_CTX_OFFSET[idx.min(2)]
+    }
+
+    /// The `ctx` of `coeff_br` (spec 9.3) at (`row`, `col`), from the padded `levels` as for
+    /// [`LevelCtx::base_ctx`].
+    fn br_ctx(&self, levels: &[u8], row: usize, col: usize) -> usize {
+        let i = row * self.stride + col;
+        let mag: usize = self
+            .br_offs
+            .iter()
+            .map(|&o| {
+                usize::from(levels[i + o].min((COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1) as u8))
+            })
+            .sum();
+        let mag = ((mag + 1) >> 1).min(6);
+        if row == 0 && col == 0 {
+            mag
+        } else if self.tx_class == TX_CLASS_2D {
+            if row < 2 && col < 2 {
+                mag + 7
+            } else {
+                mag + 14
+            }
+        } else if self.tx_class == TX_CLASS_HORIZ {
+            if col == 0 { mag + 7 } else { mag + 14 }
+        } else if row == 0 {
             mag + 7
         } else {
             mag + 14
         }
-    } else if tx_class == TX_CLASS_HORIZ {
-        if col == 0 { mag + 7 } else { mag + 14 }
-    } else if row == 0 {
-        mag + 7
-    } else {
-        mag + 14
+    }
+}
+
+/// The entries `start..start + n` of an above or left context array that lie inside the plane
+/// (index below `max`): the positions the spec's context loops visit.
+fn ctx_run(v: &[u8], start: usize, n: usize, max: usize) -> &[u8] {
+    v.get(start..start + n.min(max.saturating_sub(start)))
+        .unwrap_or_default()
+}
+
+/// The `ctx` of `dc_sign` (spec 9.3) from the in-plane runs of `AboveDcContext` and
+/// `LeftDcContext`.
+fn dc_sign_ctx_of(above: &[u8], left: &[u8]) -> usize {
+    let dc_sign: i32 = above
+        .iter()
+        .chain(left)
+        .map(|&s| i32::from(s == 2) - i32::from(s == 1))
+        .sum();
+    match dc_sign {
+        ..0 => 1,
+        0 => 0,
+        _ => 2,
     }
 }
 
@@ -657,36 +706,43 @@ impl TileDecoder<'_> {
         }
 
         if !self.skip {
-            let (eob, plane_tx_type) = self.coeffs(plane, start_x, start_y, tx_sz)?;
+            let (eob, plane_tx_type, region) = self.coeffs(plane, start_x, start_y, tx_sz)?;
             if eob > 0 {
-                self.reconstruct_block(plane, start_x, start_y, tx_sz, plane_tx_type);
+                self.reconstruct_block(plane, start_x, start_y, tx_sz, plane_tx_type, region);
             }
         }
 
         let mi_cols = self.fs.mi_cols;
-        let mi_rows = self.fs.mi_rows;
-        for i in 0..step_y {
-            for j in 0..step_x {
-                let (r, c) = ((row >> sub_y) + i, (col >> sub_x) + j);
-                if r < mi_rows
-                    && c < mi_cols
-                    && let Some(v) = self.fs.loopfilter_tx_sizes[plane].get_mut(r * mi_cols + c)
-                {
-                    *v = tx_sz as u8;
-                }
-                self.set_block_decoded(
-                    plane,
-                    sub_block_mi_row + i as i32,
-                    sub_block_mi_col + j as i32,
-                    true,
-                );
-            }
+        let (r0, c0) = (row >> sub_y, col >> sub_x);
+        let rows = step_y.min(self.fs.mi_rows.saturating_sub(r0));
+        let cols = step_x.min(mi_cols.saturating_sub(c0));
+        fill_rows(
+            &mut self.fs.loopfilter_tx_sizes[plane],
+            mi_cols,
+            r0,
+            c0,
+            rows,
+            cols,
+            tx_sz as u8,
+        );
+        // BlockDecoded[ plane ][ y ][ x ] is stored at [ y + 1 ][ x + 1 ] (set_block_decoded);
+        // the subblock position is not negative.
+        let (bd_row, bd_col) = (sub_block_mi_row as usize + 1, sub_block_mi_col as usize + 1);
+        for r in self.block_decoded[plane]
+            .iter_mut()
+            .skip(bd_row)
+            .take(step_y)
+        {
+            let end = (bd_col + step_x).min(r.len());
+            r[bd_col.min(end)..end].fill(true);
         }
         Ok(())
     }
 
     /// The call of the reconstruction process (spec 7.12.3) with `get_dc_quant( plane )` and
-    /// `get_ac_quant( plane )` (spec 7.12.2), on `self.quant`.
+    /// `get_ac_quant( plane )` (spec 7.12.2), on `self.quant` whose nonzero entries lie in the
+    /// coded `region` (rows, columns) that `coeffs` returned. `self.quant` is all zero again
+    /// afterwards, as `coeffs` expects for the next transform block.
     fn reconstruct_block(
         &mut self,
         plane: usize,
@@ -694,6 +750,7 @@ impl TileDecoder<'_> {
         start_y: usize,
         tx_sz: usize,
         plane_tx_type: usize,
+        region: (usize, usize),
     ) {
         let fh = self.fh;
         let bit_depth = u32::from(self.seq.bit_depth);
@@ -719,16 +776,21 @@ impl TileDecoder<'_> {
             bit_depth,
         };
         let fp = &mut self.fs.curr_frame[plane];
-        reconstruct(
+        reconstruct_region(
             &mut fp.px,
             fp.stride,
             start_x,
             start_y,
             &p,
             &self.quant[..],
+            region,
             &mut self.itx,
             crate::simd::best(),
         );
+        let tw = 1 << TX_WIDTH_LOG2[ADJUSTED_TX_SIZE[tx_sz]];
+        for row in self.quant.chunks_exact_mut(tw).take(region.0) {
+            row[..region.1].fill(0);
+        }
     }
 
     /// `get_filter_type( plane )` (spec 7.11.2.8).
@@ -943,21 +1005,11 @@ impl TileDecoder<'_> {
         let bsize = self.get_plane_residual_size(self.mi_size, plane);
         let bw = BLOCK_WIDTH[bsize];
         let bh = BLOCK_HEIGHT[bsize];
-        let above_level = &self.above_level_context[plane];
-        let left_level = &self.left_level_context[plane];
+        let above_level = ctx_run(&self.above_level_context[plane], x4, w4, max_x4);
+        let left_level = ctx_run(&self.left_level_context[plane], y4, h4, max_y4);
         if plane == 0 {
-            let mut top = 0u8;
-            let mut left = 0u8;
-            for k in 0..w4 {
-                if x4 + k < max_x4 {
-                    top = top.max(above_level[x4 + k]);
-                }
-            }
-            for k in 0..h4 {
-                if y4 + k < max_y4 {
-                    left = left.max(left_level[y4 + k]);
-                }
-            }
+            let top = above_level.iter().copied().max().unwrap_or(0);
+            let left = left_level.iter().copied().max().unwrap_or(0);
             if bw == w && bh == h {
                 0
             } else if top == 0 && left == 0 {
@@ -972,20 +1024,11 @@ impl TileDecoder<'_> {
                 6
             }
         } else {
-            let above_dc = &self.above_dc_context[plane];
-            let left_dc = &self.left_dc_context[plane];
-            let mut above = 0u8;
-            let mut left = 0u8;
-            for i in 0..w4 {
-                if x4 + i < max_x4 {
-                    above |= above_level[x4 + i] | above_dc[x4 + i];
-                }
-            }
-            for i in 0..h4 {
-                if y4 + i < max_y4 {
-                    left |= left_level[y4 + i] | left_dc[y4 + i];
-                }
-            }
+            let above_dc = ctx_run(&self.above_dc_context[plane], x4, w4, max_x4);
+            let left_dc = ctx_run(&self.left_dc_context[plane], y4, h4, max_y4);
+            let or = |a: &[u8], b: &[u8]| a.iter().chain(b).fold(0u8, |acc, &v| acc | v);
+            let above = or(above_level, above_dc);
+            let left = or(left_level, left_dc);
             let mut ctx = usize::from(above != 0) + usize::from(left != 0) + 7;
             if bw * bh > w * h {
                 ctx += 3;
@@ -999,33 +1042,20 @@ impl TileDecoder<'_> {
         let (sub_x, sub_y) = self.plane_subsampling(plane);
         let max_x4 = self.fs.mi_cols >> sub_x;
         let max_y4 = self.fs.mi_rows >> sub_y;
-        let mut dc_sign = 0i32;
-        let mut count = |sign: u8| {
-            if sign == 1 {
-                dc_sign -= 1;
-            } else if sign == 2 {
-                dc_sign += 1;
-            }
-        };
-        for k in 0..w4 {
-            if x4 + k < max_x4 {
-                count(self.above_dc_context[plane][x4 + k]);
-            }
-        }
-        for k in 0..h4 {
-            if y4 + k < max_y4 {
-                count(self.left_dc_context[plane][y4 + k]);
-            }
-        }
-        match dc_sign {
-            ..0 => 1,
-            0 => 0,
-            _ => 2,
-        }
+        dc_sign_ctx_of(
+            ctx_run(&self.above_dc_context[plane], x4, w4, max_x4),
+            ctx_run(&self.left_dc_context[plane], y4, h4, max_y4),
+        )
     }
 
     /// Spec 5.11.39 `coeffs( plane, startX, startY, txSz )`: fills `self.quant` (the spec's
-    /// `Quant[ ]`) and the above / left level and dc contexts. Returns `eob` and `PlaneTxType`.
+    /// `Quant[ ]`) and the above / left level and dc contexts. Returns `eob`, `PlaneTxType` and
+    /// the coded region of `Quant[ ]` (rows, columns; see `recon::reconstruct_region`).
+    ///
+    /// `self.quant` and `self.levels` are all zero on entry (they start zeroed and only ever
+    /// hold one transform block): the levels are cleared here as the sign loop reads them, and
+    /// `Quant[ ]` by `reconstruct_block` (it is only read by the reconstruction of a block with
+    /// eob > 0), so no block clears the whole arrays.
     ///
     /// # Errors
     /// `Invalid` when `golomb_length_bit` is 0 at `length` 20 (spec 6.10.35 conformance).
@@ -1035,7 +1065,7 @@ impl TileDecoder<'_> {
         start_x: usize,
         start_y: usize,
         tx_sz: usize,
-    ) -> Result<(usize, usize), Error> {
+    ) -> Result<(usize, usize, (usize, usize)), Error> {
         let x4 = start_x >> 2;
         let y4 = start_y >> 2;
         let w4 = TX_WIDTH[tx_sz] >> 2;
@@ -1047,6 +1077,8 @@ impl TileDecoder<'_> {
         let mut cul_level = 0u32;
         let mut dc_category = 0u8;
         let mut plane_tx_type = DCT_DCT;
+        // The coded region: the last nonzero row and column of Quant[ ], plus 1 (at least 1).
+        let (mut rows, mut cols) = (1, 1);
 
         let ctx = self.all_zero_ctx(plane, x4, y4, tx_sz);
         let all_zero = self
@@ -1106,38 +1138,30 @@ impl TileDecoder<'_> {
                 }
             }
 
-            // Quant[ ] is only read by the reconstruction of a block with eob > 0, so it is
-            // cleared only here.
-            let seg_eob = if tx_sz == TX_16X64 || tx_sz == TX_64X16 {
-                512
-            } else {
-                (TX_WIDTH[tx_sz] * TX_HEIGHT[tx_sz]).min(QUANT_LEN)
-            };
-            self.quant[..seg_eob].fill(0);
-            // The coded area, as `Quant[ ]` is laid out, with TX_PAD zero columns and rows.
-            let adj = ADJUSTED_TX_SIZE[tx_sz];
-            let bwl = TX_WIDTH_LOG2[adj];
-            let stride = (1 << bwl) + TX_PAD;
-            self.levels[..(TX_HEIGHT[adj] + TX_PAD) * stride].fill(0);
-
-            for c in (0..eob).rev() {
-                let pos = usize::from(*scan.get(c).ok_or(Error::Invalid("eob beyond the scan"))?);
-                let row = pos >> bwl;
-                let col = pos - (row << bwl);
+            // The first symbol read below is at scan index eob - 1, so refusing a too long eob
+            // here reads the same symbols as refusing it there.
+            let scan = scan
+                .get(..eob)
+                .ok_or(Error::Invalid("eob beyond the scan"))?;
+            // The per-tx-size setup, hoisted out of the coefficient loops.
+            let lc = LevelCtx::new(tx_sz, tx_class);
+            let eob_cdf = &mut self.cdf.coeff_base_eob_cdf[tx_sz_ctx][ptype]
+                [coeff_base_eob_ctx(tx_sz, eob - 1)];
+            let base_cdfs = &mut self.cdf.coeff_base_cdf[tx_sz_ctx][ptype];
+            let br_cdfs = &mut self.cdf.coeff_br_cdf[tx_sz_ctx.min(TX_32X32)][ptype];
+            let levels = &mut self.levels[..];
+            for (c, &pos) in scan.iter().enumerate().rev() {
+                let pos = usize::from(pos);
+                let row = pos >> lc.bwl;
+                let col = pos - (row << lc.bwl);
                 let mut level = if c == eob - 1 {
-                    let ctx = coeff_base_eob_ctx(tx_sz, c);
-                    self.sd
-                        .read_symbol(&mut self.cdf.coeff_base_eob_cdf[tx_sz_ctx][ptype][ctx])
-                        + 1
+                    self.sd.read_symbol(&mut eob_cdf[..]) + 1
                 } else {
-                    let ctx = coeff_base_ctx(&self.levels[..], stride, tx_sz, tx_class, row, col);
                     self.sd
-                        .read_symbol(&mut self.cdf.coeff_base_cdf[tx_sz_ctx][ptype][ctx])
+                        .read_symbol(&mut base_cdfs[lc.base_ctx(levels, row, col)])
                 };
                 if level > NUM_BASE_LEVELS {
-                    let ctx = coeff_br_ctx(&self.levels[..], stride, tx_class, row, col);
-                    let br_cdf: &mut [u16] =
-                        &mut self.cdf.coeff_br_cdf[tx_sz_ctx.min(TX_32X32)][ptype][ctx];
+                    let br_cdf: &mut [u16] = &mut br_cdfs[lc.br_ctx(levels, row, col)];
                     for _ in 0..COEFF_BASE_RANGE / (BR_CDF_SIZE - 1) {
                         let coeff_br = self.sd.read_symbol(br_cdf);
                         level += coeff_br;
@@ -1147,17 +1171,26 @@ impl TileDecoder<'_> {
                     }
                 }
                 // At most NUM_BASE_LEVELS + 1 + COEFF_BASE_RANGE = 15.
-                self.levels[row * stride + col] = level as u8;
+                levels[row * lc.stride + col] = level as u8;
             }
 
-            for c in 0..eob {
-                let pos = usize::from(scan[c]);
-                let mut q = i32::from(self.levels[pos + (pos >> bwl) * TX_PAD]);
+            // Reads no symbol, so it can run before the loop that needs it.
+            let dc_ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
+            let levels = &mut self.levels[..];
+            let quant = &mut self.quant[..];
+            for (c, &pos) in scan.iter().enumerate() {
+                let pos = usize::from(pos);
+                let row = pos >> lc.bwl;
+                let li = pos + row * TX_PAD;
+                let mut q = i32::from(levels[li]);
+                levels[li] = 0;
                 let mut sign = false;
                 if q != 0 {
                     if c == 0 {
-                        let ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
-                        sign = self.sd.read_symbol(&mut self.cdf.dc_sign_cdf[ptype][ctx]) != 0;
+                        sign = self
+                            .sd
+                            .read_symbol(&mut self.cdf.dc_sign_cdf[ptype][dc_ctx])
+                            != 0;
                     } else {
                         sign = self.sd.read_literal(1) != 0;
                     }
@@ -1170,6 +1203,9 @@ impl TileDecoder<'_> {
                             break;
                         }
                         if length == 20 {
+                            // Back to all zero for the next tile decoder that reuses them.
+                            levels.fill(0);
+                            quant.fill(0);
                             return Err(Error::Invalid("golomb_length_bit"));
                         }
                     }
@@ -1184,7 +1220,11 @@ impl TileDecoder<'_> {
                 }
                 q &= 0xFFFFF;
                 cul_level += q as u32;
-                self.quant[pos] = if sign { -q } else { q };
+                if q != 0 {
+                    rows = rows.max(row + 1);
+                    cols = cols.max(pos - (row << lc.bwl) + 1);
+                }
+                quant[pos] = if sign { -q } else { q };
             }
             cul_level = cul_level.min(63);
         }
@@ -1194,7 +1234,7 @@ impl TileDecoder<'_> {
         set_ctx(&mut self.above_dc_context[plane], x4, w4, dc_category);
         set_ctx(&mut self.left_level_context[plane], y4, h4, cul_level);
         set_ctx(&mut self.left_dc_context[plane], y4, h4, dc_category);
-        Ok((eob, plane_tx_type))
+        Ok((eob, plane_tx_type, (rows, cols)))
     }
 }
 
@@ -1293,12 +1333,12 @@ mod tests {
                     for pos in 0..w * h {
                         let (row, col) = (pos >> bwl, pos & (w - 1));
                         assert_eq!(
-                            coeff_base_ctx(&levels, stride, tx_sz, tx_class, row, col),
+                            LevelCtx::new(tx_sz, tx_class).base_ctx(&levels, row, col),
                             coeff_base_ctx_oracle(&q, tx_sz, tx_class, pos),
                             "tx_sz {tx_sz} class {tx_class} pos {pos}"
                         );
                         assert_eq!(
-                            coeff_br_ctx(&levels, stride, tx_class, row, col),
+                            LevelCtx::new(tx_sz, tx_class).br_ctx(&levels, row, col),
                             coeff_br_ctx_oracle(&q, tx_sz, tx_class, pos),
                             "tx_sz {tx_sz} class {tx_class} pos {pos}"
                         );
@@ -1378,5 +1418,51 @@ mod tests {
         assert_eq!(v, [7, 7, 0, 0]);
         set_ctx(&mut v, 9, 2, 1);
         assert_eq!(v, [7, 7, 0, 0]);
+    }
+
+    /// The in-plane runs and the `dc_sign` context built on them equal the spec's loops (visit
+    /// `k < n` with `start + k < max`) on random context arrays, starts and plane ends,
+    /// including runs that start at or past the plane end.
+    #[test]
+    fn context_runs_match_the_spec_loops() {
+        let mut rng = crate::symbol::XorShift(5);
+        for _ in 0..2000 {
+            let len = 32 * (1 + rng.next_u32() as usize % 3);
+            let v: Vec<u8> = (0..len).map(|_| (rng.next_u32() % 4) as u8).collect();
+            let u: Vec<u8> = (0..len).map(|_| (rng.next_u32() % 4) as u8).collect();
+            let max = rng.next_u32() as usize % (len + 1);
+            let start = rng.next_u32() as usize % (len + 1);
+            let n = [1, 2, 4, 8, 16][rng.next_u32() as usize % 5].min(len - start.min(len));
+            let spec: Vec<u8> = (0..n)
+                .filter(|&k| start + k < max)
+                .map(|k| v[start + k])
+                .collect();
+            assert_eq!(ctx_run(&v, start, n, max), &spec[..]);
+            let mut dc_sign = 0i32;
+            for k in 0..n {
+                if start + k < max {
+                    match v[start + k] {
+                        1 => dc_sign -= 1,
+                        2 => dc_sign += 1,
+                        _ => {}
+                    }
+                }
+            }
+            for k in 0..n {
+                if start + k < max {
+                    match u[start + k] {
+                        1 => dc_sign -= 1,
+                        2 => dc_sign += 1,
+                        _ => {}
+                    }
+                }
+            }
+            // Spec: 1 when negative, 2 when positive, else 0.
+            let want = [1, 0, 2][(dc_sign.signum() + 1) as usize];
+            assert_eq!(
+                dc_sign_ctx_of(ctx_run(&v, start, n, max), ctx_run(&u, start, n, max)),
+                want
+            );
+        }
     }
 }

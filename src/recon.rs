@@ -74,16 +74,10 @@ pub(crate) fn reconstruct(
     else {
         return;
     };
-    let (w, h) = (1usize << log2_w, 1usize << log2_h);
-    let (tw, th) = (w.min(32), h.min(32));
-    if p.tx_type >= 16
-        || p.qm_level > 15
-        || quant.len() < tw * th
-        || (y + h - 1) * stride + x + w > px.len()
-    {
+    let (tw, th) = ((1usize << log2_w).min(32), (1usize << log2_h).min(32));
+    if quant.len() < tw * th {
         return;
     }
-
     // The coded region. An all-zero block still runs as a 1x1 region, so the samples are clipped
     // exactly as the full transform clips them.
     let (mut rows, mut cols) = (1, 1);
@@ -92,6 +86,36 @@ pub(crate) fn reconstruct(
             rows = i + 1;
             cols = cols.max(j + 1);
         }
+    }
+    reconstruct_region(px, stride, x, y, p, quant, (rows, cols), scratch, simd);
+}
+
+/// [`reconstruct`] with the coded region given: `rows` x `cols` (each at least 1) must hold
+/// every nonzero entry of `quant`, as the region `reconstruct` finds does. The coefficient
+/// reader tracks it while it writes `Quant[ ]`, so the block is not scanned again.
+pub(crate) fn reconstruct_region(
+    px: &mut [u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    p: &ReconParams,
+    quant: &[i32],
+    (rows, cols): (usize, usize),
+    scratch: &mut ItxScratch,
+    simd: Simd,
+) {
+    let (Some(&log2_w), Some(&log2_h)) = (TX_WIDTH_LOG2.get(p.tx_sz), TX_HEIGHT_LOG2.get(p.tx_sz))
+    else {
+        return;
+    };
+    let (w, h) = (1usize << log2_w, 1usize << log2_h);
+    let (tw, th) = (w.min(32), h.min(32));
+    if p.tx_type >= 16
+        || p.qm_level > 15
+        || quant.len() < tw * th
+        || (y + h - 1) * stride + x + w > px.len()
+    {
+        return;
     }
     let Some(plan) = Plan::new(p.tx_sz, p.tx_type, p.lossless, p.bit_depth, rows, cols) else {
         return;
@@ -312,5 +336,51 @@ mod tests {
             simd::best(),
         );
         assert_eq!(a, b);
+    }
+
+    /// The region the coefficient reader tracks (the last nonzero row and column, plus 1, of
+    /// the entries it writes) gives the samples of the scanning `reconstruct`, on random sparse
+    /// blocks of every size, a few types and bit depths 8, 10 and 12.
+    #[test]
+    fn tracked_region_matches_the_scan() {
+        let mut rng = crate::symbol::XorShift(3);
+        for tx_sz in 0..19 {
+            let (w, h) = (
+                1usize << TX_WIDTH_LOG2[tx_sz],
+                1usize << TX_HEIGHT_LOG2[tx_sz],
+            );
+            let (tw, th) = (w.min(32), h.min(32));
+            for &(tx_type, bit_depth) in &[(DCT_DCT, 8), (1, 10), (IDTX, 12)] {
+                let mut quant = [0i32; 1024];
+                let (mut rows, mut cols) = (1, 1);
+                for _ in 0..1 + rng.next_u32() % 6 {
+                    let pos = rng.next_u32() as usize % (tw * th);
+                    let v = (rng.next_u32() % 64) as i32 - 32;
+                    quant[pos] = v;
+                    if v != 0 {
+                        rows = rows.max(pos / tw + 1);
+                        cols = cols.max(pos % tw + 1);
+                    }
+                }
+                let mut p = params(tx_sz, tx_type);
+                p.bit_depth = bit_depth;
+                let mut a = vec![1u16 << (bit_depth - 1); w * h];
+                let mut b = a.clone();
+                let mut scratch = ItxScratch::new();
+                reconstruct(&mut a, w, 0, 0, &p, &quant, &mut scratch, simd::best());
+                reconstruct_region(
+                    &mut b,
+                    w,
+                    0,
+                    0,
+                    &p,
+                    &quant,
+                    (rows, cols),
+                    &mut scratch,
+                    simd::best(),
+                );
+                assert_eq!(a, b, "tx_sz {tx_sz} type {tx_type}");
+            }
+        }
     }
 }
