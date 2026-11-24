@@ -19,6 +19,7 @@
 //!   then `( sum c * x + 2048 ) >> 12 = sum c * hi + ( ( sum c * lo + 2048 ) >> 12 )`, where the
 //!   low sum is below `2^26` and the high sum wraps exactly like the scalar narrowing. This is
 //!   exact for every `i32` input.
+//!
 //! The Hadamard sums and the `Round2` steps cannot overflow with these inputs either, so the
 //! kernels equal the scalar code bit for bit.
 
@@ -680,7 +681,7 @@ pub(crate) fn check(
                     }
                 }
                 _ => {
-                    if r % 8 == 0 {
+                    if r.is_multiple_of(8) {
                         ((r >> 3) % span) as i32 - lim
                     } else {
                         0
@@ -715,7 +716,7 @@ pub(crate) fn check_random(next: &mut dyn FnMut() -> u32) {
     let tx_sz = next() as usize % 19;
     let tx_type = next() as usize % 16;
     let bd = [8, 10, 12][next() as usize % 3];
-    let lossless = tx_sz == 0 && next() % 8 == 0;
+    let lossless = tx_sz == 0 && next().is_multiple_of(8);
     let (rows, cols) = (next() as usize % 33, next() as usize % 33);
     let pad = next() as usize % 4;
     let (vmode, pmode) = (next() % 4, next() % 4);
