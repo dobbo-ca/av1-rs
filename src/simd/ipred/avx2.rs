@@ -244,16 +244,14 @@ pub(super) fn palette(
     for i in 0..h {
         let dst = &mut px[(y + i) * stride + x..][..w];
         let src = &map[i * map_stride..][..w];
-        let mut dc = dst.chunks_exact_mut(8);
-        let mut sc = src.chunks_exact(8);
-        for (d, s) in (&mut dc).zip(&mut sc) {
-            if let (Some(d), Some(s)) = (d.first_chunk_mut::<8>(), s.first_chunk::<8>()) {
-                let ix = load64_u8(s);
-                let v = _mm_unpacklo_epi8(_mm_shuffle_epi8(tlo, ix), _mm_shuffle_epi8(thi, ix));
-                store128_u16(d, v);
-            }
+        let (dc, dr) = dst.as_chunks_mut::<8>();
+        let (sc, sr) = src.as_chunks::<8>();
+        for (d, s) in dc.iter_mut().zip(sc) {
+            let ix = load64_u8(s);
+            let v = _mm_unpacklo_epi8(_mm_shuffle_epi8(tlo, ix), _mm_shuffle_epi8(thi, ix));
+            store128_u16(d, v);
         }
-        for (d, &m) in dc.into_remainder().iter_mut().zip(sc.remainder()) {
+        for (d, &m) in dr.iter_mut().zip(sr) {
             *d = palette[usize::from(m)];
         }
     }

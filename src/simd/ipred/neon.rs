@@ -203,18 +203,16 @@ pub(super) fn palette(
     for i in 0..h {
         let dst = &mut px[(y + i) * stride + x..][..w];
         let src = &map[i * map_stride..][..w];
-        let mut dc = dst.chunks_exact_mut(8);
-        let mut sc = src.chunks_exact(8);
-        for (d, s) in (&mut dc).zip(&mut sc) {
-            if let (Some(d), Some(s)) = (d.first_chunk_mut::<8>(), s.first_chunk::<8>()) {
-                let ix = load_u8x8(s);
-                let (l8, h8) = (vqtbl1_u8(tlo, ix), vqtbl1_u8(thi, ix));
-                // Interleaved low, high bytes: little-endian u16 lanes.
-                let v = vcombine_u8(vzip1_u8(l8, h8), vzip2_u8(l8, h8));
-                store_u16x8(d, vreinterpretq_u16_u8(v));
-            }
+        let (dc, dr) = dst.as_chunks_mut::<8>();
+        let (sc, sr) = src.as_chunks::<8>();
+        for (d, s) in dc.iter_mut().zip(sc) {
+            let ix = load_u8x8(s);
+            let (l8, h8) = (vqtbl1_u8(tlo, ix), vqtbl1_u8(thi, ix));
+            // Interleaved low, high bytes: little-endian u16 lanes.
+            let v = vcombine_u8(vzip1_u8(l8, h8), vzip2_u8(l8, h8));
+            store_u16x8(d, vreinterpretq_u16_u8(v));
         }
-        for (d, &m) in dc.into_remainder().iter_mut().zip(sc.remainder()) {
+        for (d, &m) in dr.iter_mut().zip(sr) {
             *d = palette[usize::from(m)];
         }
     }

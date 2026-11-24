@@ -418,7 +418,7 @@ pub(crate) mod check {
             angle_delta: (next() % 7) as i32 - 3,
             log2w,
             log2h,
-            use_filter_intra: next() % 4 == 0,
+            use_filter_intra: next().is_multiple_of(4),
             filter_intra_mode: (next() % 5) as usize,
             enable_intra_edge_filter: next() & 3 != 0,
             smooth_neighbor: next() & 1 == 1,
@@ -573,7 +573,7 @@ mod tests {
                                     use_filter_intra: filter && delta == 0,
                                     filter_intra_mode: mode % 5,
                                     enable_intra_edge_filter: filter,
-                                    smooth_neighbor: (mode + bd as usize) % 2 == 0,
+                                    smooth_neighbor: (mode + bd as usize).is_multiple_of(2),
                                     max_x: if delta == 1 {
                                         27 + (1 << log2w) / 2
                                     } else {
