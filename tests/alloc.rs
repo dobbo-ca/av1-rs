@@ -111,9 +111,10 @@ fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
     v
 }
 
-/// A reduced still picture sequence header: 64x32, 8-bit (10-bit when `high_bitdepth` is 1)
-/// 4:2:0, 64x64 superblocks, CDEF and loop restoration on.
-fn sequence_header(high_bitdepth: u64) -> Vec<u8> {
+/// A reduced still picture sequence header: `width` x `height` (one superblock: at most 64x64),
+/// 8-bit (10-bit when `high_bitdepth` is 1) 4:2:0, 64x64 superblocks, CDEF and loop restoration
+/// on.
+fn sequence_header(high_bitdepth: u64, width: u64, height: u64) -> Vec<u8> {
     let mut w = Bits::default();
     for (bits, value) in [
         (3, 0),             // seq_profile
@@ -122,8 +123,8 @@ fn sequence_header(high_bitdepth: u64) -> Vec<u8> {
         (5, 4),             // seq_level_idx[0]
         (4, 7),             // frame_width_bits_minus_1
         (4, 6),             // frame_height_bits_minus_1
-        (8, 63),            // max_frame_width_minus_1
-        (7, 31),            // max_frame_height_minus_1
+        (8, width - 1),     // max_frame_width_minus_1
+        (7, height - 1),    // max_frame_height_minus_1
         (1, 0),             // use_128x128_superblock
         (1, 1),             // enable_filter_intra
         (1, 1),             // enable_intra_edge_filter
@@ -186,10 +187,10 @@ fn frame(tile: &[u8]) -> Vec<u8> {
 
 /// Temporal delimiter, sequence header (`high_bitdepth` as given) and one key frame with tile
 /// data `tile`.
-fn unit(tile: &[u8], high_bitdepth: u64) -> Vec<u8> {
+fn unit(tile: &[u8], high_bitdepth: u64, size: (u64, u64)) -> Vec<u8> {
     [
         obu(2, &[]),
-        obu(1, &sequence_header(high_bitdepth)),
+        obu(1, &sequence_header(high_bitdepth, size.0, size.1)),
         obu(6, &frame(tile)),
     ]
     .concat()
@@ -205,7 +206,7 @@ fn limits(max_alloc: usize) -> Limits {
 
 /// A unit that decodes to one frame (tile data is read as some syntax; the first candidate whose
 /// syntax is valid), with the frame.
-fn decodable_unit(high_bitdepth: u64) -> (Vec<u8>, Vec<Frame>) {
+fn decodable_unit(high_bitdepth: u64, size: (u64, u64)) -> (Vec<u8>, Vec<Frame>) {
     let cancel = AtomicBool::new(false);
     let tiles: [&[u8]; 7] = [
         &[1, 2, 3, 4],
@@ -217,7 +218,7 @@ fn decodable_unit(high_bitdepth: u64) -> (Vec<u8>, Vec<Frame>) {
         &[0xff; 8],
     ];
     for t in tiles {
-        let data = unit(t, high_bitdepth);
+        let data = unit(t, high_bitdepth, size);
         let mut d = Decoder::new(Options::default(), limits(64 << 20));
         if let Ok(frames) = d.decode_temporal_unit(&data, Format::Section5, &cancel)
             && frames.len() == 1
@@ -230,7 +231,7 @@ fn decodable_unit(high_bitdepth: u64) -> (Vec<u8>, Vec<Frame>) {
 
 #[test]
 fn second_unit_after_recycle_allocates_nothing() {
-    let (data, want) = decodable_unit(0);
+    let (data, want) = decodable_unit(0, (64, 32));
     let cancel = AtomicBool::new(false);
     let mut d = Decoder::new(Options::default(), limits(64 << 20));
     for round in 0..3 {
@@ -247,7 +248,7 @@ fn second_unit_after_recycle_allocates_nothing() {
 
 #[test]
 fn reuse_keeps_the_heap_within_max_alloc() {
-    let (data, want) = decodable_unit(0);
+    let (data, want) = decodable_unit(0, (64, 32));
     let cancel = AtomicBool::new(false);
     let mut fitted = 0;
     for max_alloc in (1..=64).map(|k| k * (8 << 10)) {
@@ -287,7 +288,7 @@ fn reuse_keeps_the_heap_within_max_alloc() {
 fn decode_of_many_high_bitdepth_frames_keeps_the_heap_within_max_alloc() {
     // 10-bit output planes come from the pool of (larger) work planes: the frames `decode`
     // collects must be charged for what they hold, not for their samples.
-    let (data, _) = decodable_unit(1);
+    let (data, _) = decodable_unit(1, (64, 32));
     let stream = data.repeat(400);
     let max_alloc = 2 << 20;
     let cancel = AtomicBool::new(false);
@@ -305,4 +306,30 @@ fn decode_of_many_high_bitdepth_frames_keeps_the_heap_within_max_alloc() {
         "{peak} bytes held, result {:?}",
         r.map(|f| f.len())
     );
+}
+
+#[test]
+fn decode_of_many_tiny_frames_keeps_the_heap_within_max_alloc() {
+    // A 1x1 frame has 3 bytes of samples: the `Frame`, its plane list and its slot in the
+    // collected `Vec` must be charged too, or a long stream of them outgrows `max_alloc`.
+    let (data, frames) = decodable_unit(0, (1, 1));
+    assert_eq!((frames[0].width, frames[0].height), (1, 1));
+    let stream = data.repeat(8000);
+    let max_alloc = 1 << 20;
+    let cancel = AtomicBool::new(false);
+    let (r, _, peak) = measured(|| {
+        av1::decode(
+            &stream,
+            Format::Section5,
+            &Options::default(),
+            &limits(max_alloc),
+            &cancel,
+        )
+    });
+    assert!(
+        peak <= max_alloc as isize + UNCHARGED,
+        "{peak} bytes held, result {:?}",
+        r.map(|f| f.len())
+    );
+    assert_eq!(r.err(), Some(Error::AllocLimit));
 }

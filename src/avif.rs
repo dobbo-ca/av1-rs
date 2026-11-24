@@ -48,8 +48,10 @@ struct Ctx<'a> {
 /// A coded item is decoded as one Section 5 temporal unit: the `av1C` configOBUs followed by the
 /// item data. A grid is assembled from its tiles; an identity image is its input. Overlays and
 /// other item types are [`Error::Unsupported`]. The frame size limits of `limits` apply to every
-/// decoded frame and to the assembled grid; one ledger of `max_alloc` covers every decoder, the
-/// assembled grid, the item copies and the primary image while the alpha item decodes. `cancel`
+/// decoded frame and to the assembled grid. `max_alloc` is the peak of the call: an eighth is
+/// given to the `isobmff` parse, an eighth to its reads of the item bytes, and the rest to one
+/// ledger for every decoder, the assembled grid, the item copies and the primary image while the
+/// alpha item decodes. `cancel`
 /// is checked between tiles and inside every decode.
 ///
 /// Exif, XMP, gain map, depth and thumbnail items are not returned; use `isobmff::parse` for them.
@@ -63,8 +65,10 @@ pub fn decode_avif(
     limits: &Limits,
     cancel: &AtomicBool,
 ) -> Result<AvifImage, Error> {
+    // An eighth of `max_alloc` for the parse and an eighth for the item reads (both outside the
+    // ledger), the rest for the ledger.
     let ilimits = isobmff::Limits {
-        max_alloc: limits.max_alloc,
+        max_alloc: limits.max_alloc / 8,
         max_threads: limits.max_threads,
         max_pixels: limits.max_pixels,
         ..isobmff::Limits::default()
@@ -72,7 +76,7 @@ pub fn decode_avif(
     let heif = isobmff::parse(file, &ilimits, cancel).map_err(container)?;
     let ledger = Arc::new(Ledger::default());
     // A `max_alloc` below the small-allocation allowance only means that every charge fails.
-    let _ = ledger.reset(limits.max_alloc, 0);
+    let _ = ledger.reset(limits.max_alloc - 2 * (limits.max_alloc / 8), 0);
     let ctx = Ctx {
         heif: &heif,
         file,
@@ -215,8 +219,9 @@ fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
     let max_threads = ctx.limits.max_threads.max(1);
     let workers = max_threads.min(grid.tiles.len());
     // Every worker's `item_bytes` call has its own budget, and a multi-extent item is copied
-    // outside the ledger: the eighth of `max_alloc` is split between the workers, so the copies
-    // that are live at once stay within it.
+    // outside the ledger: the eighth of `max_alloc` given to the reads (by `decode_avif` and
+    // `decode_avif_item`) is split between the workers, so the copies that are live at once stay
+    // within it.
     let ilimits = isobmff::Limits {
         max_alloc: ctx.ilimits.max_alloc / workers,
         ..*ctx.ilimits

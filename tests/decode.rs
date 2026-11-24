@@ -156,3 +156,59 @@ fn avif_item_bytes_over_the_split_are_an_error() {
     };
     assert!(av1::decode_avif_item(&heif, &file, heif.primary, &o, &l, &cancel).is_err());
 }
+
+/// An AVIF whose primary `av01` item is `n` zero bytes in two extents, so `isobmff` copies it.
+fn two_extent_avif(n: u32) -> Vec<u8> {
+    let ftyp = bx(b"ftyp", b"avif\0\0\0\0avifmif1");
+    let build = |mdat_at: u32| {
+        let hdlr = bx(b"hdlr", &[&[0; 8][..], b"pict", &[0; 13]].concat());
+        let pitm = bx(b"pitm", &[0, 0, 0, 0, 0, 1]);
+        let infe = bx(
+            b"infe",
+            &[&[2, 0, 0, 0, 0, 1, 0, 0][..], b"av01", &[0]].concat(),
+        );
+        let iinf = bx(b"iinf", &[&[0, 0, 0, 0, 0, 1][..], &infe].concat());
+        let mut iloc = vec![0, 0, 0, 0, 0x44, 0, 0, 1];
+        iloc.extend_from_slice(&[0, 1, 0, 0, 0, 2]);
+        for (at, len) in [(mdat_at, n / 2), (mdat_at + n / 2, n - n / 2)] {
+            iloc.extend_from_slice(&at.to_be_bytes());
+            iloc.extend_from_slice(&len.to_be_bytes());
+        }
+        let iloc = bx(b"iloc", &iloc);
+        let ispe = bx(b"ispe", &[0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 20]);
+        let av1c = bx(b"av1C", &[0x81, 0, 0x4c, 0, 0x0a]);
+        let ipco = bx(b"ipco", &[ispe, av1c].concat());
+        let ipma = bx(b"ipma", &[0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 2, 1, 0x82]);
+        let iprp = bx(b"iprp", &[ipco, ipma].concat());
+        bx(
+            b"meta",
+            &[&[0; 4][..], &hdlr, &pitm, &iinf, &iloc, &iprp].concat(),
+        )
+    };
+    let at = (ftyp.len() + build(0).len() + 8) as u32;
+    let mdat = bx(b"mdat", &vec![0; n as usize]);
+    [ftyp, build(at), mdat].concat()
+}
+
+// `decode_avif` reads the item bytes under an eighth of `max_alloc`, outside the ledger, so the
+// copy and the ledger together stay within `max_alloc`.
+#[test]
+fn avif_item_bytes_over_an_eighth_of_max_alloc_are_a_container_error() {
+    let file = two_extent_avif(4000);
+    let cancel = AtomicBool::new(false);
+    let o = Options::default();
+    let at = |max_alloc| {
+        let l = Limits {
+            max_alloc,
+            ..Limits::default()
+        };
+        av1::decode_avif(&file, &o, &l, &cancel).map(|a| a.image)
+    };
+    assert!(matches!(at(16 << 10), Err(Error::Container(_))));
+    // With an eighth above the item size the bytes are read, and the decode fails on them.
+    let r = at(64 << 10);
+    assert!(
+        r.is_err() && !matches!(r, Err(Error::Container(_))),
+        "{r:?}"
+    );
+}
