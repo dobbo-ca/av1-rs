@@ -3,6 +3,13 @@
 //!
 //! Only intra frames are decoded, so `RefFrames[ row ][ col ][ 0 ]` is always `INTRA_FRAME` and the
 //! `loop_filter_mode_deltas` / `modeType` branch of 7.14.5 never applies.
+//!
+//! The filter size and level are worked out once per 4x4 edge (7.14.2 to 7.14.5), and runs of
+//! adjacent edges with the same size and level along one edge line go to the `simd::lf` kernels
+//! in one call. Filtering a vertical edge reads and writes one sample row, and a horizontal edge
+//! one sample column, so taking vertical edges column by column within a strip of 16 mode info
+//! rows (instead of in raster order) keeps the order of the filters on every sample row: the
+//! output is the same.
 
 use crate::consts::{INTRA_FRAME, MAX_LOOP_FILTER, MI_SIZE, SEG_LVL_ALT_LF_Y_V};
 use crate::decoder::check_cancel;
@@ -10,6 +17,7 @@ use crate::error::Error;
 use crate::frame::FrameState;
 use crate::header::FrameHeader;
 use crate::seq::SequenceHeader;
+use crate::simd::{self, Simd};
 use crate::tables::{BLOCK_HEIGHT, BLOCK_WIDTH, SUBSAMPLED_SIZE, TX_HEIGHT, TX_WIDTH};
 use std::sync::atomic::AtomicBool;
 
@@ -25,20 +33,32 @@ pub(crate) fn loop_filter_frame(
     if fh.loop_filter_level[0] == 0 && fh.loop_filter_level[1] == 0 {
         return Ok(());
     }
+    let simd = simd::best();
+    let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
     for plane in 0..fs.num_planes {
         if plane == 0 || fh.loop_filter_level[1 + plane] != 0 {
+            let (row_step, col_step) = if plane == 0 {
+                (1, 1)
+            } else {
+                (1 << fs.subsampling_y, 1 << fs.subsampling_x)
+            };
             for pass in 0..2 {
-                let (row_step, col_step) = if plane == 0 {
-                    (1, 1)
-                } else {
-                    (1 << fs.subsampling_y, 1 << fs.subsampling_x)
-                };
-                for row in (0..fs.mi_rows).step_by(row_step) {
-                    if row.is_multiple_of(16) {
-                        check_cancel(cancel)?;
-                    }
-                    for col in (0..fs.mi_cols).step_by(col_step) {
-                        loop_filter_edge(fs, fh, plane, pass, row, col);
+                // Strips of 16 mode info rows (a 64x64 superblock row).
+                for strip in (0..mi_rows).step_by(16) {
+                    check_cancel(cancel)?;
+                    let rows = (strip..mi_rows.min(strip + 16)).step_by(row_step);
+                    if pass == 0 {
+                        // Vertical edges: a run goes down one column of the strip.
+                        for col in (0..mi_cols).step_by(col_step) {
+                            let edges = rows.clone().map(move |row| (row, col));
+                            filter_line(fs, fh, simd, plane, pass, edges);
+                        }
+                    } else {
+                        // Horizontal edges: a run goes along one row.
+                        for row in rows {
+                            let edges = (0..mi_cols).step_by(col_step).map(move |col| (row, col));
+                            filter_line(fs, fh, simd, plane, pass, edges);
+                        }
                     }
                 }
             }
@@ -47,15 +67,85 @@ pub(crate) fn loop_filter_frame(
     Ok(())
 }
 
-/// Spec 7.14.2 (edge loop filter process).
-fn loop_filter_edge(
+/// The 4x4 edge at plane sample (`x`, `y`) that 7.14.2 filters, with its filter size (7.14.3)
+/// and level (7.14.4).
+#[derive(Clone, Copy)]
+struct EdgeParams {
+    x: usize,
+    y: usize,
+    size: usize,
+    lvl: i32,
+}
+
+/// Filters the 4x4 edges `edges` (`(row, col)` in mode info units, adjacent along one edge
+/// line, in order), one kernel call per run of edges with the same size and level.
+fn filter_line(
     fs: &mut FrameState,
+    fh: &FrameHeader,
+    simd: Simd,
+    plane: usize,
+    pass: usize,
+    edges: impl Iterator<Item = (usize, usize)>,
+) {
+    let mut run: Option<(EdgeParams, usize)> = None;
+    for (row, col) in edges {
+        let e = edge_params(fs, fh, plane, pass, row, col);
+        let extends = match (&run, &e) {
+            (Some((r, _)), Some(e)) => r.size == e.size && r.lvl == e.lvl,
+            _ => false,
+        };
+        if extends {
+            if let Some((_, count)) = &mut run {
+                *count += 1;
+            }
+            continue;
+        }
+        if let Some((r, count)) = run {
+            filter_run(fs, fh, simd, plane, pass, r, count);
+        }
+        run = e.map(|e| (e, 1));
+    }
+    if let Some((r, count)) = run {
+        filter_run(fs, fh, simd, plane, pass, r, count);
+    }
+}
+
+/// Filters `count` adjacent 4x4 edges starting at `r`, all with `r`'s size and level.
+fn filter_run(
+    fs: &mut FrameState,
+    fh: &FrameHeader,
+    simd: Simd,
+    plane: usize,
+    pass: usize,
+    r: EdgeParams,
+    count: usize,
+) {
+    let stride = fs.curr_frame[plane].stride;
+    // Across the edge, and from one sample to the next along it.
+    let (step, along) = if pass == 0 { (1, stride) } else { (stride, 1) };
+    let edge = simd::lf::Edge {
+        pos: r.y * stride + r.x,
+        step,
+        along,
+        n: count * MI_SIZE,
+        plane,
+        bd: u32::from(fs.bit_depth),
+        lims: limits(r.lvl, fh.loop_filter_sharpness),
+        filter_size: r.size,
+    };
+    simd::lf::filter_edge(simd, &mut fs.curr_frame[plane].px, &edge);
+}
+
+/// Spec 7.14.2 (edge loop filter process) up to the sample loop: `None` when the 4x4 edge at
+/// mode info (`row`, `col`) is not filtered.
+fn edge_params(
+    fs: &FrameState,
     fh: &FrameHeader,
     plane: usize,
     pass: usize,
     row: usize,
     col: usize,
-) {
+) -> Option<EdgeParams> {
     let (sub_x, sub_y) = if plane == 0 {
         (0, 0)
     } else {
@@ -68,7 +158,7 @@ fn loop_filter_edge(
     let col = col | sub_x;
     if x >= fs.frame_width || y >= fs.frame_height || (pass == 0 && x == 0) || (pass == 1 && y == 0)
     {
-        return;
+        return None;
     }
     let x_p = x >> sub_x;
     let y_p = y >> sub_y;
@@ -85,12 +175,12 @@ fn loop_filter_edge(
         fs.skips.get(mi_idx),
         fs.ref_frames0.get(mi_idx),
     ) else {
-        return;
+        return None;
     };
     let (tx_sz, prev_tx_sz) = (usize::from(tx_sz), usize::from(prev_tx_sz));
     let plane_size = SUBSAMPLED_SIZE[usize::from(mi_size)][sub_x][sub_y];
     if plane_size >= BLOCK_WIDTH.len() {
-        return;
+        return None;
     }
     let is_intra = ref0 <= INTRA_FRAME as i8;
     let (is_block_edge, is_tx_edge) = if pass == 0 {
@@ -106,7 +196,7 @@ fn loop_filter_edge(
     };
     let apply_filter = is_tx_edge && (is_block_edge || !skip || is_intra);
     if !apply_filter {
-        return;
+        return None;
     }
     // 7.14.3 filter size process.
     let base_size = if pass == 0 {
@@ -124,10 +214,19 @@ fn loop_filter_edge(
         lvl = filter_level(fs, fh, prev_mi_idx, plane, pass);
     }
     if lvl == 0 {
-        return;
+        return None;
     }
-    // 7.14.4 limit, blimit, thresh.
-    let sharp = i32::from(fh.loop_filter_sharpness);
+    Some(EdgeParams {
+        x: x_p,
+        y: y_p,
+        size: filter_size,
+        lvl,
+    })
+}
+
+/// Spec 7.14.4: `[ limit, blimit, thresh ]` for level `lvl` (1 to 63) and sharpness `sharp`.
+pub(crate) fn limits(lvl: i32, sharp: u8) -> [i32; 3] {
+    let sharp = i32::from(sharp);
     let shift = if sharp > 4 {
         2
     } else if sharp > 0 {
@@ -142,22 +241,7 @@ fn loop_filter_edge(
     };
     let blimit = 2 * (lvl + 2) + limit;
     let thresh = lvl >> 4;
-    let stride = fs.curr_frame[plane].stride;
-    let step = if pass == 0 { 1 } else { stride };
-    let bd = u32::from(fs.bit_depth);
-    for i in 0..MI_SIZE {
-        let (sx, sy) = (x_p + dy * i, y_p + dx * i);
-        let pos = sy * stride + sx;
-        sample_filter(
-            &mut fs.curr_frame[plane].px,
-            pos,
-            step,
-            plane,
-            bd,
-            [limit, blimit, thresh],
-            filter_size,
-        );
-    }
+    [limit, blimit, thresh]
 }
 
 /// Spec 7.14.4 (adaptive filter strength, `lvl` output) with 7.14.5 (selection) for the mode
@@ -194,7 +278,7 @@ fn filter_level(
 /// Spec 7.14.6 (sample filtering process) for the sample at `px[ pos ]` (`q0`); `step` is the
 /// distance between samples across the edge (1 for vertical edges, the stride for horizontal).
 /// `lims` is `[ limit, blimit, thresh ]`. Samples outside the buffer are never touched.
-fn sample_filter(
+pub(crate) fn sample_filter(
     px: &mut [u16],
     pos: usize,
     step: usize,

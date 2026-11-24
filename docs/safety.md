@@ -47,6 +47,18 @@ bit for bit. CI checks this four ways:
 
 Production code passes `simd::best()`; tests loop over `simd::available()`.
 
+### Kernel families
+
+| Family | Oracle | Kernels | Tiers |
+|---|---|---|---|
+| `lf` | `lf::sample_filter` | One run of samples along an edge (7.14.6): masks, narrow filter, 6/8/16 wide filters, vertical and horizontal, 8/10/12-bit; lanes along the edge, the samples across it gathered into a 14-row buffer in safe code | AVX2 (16 lanes), NEON (8 lanes); AVX-512 runs the AVX2 kernel |
+
+Tiers not written:
+
+- `lf` AVX-512: a run is one transform edge (4 to 64 samples, mostly 4 to 16), so 32 lanes
+  would be mostly padding, and the gather and scatter around the kernel cost the same per sample
+  at either width.
+
 ## Kernels kept and dropped
 
 A kernel stays only when the bench (docs/benchmarks.md) shows that it wins. Kernels and tiers
