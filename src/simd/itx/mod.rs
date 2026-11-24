@@ -580,8 +580,6 @@ macro_rules! itx_kernels {
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;
-#[cfg(target_arch = "x86_64")]
-mod avx512;
 #[cfg(target_arch = "aarch64")]
 mod neon;
 
@@ -606,22 +604,9 @@ pub(crate) fn inverse_transform_add(
     }
     match simd.tier() {
         #[cfg(target_arch = "x86_64")]
-        Tier::Avx2 => {
-            // SAFETY: `simd` is a `Simd` of tier AVX2, which only `simd::available()` and
-            // `simd::best()` make after detecting AVX2 (the kernel's feature).
-            unsafe { avx2::inverse_transform_add(p, dq, mid, px, stride) }
-        }
-        // The 16-lane kernel only pays when both passes fill its lanes.
-        #[cfg(target_arch = "x86_64")]
-        Tier::Avx512 if w >= 16 && h >= 16 => {
-            // SAFETY: `simd` is a `Simd` of tier AVX-512, which only `simd::available()` and
-            // `simd::best()` make after detecting AVX-512 F (the kernel's feature).
-            unsafe { avx512::inverse_transform_add(p, dq, mid, px, stride) }
-        }
-        #[cfg(target_arch = "x86_64")]
-        Tier::Avx512 => {
-            // SAFETY: `simd` is a `Simd` of tier AVX-512, which is only made after detecting
-            // AVX2 too (the kernel's feature).
+        Tier::Avx2 | Tier::Avx512 => {
+            // SAFETY: `simd` is a detected tier (only `simd::available`/`best` make one), and
+            // AVX-512 implies AVX2 (the kernel's feature).
             unsafe { avx2::inverse_transform_add(p, dq, mid, px, stride) }
         }
         #[cfg(target_arch = "aarch64")]
