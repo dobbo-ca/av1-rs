@@ -79,6 +79,11 @@ fn source_window(
     win: &mut [i32; WIN],
 ) {
     let ww = w + 6;
+    // Window column `c` is plane column `first + c`, clamped to `0..=PlaneEndX`: columns
+    // `lo..hi` of the window need no clamp and are copied straight.
+    let first = x as isize - 3;
+    let lo = (-first).clamp(0, ww as isize) as usize;
+    let hi = (st.end_x + 1 - first).clamp(lo as isize, ww as isize) as usize;
     for r in 0..h + 6 {
         let mut yy = (y as isize + r as isize - 3).clamp(0, st.end_y);
         let src = if yy < st.start {
@@ -91,9 +96,14 @@ fn source_window(
             cdef
         };
         let row = &src.px[yy as usize * src.stride..];
-        for c in 0..ww {
-            let xx = (x as isize + c as isize - 3).clamp(0, st.end_x) as usize;
-            win[r * ww + c] = i32::from(row[xx]);
+        let out = &mut win[r * ww..(r + 1) * ww];
+        let x_lo = (first + lo as isize) as usize;
+        for (o, &v) in out[lo..hi].iter_mut().zip(&row[x_lo..x_lo + (hi - lo)]) {
+            *o = i32::from(v);
+        }
+        for c in (0..lo).chain(hi..ww) {
+            let xx = (first + c as isize).clamp(0, st.end_x) as usize;
+            out[c] = i32::from(row[xx]);
         }
     }
 }
@@ -536,6 +546,59 @@ mod tests {
         let expect = [2, 2, 2, 1, 1, 1, 1, 1, 1, 2, 2, 2];
         for (r, &e) in expect.iter().enumerate() {
             assert_eq!(col(r), e, "row {r}");
+        }
+    }
+
+    #[test]
+    fn source_window_matches_the_clamped_reads() {
+        let (pw, ph) = (80, 48);
+        let mut cdef = plane(pw, ph);
+        let mut curr = plane(pw, ph);
+        for (i, (a, b)) in cdef.px.iter_mut().zip(curr.px.iter_mut()).enumerate() {
+            *a = i as u16;
+            *b = 0x8000 | i as u16;
+        }
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: usize| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s % n as u64) as usize
+        };
+        let mut win = [0; WIN];
+        for _ in 0..500 {
+            let end_x = next(pw);
+            let end_y = next(ph);
+            let start = next(end_y + 9) as isize - 8;
+            let st = Stripe {
+                start,
+                end: start + 1 + next(64) as isize,
+                end_x: end_x as isize,
+                end_y: end_y as isize,
+            };
+            // As in `lr_stripe`: the block lies inside the plane.
+            let x = next(end_x + 1);
+            let y = next(end_y + 1);
+            let w = 1 + next(BLOCK_W.min(end_x + 1 - x));
+            let h = 1 + next(STRIPE_H);
+            source_window(&cdef, &curr, &st, x, y, w, h, &mut win);
+            for r in 0..h + 6 {
+                let mut yy = (y as isize + r as isize - 3).clamp(0, st.end_y);
+                let src = if yy < st.start {
+                    yy = yy.max(st.start - 2);
+                    &curr
+                } else if yy > st.end {
+                    yy = yy.min(st.end + 2);
+                    &curr
+                } else {
+                    &cdef
+                };
+                for c in 0..w + 6 {
+                    let xx = (x as isize + c as isize - 3).clamp(0, st.end_x) as usize;
+                    let want = i32::from(src.px[yy as usize * src.stride + xx]);
+                    assert_eq!(win[r * (w + 6) + c], want, "x {x} y {y} w {w} at {r}, {c}");
+                }
+            }
         }
     }
 }

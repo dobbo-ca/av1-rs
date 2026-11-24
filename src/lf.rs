@@ -223,33 +223,38 @@ fn edge_params(
     let prev_mi_idx = prev_row * fs.mi_cols + prev_col;
     let tx_idx = (row >> sub_y) * fs.mi_cols + (col >> sub_x);
     let prev_tx_idx = (prev_row >> sub_y) * fs.mi_cols + (prev_col >> sub_x);
-    let (Some(&mi_size), Some(&tx_sz), Some(&prev_tx_sz), Some(&skip), Some(&ref0)) = (
+    // Every `None` below means "not filtered", so the order of the checks does not change the
+    // result: the transform edge test, which rejects most positions, comes first. Block and
+    // transform sizes are powers of two, so a mask test is the spec's modulo.
+    let tx_sz = usize::from(*fs.loopfilter_tx_sizes[plane].get(tx_idx)?);
+    let is_tx_edge = if pass == 0 {
+        (x_p & (TX_WIDTH[tx_sz] - 1)) == 0
+    } else {
+        (y_p & (TX_HEIGHT[tx_sz] - 1)) == 0
+    };
+    if !is_tx_edge {
+        return None;
+    }
+    let (Some(&mi_size), Some(&prev_tx_sz), Some(&skip), Some(&ref0)) = (
         fs.mi_sizes.get(mi_idx),
-        fs.loopfilter_tx_sizes[plane].get(tx_idx),
         fs.loopfilter_tx_sizes[plane].get(prev_tx_idx),
         fs.skips.get(mi_idx),
         fs.ref_frames0.get(mi_idx),
     ) else {
         return None;
     };
-    let (tx_sz, prev_tx_sz) = (usize::from(tx_sz), usize::from(prev_tx_sz));
+    let prev_tx_sz = usize::from(prev_tx_sz);
     let plane_size = SUBSAMPLED_SIZE[usize::from(mi_size)][sub_x][sub_y];
     if plane_size >= BLOCK_WIDTH.len() {
         return None;
     }
     let is_intra = ref0 <= INTRA_FRAME as i8;
-    let (is_block_edge, is_tx_edge) = if pass == 0 {
-        (
-            x_p.is_multiple_of(BLOCK_WIDTH[plane_size]),
-            x_p.is_multiple_of(TX_WIDTH[tx_sz]),
-        )
+    let is_block_edge = if pass == 0 {
+        (x_p & (BLOCK_WIDTH[plane_size] - 1)) == 0
     } else {
-        (
-            y_p.is_multiple_of(BLOCK_HEIGHT[plane_size]),
-            y_p.is_multiple_of(TX_HEIGHT[tx_sz]),
-        )
+        (y_p & (BLOCK_HEIGHT[plane_size] - 1)) == 0
     };
-    let apply_filter = is_tx_edge && (is_block_edge || !skip || is_intra);
+    let apply_filter = is_block_edge || !skip || is_intra;
     if !apply_filter {
         return None;
     }
@@ -492,6 +497,125 @@ mod tests {
         for y in 0..32 {
             let r = &fs.curr_frame[0].px[y * stride + 28..y * stride + 36];
             assert_eq!(r, [100, 100, 102, 103, 105, 106, 108, 108]);
+        }
+    }
+
+    /// `edge_params` in the spec's order (7.14.2), with `is_multiple_of` for the edge tests: the
+    /// code before the transform edge test moved first. Returns `(x, y, size, lvl)`.
+    fn edge_params_spec(
+        fs: &FrameState,
+        fh: &FrameHeader,
+        plane: usize,
+        pass: usize,
+        row: usize,
+        col: usize,
+    ) -> Option<(usize, usize, usize, i32)> {
+        let (sub_x, sub_y) = if plane == 0 {
+            (0, 0)
+        } else {
+            (fs.subsampling_x, fs.subsampling_y)
+        };
+        let (dx, dy) = if pass == 0 { (1, 0) } else { (0, 1) };
+        let (x, y) = (col * MI_SIZE, row * MI_SIZE);
+        let (row, col) = (row | sub_y, col | sub_x);
+        if x >= fs.frame_width
+            || y >= fs.frame_height
+            || (pass == 0 && x == 0)
+            || (pass == 1 && y == 0)
+        {
+            return None;
+        }
+        let (x_p, y_p) = (x >> sub_x, y >> sub_y);
+        let (prev_row, prev_col) = (row - (dy << sub_y), col - (dx << sub_x));
+        let mi_idx = row * fs.mi_cols + col;
+        let prev_mi_idx = prev_row * fs.mi_cols + prev_col;
+        let tx_idx = (row >> sub_y) * fs.mi_cols + (col >> sub_x);
+        let prev_tx_idx = (prev_row >> sub_y) * fs.mi_cols + (prev_col >> sub_x);
+        let mi_size = usize::from(*fs.mi_sizes.get(mi_idx)?);
+        let tx_sz = usize::from(*fs.loopfilter_tx_sizes[plane].get(tx_idx)?);
+        let prev_tx_sz = usize::from(*fs.loopfilter_tx_sizes[plane].get(prev_tx_idx)?);
+        let skip = *fs.skips.get(mi_idx)?;
+        let is_intra = *fs.ref_frames0.get(mi_idx)? <= INTRA_FRAME as i8;
+        let plane_size = SUBSAMPLED_SIZE[mi_size][sub_x][sub_y];
+        if plane_size >= BLOCK_WIDTH.len() {
+            return None;
+        }
+        let (is_block_edge, is_tx_edge) = if pass == 0 {
+            (
+                x_p.is_multiple_of(BLOCK_WIDTH[plane_size]),
+                x_p.is_multiple_of(TX_WIDTH[tx_sz]),
+            )
+        } else {
+            (
+                y_p.is_multiple_of(BLOCK_HEIGHT[plane_size]),
+                y_p.is_multiple_of(TX_HEIGHT[tx_sz]),
+            )
+        };
+        let apply_filter = is_tx_edge && (is_block_edge || !skip || is_intra);
+        if !apply_filter {
+            return None;
+        }
+        let base_size = if pass == 0 {
+            TX_WIDTH[prev_tx_sz].min(TX_WIDTH[tx_sz])
+        } else {
+            TX_HEIGHT[prev_tx_sz].min(TX_HEIGHT[tx_sz])
+        };
+        let size = base_size.min(if plane == 0 { 16 } else { 8 });
+        let mut lvl = filter_level(fs, fh, mi_idx, plane, pass);
+        if lvl == 0 {
+            lvl = filter_level(fs, fh, prev_mi_idx, plane, pass);
+        }
+        (lvl != 0).then_some((x_p, y_p, size, lvl))
+    }
+
+    #[test]
+    fn edge_params_match_the_spec_order() {
+        use crate::consts::{BLOCK_SIZES, TX_SIZES_ALL};
+        let (mut fs, mut fh, _) = setup(0, 0);
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let n = fs.mi_rows * fs.mi_cols;
+        for round in 0..24 {
+            (fs.subsampling_x, fs.subsampling_y) = [(0, 0), (1, 0), (1, 1)][round % 3];
+            for l in fh.loop_filter_level.iter_mut() {
+                *l = next(64) as u8;
+            }
+            fh.delta_lf_multi = next(2) == 1;
+            fh.loop_filter_delta_enabled = next(2) == 1;
+            for i in 0..n {
+                fs.mi_sizes[i] = next(BLOCK_SIZES as u64) as u8;
+                fs.skips[i] = next(2) == 1;
+                fs.ref_frames0[i] = next(3) as i8 - 1;
+                for d in fs.delta_lfs[i].iter_mut() {
+                    *d = next(33) as i8 - 16;
+                }
+                for plane in 0..3 {
+                    // Mostly small transforms, so that many positions are edges.
+                    let t = if next(2) == 0 {
+                        0
+                    } else {
+                        next(TX_SIZES_ALL as u64)
+                    };
+                    fs.loopfilter_tx_sizes[plane][i] = t as u8;
+                }
+            }
+            for plane in 0..3 {
+                for pass in 0..2 {
+                    for row in 0..fs.mi_rows {
+                        for col in 0..fs.mi_cols {
+                            let got = edge_params(&fs, &fh, plane, pass, row, col)
+                                .map(|e| (e.x, e.y, e.size, e.lvl));
+                            let want = edge_params_spec(&fs, &fh, plane, pass, row, col);
+                            assert_eq!(got, want, "plane {plane} pass {pass} at {row}, {col}");
+                        }
+                    }
+                }
+            }
         }
     }
 }

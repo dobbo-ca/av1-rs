@@ -43,6 +43,40 @@ impl Plane {
             charged,
         })
     }
+
+    /// A `width` x `height` plane with `stride == width` holding `height` rows of `src`, row
+    /// `y` starting at `src[ y * stride ]`, like [`Plane::new`] but filled by the copy instead
+    /// of zeroed first.
+    ///
+    /// # Errors
+    /// As [`Plane::new`]; `Invalid` when `src` is too short.
+    pub(crate) fn copy_of(
+        src: &[u16],
+        stride: usize,
+        width: usize,
+        height: usize,
+        ledger: &Arc<Ledger>,
+    ) -> Result<Plane, Error> {
+        let n = width.checked_mul(height).ok_or(Error::AllocLimit)?;
+        let (px, charged) = ledger.take::<u16>(n)?;
+        // Built first, so the buffer goes back to the ledger if `src` is too short.
+        let mut p = Plane {
+            width,
+            height,
+            stride: width,
+            px,
+            ledger: Arc::clone(ledger),
+            charged,
+        };
+        for y in 0..height {
+            let start = y * stride;
+            let row = src
+                .get(start..start + width)
+                .ok_or(Error::Invalid("plane smaller than its size"))?;
+            p.px.extend_from_slice(row);
+        }
+        Ok(p)
+    }
 }
 
 impl Drop for Plane {
