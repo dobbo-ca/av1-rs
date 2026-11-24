@@ -32,12 +32,16 @@ pub(crate) fn blend_luma(
     let (out, src, noise) = (&mut out[..n], &src[..n], &noise[..n]);
     match simd.tier() {
         #[cfg(target_arch = "x86_64")]
-        // SAFETY: `simd` is the proof that AVX2 was detected (`simd::available`); the AVX-512
-        // tier is only detected together with AVX2.
-        Tier::Avx2 | Tier::Avx512 => unsafe { avx2::blend_luma(out, src, noise, lut, table, b) },
+        Tier::Avx2 | Tier::Avx512 => {
+            // SAFETY: `simd` is the proof that AVX2 was detected (`simd::available`); the
+            // AVX-512 tier is only detected together with AVX2.
+            unsafe { avx2::blend_luma(out, src, noise, lut, table, b) }
+        }
         #[cfg(target_arch = "aarch64")]
-        // SAFETY: `simd` is the proof that NEON was detected (`simd::available`).
-        Tier::Neon => unsafe { neon::blend_luma(out, src, noise, lut, table, b) },
+        Tier::Neon => {
+            // SAFETY: `simd` is the proof that NEON was detected (`simd::available`).
+            unsafe { neon::blend_luma(out, src, noise, lut, table, b) }
+        }
         _ => blend_luma_row(out, src, noise, lut, b),
     }
 }
@@ -64,14 +68,16 @@ pub(crate) fn blend_chroma(
     let (out, src, noise) = (&mut out[..n], &src[..n], &noise[..n]);
     match simd.tier() {
         #[cfg(target_arch = "x86_64")]
-        // SAFETY: `simd` is the proof that AVX2 was detected (`simd::available`); the AVX-512
-        // tier is only detected together with AVX2.
-        Tier::Avx2 | Tier::Avx512 => unsafe {
-            avx2::blend_chroma(out, src, luma, noise, lut, table, b)
-        },
+        Tier::Avx2 | Tier::Avx512 => {
+            // SAFETY: `simd` is the proof that AVX2 was detected (`simd::available`); the
+            // AVX-512 tier is only detected together with AVX2.
+            unsafe { avx2::blend_chroma(out, src, luma, noise, lut, table, b) }
+        }
         #[cfg(target_arch = "aarch64")]
-        // SAFETY: `simd` is the proof that NEON was detected (`simd::available`).
-        Tier::Neon => unsafe { neon::blend_chroma(out, src, luma, noise, lut, table, b) },
+        Tier::Neon => {
+            // SAFETY: `simd` is the proof that NEON was detected (`simd::available`).
+            unsafe { neon::blend_chroma(out, src, luma, noise, lut, table, b) }
+        }
         _ => blend_chroma_row(out, src, luma, noise, lut, b),
     }
 }
