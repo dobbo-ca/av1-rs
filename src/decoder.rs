@@ -116,6 +116,9 @@ pub struct Decoder {
     state: Option<FrameState>,
     metadata: Vec<Metadata>,
     metadata_bytes: usize,
+    /// Charge the kept metadata to `ledger` (set with a shared ledger, so `max_metadata` is not
+    /// counted per frame and per decoder on top of it).
+    charge_metadata: bool,
     /// Output frames of the current temporal unit, before the layer selection.
     ready: Vec<Frame>,
     /// Ledger bytes held by the planes built for `ready` (and by a frame that failed half-built),
@@ -135,6 +138,7 @@ impl Decoder {
     pub(crate) fn with_ledger(options: Options, limits: Limits, ledger: Arc<Ledger>) -> Decoder {
         let mut d = Self::build(options, limits, false);
         d.ledger = ledger;
+        d.charge_metadata = true;
         d
     }
 
@@ -160,6 +164,7 @@ impl Decoder {
             state: None,
             metadata: Vec::new(),
             metadata_bytes: 0,
+            charge_metadata: false,
             ready: Vec::new(),
             ready_bytes: 0,
             infos: Vec::new(),
@@ -192,8 +197,7 @@ impl Decoder {
         self.pending = None;
         self.ready.clear();
         self.release_ready();
-        self.metadata.clear();
-        self.metadata_bytes = 0;
+        self.clear_metadata();
         for obu in ObuIter::new(data, format) {
             if cancel.load(Ordering::Relaxed) {
                 return Err(Error::Cancelled);
@@ -263,8 +267,7 @@ impl Decoder {
             OBU_TEMPORAL_DELIMITER => {
                 // `SeenFrameHeader = 0`: an unfinished frame is abandoned.
                 self.pending = None;
-                self.metadata.clear();
-                self.metadata_bytes = 0;
+                self.clear_metadata();
                 Ok(())
             }
             OBU_FRAME_HEADER | OBU_REDUNDANT_FRAME_HEADER => {
@@ -512,9 +515,21 @@ impl Decoder {
         if total > self.limits.max_metadata {
             return Err(Error::MetadataLimit);
         }
+        if self.charge_metadata {
+            self.ledger.reserve(cost)?;
+        }
         self.metadata_bytes = total;
         self.metadata.push(m);
         Ok(())
+    }
+
+    /// Drops the kept metadata, and gives back what a shared ledger was charged for it.
+    fn clear_metadata(&mut self) {
+        if self.charge_metadata {
+            self.ledger.release(self.metadata_bytes);
+        }
+        self.metadata.clear();
+        self.metadata_bytes = 0;
     }
 
     /// Builds the output frame from stored planes (spec 7.18): film grain on a copy when
@@ -594,6 +609,7 @@ impl Decoder {
                 out.push(self.public_plane(p, p.width, p.height, s.bit_depth)?);
             }
         }
+        // The frame owns the metadata now; a shared ledger keeps it booked for the rest of the call.
         let metadata = std::mem::take(&mut self.metadata);
         self.metadata_bytes = 0;
         Ok(Frame {
@@ -1013,6 +1029,33 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(d.metadata.len(), 1);
+    }
+
+    // On a shared ledger the kept metadata is booked in it, so many decoders (or many frames of
+    // one unit) cannot keep `max_metadata` each on top of `max_alloc`.
+    #[test]
+    fn shared_ledger_books_the_metadata() {
+        let m = obu(OBU_METADATA, &[1, 0x03, 0xe8, 0x01, 0x90, 0x80]);
+        let shared = |extra: usize| {
+            let ledger = Arc::new(Ledger::default());
+            ledger.reset(crate::ledger::SMALL + extra, 0).unwrap();
+            ledger
+        };
+        let ledger = shared(4);
+        let mut d = Decoder::with_ledger(Options::default(), Limits::default(), ledger.clone());
+        assert_eq!(
+            d.decode_temporal_unit(&m, Format::Section5, &cancel()),
+            Err(Error::AllocLimit)
+        );
+        let ledger = shared(1 << 20);
+        let mut d = Decoder::with_ledger(Options::default(), Limits::default(), ledger.clone());
+        d.decode_temporal_unit(&m, Format::Section5, &cancel())
+            .unwrap();
+        assert!(ledger.left() < 1 << 20);
+        // The next unit drops the kept metadata and gives its bytes back.
+        d.decode_temporal_unit(&[], Format::Section5, &cancel())
+            .unwrap();
+        assert_eq!(ledger.left(), 1 << 20);
     }
 
     #[test]
