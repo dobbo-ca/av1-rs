@@ -102,6 +102,19 @@ per-tier vector primitives, written from the spec code (not ported from dav1d).
   families dispatch to, on bands), and it has no `unsafe`. Its "cross-tier" checks compare
   thread counts instead: the unit tests in `decoder.rs` and the fuzz target `simd_threads`.
 
+- `coefhot` (speed round S): not a SIMD kernel family. Scalar, safe-code changes to the
+  coefficient path (`src/coef.rs`, `src/recon.rs`) with the same arithmetic and the same symbol
+  reads: `Quant[ ]` and the padded levels stay all zero between transform blocks (the levels are
+  cleared as the sign loop reads them, `Quant[ ]` over the coded region after the
+  reconstruction) instead of being cleared whole per block; the coefficient reader tracks the
+  coded region, so `recon::reconstruct_region` does not scan `Quant[ ]` again; the context
+  offsets, CDF rows and scan bounds are set up once per transform block; the above / left
+  context runs are slices; `BlockDecoded` and the loop filter transform sizes are filled by
+  rows. No tier and no new kernel boundary, so no fuzz target: the unit tests compare the
+  helpers with the spec loops (`coef::tests::context_runs_match_the_spec_loops`,
+  `padded_contexts_match_the_oracle`, `recon::tests::tracked_region_matches_the_scan`) and the
+  decode parity tests cover the rest.
+
 `entropy` also holds the scalar symbol reader (`src/symbol.rs`, after dav1d's msac: a 64-bit
 window, renormalisation by `leading_zeros`, a branchless symbol search) and the padded levels
 of the coefficient contexts (`src/coef.rs`); neither has a SIMD tier (the reader is serial, one
