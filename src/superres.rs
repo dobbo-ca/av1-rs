@@ -7,9 +7,10 @@ use crate::consts::{
 };
 use crate::decoder::check_cancel;
 use crate::error::Error;
-use crate::frame::{FrameState, Plane};
+use crate::frame::{FrameState, Plane, View};
 use crate::header::FrameHeader;
 use crate::seq::SequenceHeader;
+use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 
 /// `Upscale_Filter` (spec 7.16).
@@ -118,47 +119,76 @@ pub(crate) fn upscale(
     out: &mut [Plane],
     cancel: &AtomicBool,
 ) -> Result<(), Error> {
-    let max_val = (1i64 << seq.bit_depth) - 1;
     let planes = fs.num_planes.min(input.len()).min(out.len());
     for plane in 0..planes {
-        let (sub_x, sub_y) = if plane > 0 {
-            (u32::from(seq.subsampling_x), u32::from(seq.subsampling_y))
-        } else {
-            (0, 0)
-        };
-        let round2 = |v: u32, n: u32| i64::from((v + ((1 << n) >> 1)) >> n);
-        let downscaled_plane_w = round2(fh.frame_width, sub_x);
-        let upscaled_plane_w = round2(fh.upscaled_width, sub_x);
-        let plane_h = round2(fh.frame_height, sub_y) as usize;
-        if upscaled_plane_w == 0 {
-            continue;
+        let dst = &mut out[plane];
+        let size = (dst.width, dst.height);
+        let rows = 0..dst.height;
+        upscale_rows(
+            &input[plane],
+            plane,
+            seq,
+            fh,
+            size,
+            rows,
+            &mut View::of(dst),
+            cancel,
+        )?;
+    }
+    Ok(())
+}
+
+/// The rows `rows` of plane `plane` of [`upscale`]: reads `inp`, writes `dst`, whole rows (from
+/// row `dst.y0`, at least `rows`) of an output plane of `dst_size` (width, height) samples. The
+/// cancel flag is checked every 64 rows.
+pub(crate) fn upscale_rows(
+    inp: &Plane,
+    plane: usize,
+    seq: &SequenceHeader,
+    fh: &FrameHeader,
+    (dst_w, dst_h): (usize, usize),
+    rows: Range<usize>,
+    dst: &mut View<'_>,
+    cancel: &AtomicBool,
+) -> Result<(), Error> {
+    let max_val = (1i64 << seq.bit_depth) - 1;
+    let (sub_x, sub_y) = if plane > 0 {
+        (u32::from(seq.subsampling_x), u32::from(seq.subsampling_y))
+    } else {
+        (0, 0)
+    };
+    let round2 = |v: u32, n: u32| i64::from((v + ((1 << n) >> 1)) >> n);
+    let downscaled_plane_w = round2(fh.frame_width, sub_x);
+    let upscaled_plane_w = round2(fh.upscaled_width, sub_x);
+    let plane_h = round2(fh.frame_height, sub_y) as usize;
+    if upscaled_plane_w == 0 {
+        return Ok(());
+    }
+    let step_x =
+        ((downscaled_plane_w << SUPERRES_SCALE_BITS) + (upscaled_plane_w / 2)) / upscaled_plane_w;
+    let err = (upscaled_plane_w * step_x) - (downscaled_plane_w << SUPERRES_SCALE_BITS);
+    let mut initial_subpel_x = (-((upscaled_plane_w - downscaled_plane_w)
+        << (SUPERRES_SCALE_BITS - 1))
+        + upscaled_plane_w / 2)
+        / upscaled_plane_w
+        + (1 << (SUPERRES_EXTRA_BITS - 1))
+        - err / 2;
+    initial_subpel_x &= SUPERRES_SCALE_MASK as i64;
+    let mi_w = i64::from(fh.mi_cols >> sub_x);
+    if inp.width == 0 || inp.stride == 0 || dst.stride == 0 {
+        return Ok(());
+    }
+    let max_x = (mi_w * 4 - 1).min(inp.width as i64 - 1).max(0);
+    let out_w = (upscaled_plane_w as usize).min(dst_w);
+    let end = plane_h.min(inp.height).min(dst_h).min(rows.end);
+    for y in rows.start..end {
+        if y.is_multiple_of(64) {
+            check_cancel(cancel)?;
         }
-        let step_x = ((downscaled_plane_w << SUPERRES_SCALE_BITS) + (upscaled_plane_w / 2))
-            / upscaled_plane_w;
-        let err = (upscaled_plane_w * step_x) - (downscaled_plane_w << SUPERRES_SCALE_BITS);
-        let mut initial_subpel_x = (-((upscaled_plane_w - downscaled_plane_w)
-            << (SUPERRES_SCALE_BITS - 1))
-            + upscaled_plane_w / 2)
-            / upscaled_plane_w
-            + (1 << (SUPERRES_EXTRA_BITS - 1))
-            - err / 2;
-        initial_subpel_x &= SUPERRES_SCALE_MASK as i64;
-        let mi_w = i64::from(fh.mi_cols >> sub_x);
-        let (inp, dst) = (&input[plane], &mut out[plane]);
-        if inp.width == 0 || inp.stride == 0 || dst.stride == 0 {
-            continue;
-        }
-        let max_x = (mi_w * 4 - 1).min(inp.width as i64 - 1).max(0);
-        let out_w = (upscaled_plane_w as usize).min(dst.width);
-        let rows = plane_h.min(inp.height).min(dst.height);
-        for y in 0..rows {
-            if y.is_multiple_of(64) {
-                check_cancel(cancel)?;
-            }
-            let src_row = &inp.px[y * inp.stride..y * inp.stride + inp.width];
-            let dst_row = &mut dst.px[y * dst.stride..y * dst.stride + out_w];
-            upscale_row(src_row, dst_row, initial_subpel_x, step_x, max_x, max_val);
-        }
+        let src_row = &inp.px[y * inp.stride..y * inp.stride + inp.width];
+        let d = (y - dst.y0) * dst.stride;
+        let dst_row = &mut dst.px[d..d + out_w];
+        upscale_row(src_row, dst_row, initial_subpel_x, step_x, max_x, max_val);
     }
     Ok(())
 }

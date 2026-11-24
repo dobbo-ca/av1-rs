@@ -23,7 +23,7 @@ use super::{Simd, Tier};
 use crate::bits::floor_log2;
 use crate::cdef::{CDEF_DIRECTIONS, CDEF_PRI_TAPS, FilterCtx, cdef_direction, cdef_filter};
 use crate::consts::MI_SIZE;
-use crate::frame::Plane;
+use crate::frame::{Plane, View};
 
 /// Row stride of the padded block.
 const TS: usize = 16;
@@ -135,7 +135,7 @@ pub(crate) fn filter(
     simd: Simd,
     ctx: &FilterCtx,
     src: &Plane,
-    dst: &mut Plane,
+    dst: &mut View<'_>,
     plane: usize,
     sub: (usize, usize),
     r: usize,
@@ -169,7 +169,7 @@ pub(crate) fn filter(
     }
     // `prepare` checked that every row fits in `dst`.
     for (i, row) in out.chunks_exact(f.w).take(f.h).enumerate() {
-        let a = (y0 + i) * dst.stride + x0;
+        let a = (y0 - dst.y0 + i) * dst.stride + x0;
         if let Some(d) = dst.px.get_mut(a..a + f.w) {
             d.copy_from_slice(row);
         }
@@ -181,7 +181,7 @@ pub(crate) fn filter(
 fn prepare(
     ctx: &FilterCtx,
     src: &Plane,
-    dst: &Plane,
+    dst: &View<'_>,
     plane: usize,
     sub: (usize, usize),
     r: usize,
@@ -203,8 +203,10 @@ fn prepare(
     if x0 + w > cols || y0 + h > rows {
         return None;
     }
-    // Every output row must fit in `dst` (the oracle drops a sample that does not).
-    if (y0 + h - 1) * dst.stride + x0 + w > dst.px.len() {
+    // Every output row must fit in `dst`, which starts at plane row `dst.y0` (the oracle drops
+    // a sample that does not).
+    let dy = y0.checked_sub(dst.y0)?;
+    if (dy + h - 1) * dst.stride + x0 + w > dst.px.len() {
         return None;
     }
     // `constrain` of `cdef_filter`; a sentinel tap must give 0: `32768 >> shift >= threshold`.
@@ -381,11 +383,34 @@ mod tests {
                         let st = (pri, sec);
                         let mut want = plane(w, h, s.stride);
                         want.px.copy_from_slice(&s.px);
-                        cdef_filter(&ctx, &s, &mut want, plane_i, sub, r, c, st, damping, dir);
+                        cdef_filter(
+                            &ctx,
+                            &s,
+                            &mut View::of(&mut want),
+                            plane_i,
+                            sub,
+                            r,
+                            c,
+                            st,
+                            damping,
+                            dir,
+                        );
                         for t in available() {
                             let mut got = plane(w, h, s.stride);
                             got.px.copy_from_slice(&s.px);
-                            filter(t, &ctx, &s, &mut got, plane_i, sub, r, c, st, damping, dir);
+                            filter(
+                                t,
+                                &ctx,
+                                &s,
+                                &mut View::of(&mut got),
+                                plane_i,
+                                sub,
+                                r,
+                                c,
+                                st,
+                                damping,
+                                dir,
+                            );
                             assert_eq!(
                                 got.px, want.px,
                                 "{t:?} bd {bd} sub {sub:?} plane {plane_i} r {r} c {c} \

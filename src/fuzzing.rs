@@ -123,7 +123,7 @@ pub fn lr(data: &[u8]) {
 /// damping, direction, stride padding; the rest: the samples, two bytes each, repeated.
 pub fn cdef(data: &[u8]) {
     use crate::cdef::{FilterCtx, cdef_direction, cdef_filter};
-    use crate::frame::Plane;
+    use crate::frame::{Plane, View};
     use crate::ledger::Ledger;
     use crate::simd::{available, cdef as k};
     use std::sync::Arc;
@@ -189,7 +189,7 @@ pub fn cdef(data: &[u8]) {
     cdef_filter(
         &ctx,
         &src,
-        &mut want,
+        &mut View::of(&mut want),
         plane,
         sub,
         r,
@@ -204,7 +204,7 @@ pub fn cdef(data: &[u8]) {
             s,
             &ctx,
             &src,
-            &mut got,
+            &mut View::of(&mut got),
             plane,
             sub,
             r,
@@ -259,4 +259,12 @@ pub fn itx(data: &[u8]) {
         v
     };
     crate::simd::itx::check_random(&mut next);
+}
+
+/// Family `threads` (no SIMD tiers: it compares thread counts). Builds a frame whose tiles are
+/// done from `data` (format, bit depth, superres, size, filter parameters, mode info and
+/// samples) and runs the threaded wrapup (loop filter, CDEF, superres, loop restoration) with
+/// 2 and 3 threads: the samples or the error must equal those of 1 thread.
+pub fn threads(data: &[u8]) {
+    crate::decoder::check_threads(data, &[2, 3]);
 }

@@ -76,3 +76,10 @@ path = "fuzz_targets/simd_itx.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "simd_threads"
+path = "fuzz_targets/simd_threads.rs"
+test = false
+doc = false
+bench = false

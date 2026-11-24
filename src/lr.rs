@@ -12,7 +12,7 @@ use crate::consts::{
 };
 use crate::decoder::check_cancel;
 use crate::error::Error;
-use crate::frame::{FrameState, Plane};
+use crate::frame::{FrameState, Plane, View};
 use crate::header::FrameHeader;
 use crate::seq::SequenceHeader;
 use crate::simd::lr as simd_lr;
@@ -106,14 +106,15 @@ pub(crate) fn wiener_coefficients(coeff: &[i8; 3]) -> [i64; 7] {
 }
 
 /// Wiener filter process (spec 7.17.4) on the `w` x `h` block at (`x`, `y`) of `dst`; `win` is the
-/// source window of that block, `lr` is `LrWiener[ plane ][ unitRow ][ unitCol ]`.
+/// source window of that block, `lr` is `LrWiener[ plane ][ unitRow ][ unitCol ]`. `y` counts
+/// from `dst.y0`.
 pub(crate) fn wiener_filter(
     win: &[i32],
     w: usize,
     h: usize,
     bd: usize,
     lr: &[[i8; 3]; 2],
-    dst: &mut Plane,
+    dst: &mut View<'_>,
     x: usize,
     y: usize,
 ) {
@@ -231,7 +232,8 @@ fn box_filter(
     f
 }
 
-/// Self guided filter process (spec 7.17.2) on the `w` x `h` block at (`x`, `y`) of `dst`.
+/// Self guided filter process (spec 7.17.2) on the `w` x `h` block at (`x`, `y`) of `dst` (`y`
+/// counts from `dst.y0`).
 pub(crate) fn self_guided_filter(
     win: &[i32],
     w: usize,
@@ -239,7 +241,7 @@ pub(crate) fn self_guided_filter(
     bd: usize,
     set: usize,
     xqd: &[i8; 2],
-    dst: &mut Plane,
+    dst: &mut View<'_>,
     x: usize,
     y: usize,
 ) {
@@ -280,10 +282,6 @@ pub(crate) fn lr_frame(
     out: &mut [Plane],
     cancel: &AtomicBool,
 ) -> Result<(), Error> {
-    let bd = usize::from(seq.bit_depth);
-    let simd = crate::simd::best();
-    // The source window of the current block (at most 70 x 70 samples).
-    let mut win = Vec::new();
     let planes = fs
         .num_planes
         .min(3)
@@ -291,94 +289,169 @@ pub(crate) fn lr_frame(
         .min(upscaled_curr.len())
         .min(out.len());
     for plane in 0..planes {
-        if fh.frame_restoration_type[plane] == RESTORE_NONE {
-            continue;
-        }
-        let (sub_x, sub_y) = if plane > 0 {
-            (
-                usize::from(seq.subsampling_x),
-                usize::from(seq.subsampling_y),
-            )
-        } else {
-            (0, 0)
-        };
-        let unit_size = usize::from(fh.loop_restoration_size[plane]);
-        let (unit_rows, unit_cols) = (fs.lr_unit_rows[plane], fs.lr_unit_cols[plane]);
-        if unit_size == 0 || unit_rows == 0 || unit_cols == 0 {
-            continue;
-        }
         let (cdef, curr) = (&upscaled_cdef[plane], &upscaled_curr[plane]);
         let dst = &mut out[plane];
-        let round2u = |v: usize, n: usize| (v + ((1 << n) >> 1)) >> n;
-        let plane_w = round2u(fs.upscaled_width, sub_x)
-            .min(cdef.width)
-            .min(curr.width)
-            .min(dst.width);
-        let plane_h = round2u(fs.frame_height, sub_y)
-            .min(cdef.height)
-            .min(curr.height)
-            .min(dst.height);
-        if plane_w == 0 || plane_h == 0 {
+        let Some(g) = lr_plane(fs, seq, fh, plane, [cdef, curr], (dst.width, dst.height)) else {
             continue;
-        }
-        // PlaneEndX, PlaneEndY.
-        let (end_x, end_y) = (plane_w - 1, plane_h - 1);
+        };
+        let mut dst = View::of(dst);
         let mut stripe_num = 0usize;
         loop {
             check_cancel(cancel)?;
-            let start = ((stripe_num * 64) as isize - 8) >> sub_y;
-            if start > end_y as isize {
+            if g.stripe(stripe_num).is_none() {
                 break;
             }
-            let st = Stripe {
-                start,
-                end: start + (64 >> sub_y) as isize - 1,
-                end_x: end_x as isize,
-                end_y: end_y as isize,
-            };
-            let y0 = start.max(0) as usize;
-            let y1 = st.end.min(end_y as isize) as usize;
-            let luma_y = if stripe_num == 0 {
-                0
-            } else {
-                stripe_num * 64 - 8
-            };
-            let unit_row = (unit_rows - 1).min(((luma_y + 8) >> sub_y) / unit_size);
+            lr_stripe(fs, seq, &g, stripe_num, cdef, curr, &mut dst);
             stripe_num += 1;
-            for unit_col in 0..unit_cols {
-                let x0 = unit_col * unit_size;
-                if x0 > end_x {
-                    break;
-                }
-                let x1 = if unit_col + 1 == unit_cols {
-                    end_x
-                } else {
-                    ((unit_col + 1) * unit_size - 1).min(end_x)
-                };
-                let idx = unit_row * unit_cols + unit_col;
-                let r_type = fs.lr_type[plane].get(idx).copied().unwrap_or(RESTORE_NONE);
-                if r_type != RESTORE_WIENER && r_type != RESTORE_SGRPROJ {
-                    continue;
-                }
-                let h = y1 - y0 + 1;
-                for x in (x0..=x1).step_by(BLOCK_W) {
-                    let w = BLOCK_W.min(x1 - x + 1);
-                    source_window(cdef, curr, &st, x, y0, w, h, &mut win);
-                    if r_type == RESTORE_WIENER {
-                        if let Some(lr) = fs.lr_wiener[plane].get(idx) {
-                            simd_lr::wiener(simd, &win, w, h, bd, lr, dst, x, y0);
-                        }
-                    } else if let (Some(&set), Some(xqd)) =
-                        (fs.lr_sgr_set[plane].get(idx), fs.lr_sgr_xqd[plane].get(idx))
-                    {
-                        let set = usize::from(set);
-                        simd_lr::self_guided(simd, &win, w, h, bd, set, xqd, dst, x, y0);
-                    }
-                }
-            }
         }
     }
     Ok(())
+}
+
+/// Where loop restoration works in one plane.
+pub(crate) struct LrPlane {
+    plane: usize,
+    sub_y: usize,
+    unit_size: usize,
+    unit_rows: usize,
+    unit_cols: usize,
+    /// `PlaneEndX`, `PlaneEndY`.
+    end_x: usize,
+    end_y: usize,
+}
+
+/// The loop restoration of plane `plane` (0 to 2) with inputs `[ UpscaledCdefFrame,
+/// UpscaledCurrFrame ]` and an output plane of `dst_size` (width, height) samples; `None` when
+/// the plane is not restored or has no area.
+pub(crate) fn lr_plane(
+    fs: &FrameState,
+    seq: &SequenceHeader,
+    fh: &FrameHeader,
+    plane: usize,
+    [cdef, curr]: [&Plane; 2],
+    (dst_w, dst_h): (usize, usize),
+) -> Option<LrPlane> {
+    if fh.frame_restoration_type[plane] == RESTORE_NONE {
+        return None;
+    }
+    let (sub_x, sub_y) = if plane > 0 {
+        (
+            usize::from(seq.subsampling_x),
+            usize::from(seq.subsampling_y),
+        )
+    } else {
+        (0, 0)
+    };
+    let unit_size = usize::from(fh.loop_restoration_size[plane]);
+    let (unit_rows, unit_cols) = (fs.lr_unit_rows[plane], fs.lr_unit_cols[plane]);
+    if unit_size == 0 || unit_rows == 0 || unit_cols == 0 {
+        return None;
+    }
+    let round2u = |v: usize, n: usize| (v + ((1 << n) >> 1)) >> n;
+    let plane_w = round2u(fs.upscaled_width, sub_x)
+        .min(cdef.width)
+        .min(curr.width)
+        .min(dst_w);
+    let plane_h = round2u(fs.frame_height, sub_y)
+        .min(cdef.height)
+        .min(curr.height)
+        .min(dst_h);
+    if plane_w == 0 || plane_h == 0 {
+        return None;
+    }
+    Some(LrPlane {
+        plane,
+        sub_y,
+        unit_size,
+        unit_rows,
+        unit_cols,
+        end_x: plane_w - 1,
+        end_y: plane_h - 1,
+    })
+}
+
+impl LrPlane {
+    /// Stripe `n` (64 luma rows, offset up by 8); `None` after the last one. The stripes of a
+    /// plane cover its rows once each, in order.
+    fn stripe(&self, n: usize) -> Option<Stripe> {
+        let start = ((n * 64) as isize - 8) >> self.sub_y;
+        if start > self.end_y as isize {
+            return None;
+        }
+        Some(Stripe {
+            start,
+            end: start + (64 >> self.sub_y) as isize - 1,
+            end_x: self.end_x as isize,
+            end_y: self.end_y as isize,
+        })
+    }
+
+    /// The rows `y0..=y1` of the plane that stripe `n` filters.
+    pub(crate) fn stripe_rows(&self, n: usize) -> Option<(usize, usize)> {
+        let st = self.stripe(n)?;
+        Some((st.start.max(0) as usize, st.end.min(st.end_y) as usize))
+    }
+}
+
+/// Loop restoration of stripe `n` of plane `g`, every unit column: reads `cdef` and `curr`
+/// (that plane of `UpscaledCdefFrame` and `UpscaledCurrFrame`), writes the restored units
+/// into `dst`, whole rows of the `LrFrame` plane (from row `dst.y0`, the stripe's rows among
+/// them).
+pub(crate) fn lr_stripe(
+    fs: &FrameState,
+    seq: &SequenceHeader,
+    g: &LrPlane,
+    n: usize,
+    cdef: &Plane,
+    curr: &Plane,
+    dst: &mut View<'_>,
+) {
+    let (Some(st), Some((y0, y1))) = (g.stripe(n), g.stripe_rows(n)) else {
+        return;
+    };
+    // The stripe's first row in `dst`.
+    let Some(dst_y) = y0.checked_sub(dst.y0) else {
+        return;
+    };
+    let bd = usize::from(seq.bit_depth);
+    let simd = crate::simd::best();
+    // The source window of the current block (at most 70 x 70 samples).
+    let mut win = Vec::new();
+    let plane = g.plane;
+    let end_x = g.end_x;
+    let luma_y = if n == 0 { 0 } else { n * 64 - 8 };
+    let unit_row = (g.unit_rows - 1).min(((luma_y + 8) >> g.sub_y) / g.unit_size);
+    for unit_col in 0..g.unit_cols {
+        let x0 = unit_col * g.unit_size;
+        if x0 > end_x {
+            break;
+        }
+        let x1 = if unit_col + 1 == g.unit_cols {
+            end_x
+        } else {
+            ((unit_col + 1) * g.unit_size - 1).min(end_x)
+        };
+        let idx = unit_row * g.unit_cols + unit_col;
+        let r_type = fs.lr_type[plane].get(idx).copied().unwrap_or(RESTORE_NONE);
+        if r_type != RESTORE_WIENER && r_type != RESTORE_SGRPROJ {
+            continue;
+        }
+        let h = y1 - y0 + 1;
+        for x in (x0..=x1).step_by(BLOCK_W) {
+            let w = BLOCK_W.min(x1 - x + 1);
+            source_window(cdef, curr, &st, x, y0, w, h, &mut win);
+            if r_type == RESTORE_WIENER {
+                if let Some(lr) = fs.lr_wiener[plane].get(idx) {
+                    simd_lr::wiener(simd, &win, w, h, bd, lr, dst, x, dst_y);
+                }
+            } else if let (Some(&set), Some(xqd)) =
+                (fs.lr_sgr_set[plane].get(idx), fs.lr_sgr_xqd[plane].get(idx))
+            {
+                let set = usize::from(set);
+                simd_lr::self_guided(simd, &win, w, h, bd, set, xqd, dst, x, dst_y);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -400,7 +473,7 @@ mod tests {
             .map(|i| (i as i32 * 37) % 256)
             .collect();
         let mut dst = plane(w, h);
-        wiener_filter(&win, w, h, 8, &[[0; 3]; 2], &mut dst, 0, 0);
+        wiener_filter(&win, w, h, 8, &[[0; 3]; 2], &mut View::of(&mut dst), 0, 0);
         for r in 0..h {
             for c in 0..w {
                 assert_eq!(i32::from(dst.px[r * w + c]), win[(r + 3) * (w + 6) + c + 3]);
