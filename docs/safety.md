@@ -57,6 +57,7 @@ Production code passes `simd::best()`; tests loop over `simd::available()`.
 | `cdef` | `cdef::cdef_direction`, `cdef::cdef_filter` | `direction` (7.15.2, one 8x8 luma block), `filter` (7.15.3, one 8x8, 4x4, 4x8 or 8x4 block), 8/10/12-bit. The filter copies the block and a 2-sample border into a padded 16-bit block with the sentinel `0x8000` for unavailable taps (dav1d's design, see NOTICE), so the kernel has no per-tap check. The dispatch takes the oracle for a block whose premises do not hold (block not fully inside `MiRows` x `MiCols`, a sample of 4096 or more, strengths above 255, a plane too short); decoded frames always meet them (`MiRows` and `MiCols` are even, samples fit the bit depth) | AVX2 (16 lanes), NEON (8 lanes); AVX-512 runs the AVX2 kernels |
 | `ipred` | `src/predict.rs` | Paeth; Smooth, Smooth_V, Smooth_H; directional zone 1 without upsampling; intra edge filter; palette (rows of 8); CFL alpha step | AVX2 (8 x i32), NEON (4 x i32); AVX-512 runs the AVX2 kernels |
 | `itx` | `transform::inverse_transform_add` | 2D inverse transform + add/clip into the samples: DCT 4..64, ADST 4/8/16, identity 4..32, flips, rect scaling, row/column shifts and clamps | AVX2 (8 x i32), NEON (4 x i32); AVX-512 runs the AVX2 kernel (the 16-lane kernel was dropped, see below) |
+| `entropy` | `symbol::adapt_cdf` | `adapt_cdf`: the CDF update of `read_symbol` for 4 to 16 symbols | AVX2, NEON; AVX-512 runs the AVX2 kernel (at most 16 lanes of `u16`, nothing for wider vectors to do) |
 
 Tiers not written:
 
@@ -101,6 +102,12 @@ per-tier vector primitives, written from the spec code (not ported from dav1d).
   families dispatch to, on bands), and it has no `unsafe`. Its "cross-tier" checks compare
   thread counts instead: the unit tests in `decoder.rs` and the fuzz target `simd_threads`.
 
+`entropy` also holds the scalar symbol reader (`src/symbol.rs`, after dav1d's msac: a 64-bit
+window, renormalisation by `leading_zeros`, a branchless symbol search) and the padded levels
+of the coefficient contexts (`src/coef.rs`); neither has a SIMD tier (the reader is serial, one
+symbol at a time). The spec's bit by bit reader stays as `symbol::oracle` (tests and the
+`simd_entropy` fuzz target only).
+
 ## Kernels kept and dropped
 
 A kernel stays only when the bench (docs/benchmarks.md) shows that it wins. Kernels and tiers
@@ -114,6 +121,7 @@ that were tried and dropped are listed here with their numbers.
 | `ipred` Paeth, Smooth, zone 1, edge filter, palette, CFL; V/H fills | AVX2, AVX-512 (runs AVX2) | Kept, not slower than scalar; the gain is at the edge of what the bench resolves. Tier table (bench run 45345035593), scalar / avx2 / avx512 ms: allintra 824 / 583 / 584, avif8 138 / 82 / 82, avifhi 340 / 226 / 226, tiles8 538 / 230 / 229, tiles10 554 / 233 / 232 (the `cdef` bench before the change: allintra 837 / 593 / 591, avif8 139 / 83 / 83, avifhi 343 / 231 / 235, tiles8 542 / 233 / 235, tiles10 558 / 235 / 236). avx2 went down 1 to 2% on every class (allintra 593 to 583, avifhi 231 to 226), but the scalar tier, which runs the unchanged oracle, moved by the same amount, so avx2 / scalar stays within 1 point (allintra 71% / 71%, avifhi 67% / 66%). The kernels cover the cheap intra modes; DC and directional zones 2 and 3 still run the oracle. NEON is not benched (the bench runs on x86_64 only). |
 | `itx` inverse transforms + add/clip; scalar coded-region recon and DC-only path | AVX2 | Kept. Tier table (bench run 45355824675), scalar / avx2 / avx512 ms: allintra 782 / 496 / 497, avif8 130 / 61 / 61, avifhi 317 / 149 / 148, tiles8 518 / 167 / 168, tiles10 530 / 169 / 168 (the `ipred` bench before the change: allintra 824 / 583 / 584, avif8 138 / 82 / 82, avifhi 340 / 226 / 226, tiles8 538 / 230 / 229, tiles10 554 / 233 / 232). The scalar tier (coded region only, no 32 KiB memsets, DC-only path) went down 3 to 6% (allintra 824 to 782, avifhi 340 to 317); avx2 went down 15 to 34% (allintra 583 to 496, avif8 82 to 61, avifhi 226 to 149, tiles8 230 to 167, tiles10 233 to 169). NEON is not benched (the bench runs on x86_64 only). |
 | `itx` 16-lane kernel (blocks of at least 16x16) | AVX-512 | Dropped: no measurable win over AVX2. In bench run 45355824675 the AVX-512 tier (16-lane kernel for blocks of at least 16x16, AVX2 kernel for the rest) against AVX2 ms: allintra 497 / 496, avif8 61 / 61, avifhi 148 / 149, tiles8 168 / 167, tiles10 168 / 169. The Avx512 tier now runs the AVX2 kernel. |
+| `entropy` CDF adaptation; scalar msac-style reader and padded coefficient levels | AVX2, AVX-512 (runs AVX2) | Kept. Tier table (bench run 45383238337, repeated within 1 ms of run 45379934968), scalar / avx2 / avx512 ms: allintra 719 / 414 / 414, avif8 125 / 55 / 55, avifhi 309 / 138 / 137, tiles8 513 / 153 / 154, tiles10 529 / 154 / 155 (the `threads` bench before the change, run 45371888091: allintra 790 / 499 / 499, avif8 130 / 61 / 61, avifhi 317 / 148 / 147, tiles8 519 / 168 / 167, tiles10 535 / 168 / 168). The scalar tier (new reader and levels, scalar adaptation) went down 1 to 9% (allintra 790 to 719); avx2 went down 7 to 17% (allintra 499 to 414, avif8 61 to 55, avifhi 148 to 138, tiles8 168 to 153, tiles10 168 to 154), avx2 / scalar from 63% to 57% on allintra. The bench does not separate the SIMD adaptation from the reader; AVX-512 runs the AVX2 kernel and is within the noise of it. NEON is not benched (the bench runs on x86_64 only). |
 
 ## Hostile input
 

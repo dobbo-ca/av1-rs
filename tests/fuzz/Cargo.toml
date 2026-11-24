@@ -83,3 +83,10 @@ path = "fuzz_targets/simd_threads.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "simd_entropy"
+path = "fuzz_targets/simd_entropy.rs"
+test = false
+doc = false
+bench = false

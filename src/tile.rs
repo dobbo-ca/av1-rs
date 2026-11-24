@@ -30,6 +30,7 @@
 #![allow(dead_code)]
 
 use crate::cdf::CdfContext;
+use crate::coef::{LEVELS_LEN, QUANT_LEN};
 use crate::consts::*;
 use crate::error::Error;
 use crate::frame::{Charged, FrameState};
@@ -176,6 +177,12 @@ pub(crate) struct TileDecoder<'a> {
 
     /// The reconstruction buffers (fixed size, reused by every transform block).
     pub itx: Box<ItxScratch>,
+    /// `Quant[ ]` of the current transform block (spec 5.11.39); see `coef`. Allocated once
+    /// per tile.
+    pub quant: Box<[i32; QUANT_LEN]>,
+    /// The levels of the current transform block, padded so that the context reads need no
+    /// bounds checks; see `coef::TX_PAD`.
+    pub levels: Box<[u8; LEVELS_LEN]>,
 
     _charged: Charged,
 }
@@ -475,6 +482,8 @@ impl<'a> TileDecoder<'a> {
             left_seg_pred_context,
             block_decoded: [[[false; BD]; BD]; 3],
             itx: ItxScratch::new(),
+            quant: Box::new([0; QUANT_LEN]),
+            levels: Box::new([0; LEVELS_LEN]),
             _charged: charged,
         })
     }
