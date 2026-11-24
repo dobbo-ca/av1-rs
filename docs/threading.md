@@ -3,7 +3,7 @@
 `Limits::max_threads` is the most OS threads one call uses, the calling thread included. 1 spawns
 no thread: the calling thread does all the work. Output is byte-identical for every thread count.
 All threading is safe Rust (`std::thread::scope`, `Mutex`, `RwLock`, `Condvar`, atomics); the
-crate forbids `unsafe`.
+crate denies `unsafe` outside `src/simd` (docs/safety.md).
 
 ## What runs in parallel
 

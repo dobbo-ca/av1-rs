@@ -282,12 +282,13 @@ struct Canvas {
     first: u32,
 }
 
-/// The sample bytes of a frame.
+/// The heap bytes of a frame's sample buffers: their capacity, as an output plane taken from
+/// the pool can be larger than its samples.
 pub(crate) fn frame_bytes(f: &Frame) -> usize {
     f.planes.iter().fold(0usize, |n, p| {
         n.saturating_add(match &p.data {
-            PlaneData::U8(v) => v.len(),
-            PlaneData::U16(v) => v.len().saturating_mul(2),
+            PlaneData::U8(v) => v.capacity(),
+            PlaneData::U16(v) => v.capacity().saturating_mul(2),
         })
     })
 }

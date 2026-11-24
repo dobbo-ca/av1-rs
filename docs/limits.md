@@ -31,7 +31,8 @@ luma rows while the band runs, its noise stripe and the one above it (34 rows of
 copy, the colour maps, the coefficient and level buffers, about 27 KB per tile decoder) is not
 charged. The output planes are charged
 from when they are built until the
-temporal unit returns; `decode` keeps every frame it collects charged until it returns. AVIF: one
+temporal unit returns; `decode` keeps every frame it collects charged (for the capacity of its
+planes, which may be pooled buffers larger than the samples) until it returns. AVIF: one
 ledger per `decode_avif` call covers every item decoder, the grid canvas, the item copy and the
 primary image (docs/threading.md).
 

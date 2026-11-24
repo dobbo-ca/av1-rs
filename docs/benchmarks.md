@@ -4,7 +4,7 @@ Information only: there is no speed bar. `.github/workflows/bench.yml` runs
 `tests/parity/bench.sh` in the `bench` image (push to `main` and dispatch). dav1d 1.0.0, aomdec
 3.6.0 and av1-rs (`examples/oracle.rs --null`) decode the same frames of each bench class, once
 with one thread and once with the default threads (`nproc`). av1-rs runs twice: the default
-release build (runtime SIMD dispatch) and the release-binary build of docs/conventions.md
+release build (runtime SIMD dispatch) and a release-binary build
 (`-C target-cpu=x86-64-v4 -C target-feature=+false-deps-tzcnt,+false-deps-bls`, fat LTO,
 `panic=abort`), and a third table times the default build with each SIMD tier forced
 (`AV1_SIMD`). The figure is the wall time of the whole class, best of 5. No decoder writes
