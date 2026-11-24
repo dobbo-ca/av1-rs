@@ -12,9 +12,7 @@ Ported code
 
 src/simd/cdef (mod.rs, avx2.rs, neon.rs) follows the CDEF filter design of dav1d
 (src/cdef_tmpl.c, src/x86/cdef*.asm): a padded 16-bit block with a sentinel for unavailable
-taps. src/simd/entropy (mod.rs, avx2.rs, neon.rs) follows the vector symbol search and
-adaptation of dav1d's msac_decode_symbol_adapt16 (src/x86/msac.asm, src/arm/64/msac.S).
-src/symbol.rs (the symbol reader, after src/msac.c) and src/coef.rs (the padded levels
+taps. src/symbol.rs (the symbol reader, after src/msac.c) and src/coef.rs (the padded levels
 of the coefficient contexts, after src/recon_tmpl.c) carry code ported from dav1d. dav1d is
 distributed under the following license:
 

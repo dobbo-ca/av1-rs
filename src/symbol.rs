@@ -6,8 +6,8 @@
 //! docs/dependencies.md): `SymbolValue` is the top 16 bits of a 64-bit window whose lower bits
 //! hold the next bits of the tile data, inverted, refilled a byte at a time; the renormalisation
 //! shifts by `leading_zeros`; the symbol search stops at the first partition point at or below
-//! the value (or, on the SIMD tiers, compares it with all of them at once and adapts the row in
-//! the same pass, `simd::entropy::decode_symbol`); `read_bool` has its own fast path. The CDFs
+//! the value (`search`; the SIMD tiers then adapt the row, `simd::entropy::decode_symbol`);
+//! `read_bool` has its own fast path. The CDFs
 //! keep this crate's convention (the spec's values, ending in 32768, then the counter).
 //!
 //! The arithmetic is the spec's, so every symbol and every state equal those of the bit by bit
