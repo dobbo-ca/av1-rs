@@ -12,7 +12,12 @@ The crate depends on `isobmff` (our container parser, pinned by rev) and otherwi
     and `src/x86/cdef*.asm` (a padded 16-bit block with the sentinel `0x8000` for unavailable
     taps; signed max and unsigned min skip it). Copyright © 2018, VideoLAN and dav1d authors;
     Copyright © 2018, Two Orioles, LLC.
-  - `src/symbol.rs`: the symbol reader's window, refill, renormalisation and `read_bool` fast
+  - `src/symbol.rs`: the symbol reader's window, refill, renormalisation, sequential symbol
+    search (`msac_decode_symbol_adapt`) and `read_bool` fast
     path, after dav1d's `src/msac.c`.
+  - `src/simd/entropy/{mod,avx2,neon}.rs`: the vector symbol search and adaptation in one pass
+    over the CDF row, after dav1d's `msac_decode_symbol_adapt16` (`src/x86/msac.asm`,
+    `src/arm/64/msac.S`). Copyright © 2019, VideoLAN and dav1d authors; Copyright © 2019, Two
+    Orioles, LLC.
   - `src/coef.rs`: the padded levels array behind the `coeff_base` and `coeff_br` contexts,
     after dav1d's `src/recon_tmpl.c` (`decode_coefs`).

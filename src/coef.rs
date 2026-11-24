@@ -1132,7 +1132,7 @@ impl TileDecoder<'_> {
                     eob += 1 << (eob_pt - 3);
                 }
                 for i in 1..(eob_pt - 2) {
-                    if self.sd.read_literal(1) != 0 {
+                    if self.sd.read_bool() {
                         eob += 1 << (eob_pt - 2 - 1 - i);
                     }
                 }
@@ -1192,14 +1192,14 @@ impl TileDecoder<'_> {
                             .read_symbol(&mut self.cdf.dc_sign_cdf[ptype][dc_ctx])
                             != 0;
                     } else {
-                        sign = self.sd.read_literal(1) != 0;
+                        sign = self.sd.read_bool();
                     }
                 }
                 if q > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
                     let mut length = 0;
                     loop {
                         length += 1;
-                        if self.sd.read_literal(1) != 0 {
+                        if self.sd.read_bool() {
                             break;
                         }
                         if length == 20 {
@@ -1211,7 +1211,7 @@ impl TileDecoder<'_> {
                     }
                     let mut x = 1i32;
                     for _ in 0..length - 1 {
-                        x = (x << 1) | self.sd.read_literal(1) as i32;
+                        x = (x << 1) | i32::from(self.sd.read_bool());
                     }
                     q = x + (COEFF_BASE_RANGE + NUM_BASE_LEVELS) as i32;
                 }
