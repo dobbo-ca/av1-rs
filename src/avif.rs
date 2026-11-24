@@ -106,9 +106,9 @@ pub fn decode_avif(
 ///
 /// `limits.max_alloc` is the peak of this call: an eighth is given to the `isobmff` reads of the
 /// item bytes and the rest to one ledger for every decoder, the assembled grid, the item copies
-/// and the output. `limits.max_metadata` is counted on top of `max_alloc`, as in [`Decoder`]. The
-/// frame size limits apply to every decoded frame and to the grid; `cancel` is checked between
-/// tiles and inside every decode.
+/// and the output. `limits.max_metadata` caps the metadata of one frame; what every decoder of
+/// the call keeps is also booked in that ledger. The frame size limits apply to every decoded
+/// frame and to the grid; `cancel` is checked between tiles and inside every decode.
 ///
 /// # Errors
 /// [`Error::Container`] when `id` is not an image item of `heif` or the item is broken, otherwise
@@ -128,8 +128,7 @@ pub fn decode_avif_item(
         ..isobmff::Limits::default()
     };
     let ledger = Arc::new(Ledger::default());
-    // A `max_alloc` below the small-allocation allowance only means that every charge fails.
-    let _ = ledger.reset(limits.max_alloc - limits.max_alloc / 8, 0);
+    ledger.reset(limits.max_alloc - limits.max_alloc / 8, 0)?;
     let ctx = Ctx {
         heif,
         file,
@@ -247,6 +246,9 @@ fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
         let tile = ctx.heif.image(*id).map_err(container)?;
         let decoder = Decoder::with_ledger(ctx.options.clone(), inner, Arc::clone(&ctx.ledger));
         let frame = decode_item(ctx, &tile, decoder)?;
+        // The tile's samples are booked until it is pasted; its metadata stays booked by the
+        // decoder.
+        let _held = ctx.ledger.charge(frame_bytes(&frame))?;
         let i = u32::try_from(i).map_err(|_| Error::Invalid("avif grid tile count"))?;
         let mut guard = canvas.lock().unwrap_or_else(|e| e.into_inner());
         // The canvas is sized by whichever tile finishes first; tile 0 then sets the properties
@@ -260,7 +262,7 @@ fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
             return Err(Error::Invalid("avif grid tile count"));
         };
         if i == 0 && c.first != 0 {
-            c.take_properties(&frame);
+            c.take_properties(&frame, &ctx.ledger)?;
         }
         c.paste(&frame, i % grid.columns, i / grid.columns)
     })?;
@@ -287,6 +289,13 @@ pub(crate) fn frame_bytes(f: &Frame) -> usize {
             PlaneData::U8(v) => v.len(),
             PlaneData::U16(v) => v.len().saturating_mul(2),
         })
+    })
+}
+
+/// What a decoder books for the metadata OBUs of a frame.
+fn metadata_bytes(f: &Frame) -> usize {
+    f.metadata.iter().fold(0usize, |n, m| {
+        n.saturating_add(m.payload.len() + size_of::<crate::Metadata>())
     })
 }
 
@@ -352,6 +361,8 @@ impl Canvas {
             .sum();
         // Booked for the rest of the call: the canvas is the image the caller gets.
         ledger.reserve(usize::try_from(total).map_err(|_| Error::AllocLimit)?)?;
+        // The canvas holds a copy of the first tile's metadata.
+        ledger.reserve(metadata_bytes(first))?;
         let mut planes = Vec::with_capacity(dims.len());
         for (width, height) in dims {
             let n = u64::from(width) * u64::from(height);
@@ -392,14 +403,18 @@ impl Canvas {
 
     /// Takes the output frame's properties (everything but the size, format and samples) from
     /// `tile`, tile 0 of the grid.
-    fn take_properties(&mut self, tile: &Frame) {
+    fn take_properties(&mut self, tile: &Frame, ledger: &Ledger) -> Result<(), Error> {
         let f = &mut self.frame;
+        // The metadata copy is booked (the old one is given back) before it is made.
+        ledger.reserve(metadata_bytes(tile))?;
+        ledger.release(metadata_bytes(f));
         f.color = tile.color;
         f.metadata = tile.metadata.clone();
         f.film_grain_applied = tile.film_grain_applied;
         f.frame_type = tile.frame_type;
         f.temporal_id = tile.temporal_id;
         f.spatial_id = tile.spatial_id;
+        Ok(())
     }
 
     /// Copies `tile` to tile position (`col`, `row`), clipped to the output.

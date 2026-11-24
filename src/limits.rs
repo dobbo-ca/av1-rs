@@ -21,8 +21,9 @@ pub struct Limits {
     /// Most `width * height` luma samples of a frame (default `1 << 28`). More is
     /// [`Error::PixelLimit`](crate::Error::PixelLimit).
     pub max_pixels: u64,
-    /// Sum of the metadata OBU payloads kept for one frame, in bytes (default 16 MiB), counted in
-    /// addition to `max_alloc`. More is
+    /// Sum of the metadata OBU payloads kept for one frame, in bytes (default 16 MiB). A
+    /// [`Decoder`](crate::Decoder) counts it in addition to `max_alloc`; the AVIF item decodes also
+    /// book what they keep in `max_alloc`. More is
     /// [`Error::MetadataLimit`](crate::Error::MetadataLimit).
     pub max_metadata: usize,
 }
