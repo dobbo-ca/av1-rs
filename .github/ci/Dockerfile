@@ -156,6 +156,18 @@ RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
     sh tests/parity/run.sh seeds tests/fuzz/seeds
 RUN cargo +nightly fuzz build --fuzz-dir tests/fuzz
 
+# Fuzzing on aarch64 (fuzz.yml, job fuzz-arm64): the targets cross-built for aarch64 and run under
+# qemu-user, so the NEON tier is compared with scalar. No sanitizer: ASan does not run under
+# qemu-user. libfuzzer-sys compiles libFuzzer with the target's g++ (CXX_<target>); the cross gcc
+# from `toolchain` links.
+FROM fuzz-tools AS fuzz-arm64
+RUN rustup target add aarch64-unknown-linux-gnu --toolchain nightly \
+    && apt-get update && apt-get install -y --no-install-recommends g++-aarch64-linux-gnu qemu-user \
+    && rm -rf /var/lib/apt/lists/*
+ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+COPY . .
+RUN cargo +nightly fuzz build --fuzz-dir tests/fuzz --target aarch64-unknown-linux-gnu -s none
+
 # Benchmark (bench.yml) and profile (profile.yml) binaries: av1-oracle (the default release
 # build), av1-oracle-v4 (the release-binary flags of docs/conventions.md: x86-64-v4 with the
 # false-deps features, fat LTO, panic=abort) and av1-avifx (extracts AVIF items for the classes).

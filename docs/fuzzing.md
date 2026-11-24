@@ -27,6 +27,16 @@ output.
 `.github/workflows/fuzz.yml`: weekly (Thursday 12:23 UTC) and on dispatch, two jobs at a time,
 `-rss_limit_mb=2048 -malloc_limit_mb=512`, crashers uploaded as artifacts.
 
+Job `fuzz-arm64` (same workflow, after the x86_64 matrix, two jobs at a time): the `simd_*`
+targets built for `aarch64-unknown-linux-gnu` (Dockerfile stage `fuzz-arm64`,
+`cargo +nightly fuzz build --target aarch64-unknown-linux-gnu -s none`, libFuzzer compiled with
+`aarch64-linux-gnu-g++`) and run with `qemu-aarch64 -L /usr/aarch64-linux-gnu`, so the NEON tier
+is compared with scalar. No sanitizer: ASan does not run under qemu-user, so `-malloc_limit_mb`
+has no malloc hook there and only `-rss_limit_mb` (of the qemu process) holds. The dispatch input
+`only` picks the target of both jobs; a target that is not `simd_*` skips `fuzz-arm64`. Its corpus
+cache (`fuzz-corpus-arm64-<target>`) starts from the x86_64 corpus of the same target; artifacts
+are `crashers-arm64-<target>` and `corpus-arm64-<target>`.
+
 ## Runs on main
 
 | Date | Commit | max_total_time | Targets | Fuzz hours | Crashes | Runs (probe / decode / avif) |
