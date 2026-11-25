@@ -31,7 +31,7 @@ use crate::tables::{
     NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, SIG_REF_DIFF_OFFSET, SUBSAMPLED_SIZE, TX_HEIGHT,
     TX_HEIGHT_LOG2, TX_SIZE_SQR, TX_SIZE_SQR_UP, TX_WIDTH, TX_WIDTH_LOG2,
 };
-use crate::tile::{TileDecoder, fill_rows};
+use crate::tile::{TileDecoder, fill_cols, fill_rows};
 
 /// `Tx_Type_In_Set_Intra` (spec 5.11.40).
 const TX_TYPE_IN_SET_INTRA: [[u8; TX_TYPES]; TX_SET_TYPES_INTRA] = [
@@ -510,7 +510,7 @@ fn dc_sign_ctx_of(above: &[u8], left: &[u8]) -> usize {
 fn set_ctx(v: &mut [u8], start: usize, n: usize, val: u8) {
     let end = (start + n).min(v.len());
     if start < end {
-        v[start..end].fill(val);
+        fill_cols(&mut v[start..end], val);
     }
 }
 
@@ -824,7 +824,7 @@ impl TileDecoder<'_> {
             .take(step_y)
         {
             let end = (bd_col + step_x).min(r.len());
-            r[bd_col.min(end)..end].fill(true);
+            fill_cols(&mut r[bd_col.min(end)..end], true);
         }
         Ok(())
     }

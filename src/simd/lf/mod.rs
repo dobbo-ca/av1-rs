@@ -114,7 +114,13 @@ fn chunks<const L: usize>(
         if e.along == 1 {
             for j in 0..2 * m {
                 let b = first + j * e.step;
-                s[7 - m + j][..cnt].copy_from_slice(&px[b..b + cnt]);
+                let src = &px[b..b + cnt];
+                // A full chunk is a fixed-size copy (no `memmove` call).
+                if let Some(a) = src.first_chunk::<L>() {
+                    s[7 - m + j] = *a;
+                } else {
+                    s[7 - m + j][..cnt].copy_from_slice(src);
+                }
             }
         } else {
             // `step` is 1 here (`vector_taps`): the window of each lane is one slice.
@@ -129,7 +135,12 @@ fn chunks<const L: usize>(
         if e.along == 1 {
             for j in 0..2 * m {
                 let b = first + j * e.step;
-                px[b..b + cnt].copy_from_slice(&s[7 - m + j][..cnt]);
+                let dst = &mut px[b..b + cnt];
+                if let Some(a) = dst.first_chunk_mut::<L>() {
+                    *a = s[7 - m + j];
+                } else {
+                    dst.copy_from_slice(&s[7 - m + j][..cnt]);
+                }
             }
         } else {
             for l in 0..cnt {
