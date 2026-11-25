@@ -282,11 +282,8 @@ pub fn decode(
 ) -> Result<Vec<Frame>, Error> {
     let mut decoder = Decoder::new(options.clone(), *limits);
     // Framing is checked up front, so a broken stream decodes nothing.
-    let mut units = Vec::new();
-    for unit in TemporalUnits::new(data, format) {
-        units.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-        units.push(unit?);
-    }
+    // The list of units is charged against `max_alloc` (every Annex B zero byte is a unit).
+    let units = split_temporal_units(data, format, limits)?;
     // Every frame collected so far stays booked, so the output of the call counts too; with
     // `max_threads` above 1 the frames of several units decode at once.
     decoder.decode_temporal_units(&units, format, cancel)

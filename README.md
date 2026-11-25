@@ -41,7 +41,8 @@ threads included: frame buffers, film grain buffers and the output frames of a t
 (and every frame `decode` collects) are charged before allocation and released on drop. Not
 counted: frames already returned by `Decoder` (buffers handed back with `Decoder::recycle` are
 charged again while the decoder keeps them, and dropped when they do not fit), the item bytes
-inside `isobmff` (an eighth of `max_alloc` for the parse and one for the reads); `max_metadata`
+inside `isobmff` (an eighth of `max_alloc` for the parse and one for the reads), and the stacks of
+the up to `max_threads - 1` threads a call spawns (std default size); `max_metadata`
 is on top. `max_threads = 1` spawns no thread; otherwise the tiles and in-loop filters of a frame
 (one scope of threads per frame, no pool kept between calls) and the tiles of
 an AVIF grid decode on up to `max_threads` threads, and film grain runs in bands of 32 rows on

@@ -464,7 +464,8 @@ impl Decoder {
                         .as_ref()
                         .is_some_and(|old| !same_sequence(old, &new))
                 }),
-            OBU_FRAME_HEADER => {
+            // A redundant frame header with no frame pending parses as a frame header too.
+            OBU_FRAME_HEADER | OBU_REDUNDANT_FRAME_HEADER => {
                 self.seq
                     .as_ref()
                     .is_some_and(|s| !s.reduced_still_picture_header)
@@ -2663,6 +2664,27 @@ mod tests {
         // The streams decode some frames and the broken one fails: the test compares something.
         assert!(frames > 0);
         assert!(errors > 0);
+    }
+
+    #[test]
+    fn show_existing_in_either_header_obu_is_a_barrier() {
+        let (_, _, mut d) = run_batch(&units_of(1), 2, 64 << 20);
+        // The sequence is a still one, which has no show_existing_frame: make it a full one.
+        d.seq.as_mut().unwrap().reduced_still_picture_header = false;
+        for obu_type in [OBU_FRAME_HEADER, OBU_REDUNDANT_FRAME_HEADER] {
+            let bytes = obu(obu_type, &[0x80]);
+            let o = ObuIter::new(&bytes, Format::Section5)
+                .next()
+                .unwrap()
+                .unwrap();
+            assert!(d.is_barrier(&o), "type {obu_type}");
+            let bytes = obu(obu_type, &[0x00]);
+            let o = ObuIter::new(&bytes, Format::Section5)
+                .next()
+                .unwrap()
+                .unwrap();
+            assert!(!d.is_barrier(&o), "type {obu_type}");
+        }
     }
 
     #[test]

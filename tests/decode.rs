@@ -212,3 +212,20 @@ fn avif_item_bytes_over_an_eighth_of_max_alloc_are_a_container_error() {
         "{r:?}"
     );
 }
+
+#[test]
+fn decode_charges_the_unit_list_to_max_alloc() {
+    // Every Annex B zero byte is an empty temporal unit: the list is 16 bytes per input byte.
+    let limits = Limits {
+        max_alloc: 1 << 10,
+        ..Limits::default()
+    };
+    let r = decode(
+        &vec![0u8; 1 << 12],
+        Format::AnnexB,
+        &Options::default(),
+        &limits,
+        &AtomicBool::new(false),
+    );
+    assert_eq!(r.err(), Some(Error::AllocLimit));
+}
