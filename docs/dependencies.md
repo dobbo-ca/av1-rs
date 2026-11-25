@@ -15,5 +15,5 @@ The crate depends on `isobmff` (our container parser, pinned by rev) and otherwi
   - `src/symbol.rs`: the symbol reader's window, refill, renormalisation, sequential symbol
     search (`msac_decode_symbol_adapt`) and `read_bool` fast
     path, after dav1d's `src/msac.c`.
-  - `src/coef.rs`: the padded levels array behind the `coeff_base` and `coeff_br` contexts,
+  - `src/coef.rs`: the padded levels array behind the `coeff_base` and `coeff_br` contexts and the linked list of nonzero positions of the sign pass,
     after dav1d's `src/recon_tmpl.c` (`decode_coefs`).

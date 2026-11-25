@@ -14,7 +14,8 @@
 //!
 //! Entry point: `TileDecoder::residual( )`, called by `decode_block` after the mode info.
 //!
-//! The padded levels array behind the `coeff_base` and `coeff_br` contexts is ported from
+//! The padded levels array behind the `coeff_base` and `coeff_br` contexts and the linked list
+//! of nonzero positions that the sign pass walks are ported from
 //! dav1d's `src/recon_tmpl.c` (`decode_coefs`; Copyright 2018-2019, VideoLAN and dav1d authors,
 //! Copyright 2018-2019, Two Orioles, LLC; BSD-2-Clause, see NOTICE and docs/dependencies.md).
 
@@ -24,6 +25,7 @@ use crate::predict::{IntraEdges, IntraParams, predict_cfl, predict_intra, predic
 use crate::quant::{ac_q, dc_q};
 use crate::recon::{ReconParams, reconstruct_region};
 use crate::scan::get_scan;
+use crate::symbol::SymbolDecoder;
 use crate::tables::{
     ADJUSTED_TX_SIZE, BLOCK_HEIGHT, BLOCK_WIDTH, MAX_TX_SIZE_RECT, MODE_TO_TXFM,
     NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, SIG_REF_DIFF_OFFSET, SUBSAMPLED_SIZE, TX_HEIGHT,
@@ -102,7 +104,9 @@ const COEFF_BASE_POS_CTX_OFFSET: [usize; 3] = [
     SIG_COEF_CONTEXTS_2D + 10,
 ];
 
-/// `Mag_Ref_Offset_With_Tx_Class` (spec 9.3, `coeff_br`): `[ row, col ]` offsets.
+/// `Mag_Ref_Offset_With_Tx_Class` (spec 9.3, `coeff_br`): `[ row, col ]` offsets. The decoder
+/// reads the first three `Sig_Ref_Diff_Offset` entries instead, which are the same (tested).
+#[cfg(test)]
 const MAG_REF_OFFSET_WITH_TX_CLASS: [[[usize; 2]; 3]; 3] = [
     [[0, 1], [1, 0], [1, 1]],
     [[0, 1], [1, 0], [0, 2]],
@@ -317,11 +321,8 @@ struct LevelCtx {
     bwl: usize,
     /// The row stride of the padded levels.
     stride: usize,
-    tx_class: usize,
     /// `Sig_Ref_Diff_Offset[ txClass ]` as offsets into the levels.
     base_offs: [usize; 5],
-    /// `Mag_Ref_Offset_With_Tx_Class[ txClass ]` as offsets into the levels.
-    br_offs: [usize; 3],
     /// `Coeff_Base_Ctx_Offset[ txSz ]`.
     base_ctx_offset: [[u8; 5]; 5],
 }
@@ -333,58 +334,58 @@ impl LevelCtx {
         LevelCtx {
             bwl,
             stride,
-            tx_class,
             base_offs: SIG_REF_DIFF_OFFSET[tx_class].map(|o| o[0] * stride + o[1]),
-            br_offs: MAG_REF_OFFSET_WITH_TX_CLASS[tx_class].map(|o| o[0] * stride + o[1]),
             base_ctx_offset: COEFF_BASE_CTX_OFFSET[tx_sz],
         }
     }
 
-    /// `get_coeff_base_ctx( txSz, plane, x4, y4, pos, c, 0 )` (spec 9.3, `coeff_base`) at
-    /// (`row`, `col`). `levels` holds the levels decoded so far, padded.
-    fn base_ctx(&self, levels: &[u8], row: usize, col: usize) -> usize {
+    /// The sums of the packed levels (see [`pack_level`]) of the five `Sig_Ref_Diff_Offset`
+    /// neighbours of (`row`, `col`) and of the first three of them. The three
+    /// `Mag_Ref_Offset_With_Tx_Class` neighbours of `coeff_br` are those first three for every
+    /// class (spec 9.3), so one set of loads serves [`LevelCtx::base_ctx`] and
+    /// [`LevelCtx::br_ctx`].
+    #[inline(always)]
+    fn neighbours(&self, levels: &[u8], row: usize, col: usize) -> (usize, usize) {
         let i = row * self.stride + col;
-        let mag: usize = self
-            .base_offs
-            .iter()
-            .map(|&o| usize::from(levels[i + o].min(3)))
-            .sum();
-        let ctx = ((mag + 1) >> 1).min(4);
-        if self.tx_class == TX_CLASS_2D {
-            if row == 0 && col == 0 {
-                return 0;
-            }
+        let at = |k: usize| usize::from(levels[i + self.base_offs[k]]);
+        let s3 = at(0) + at(1) + at(2);
+        (s3 + at(3) + at(4), s3)
+    }
+
+    /// `get_coeff_base_ctx( txSz, plane, x4, y4, pos, c, 0 )` (spec 9.3, `coeff_base`) at
+    /// (`row`, `col`) for the transform class `CLASS`, except that the DC position of a 2D
+    /// class (context 0, no neighbours) is the caller's. `s5` is the first sum of
+    /// [`LevelCtx::neighbours`].
+    ///
+    /// The spec's `Min( 3, level )` sum S and the plain sum L of the five neighbours give
+    /// `s5 = 64 S + L`. When S <= 7, at most two neighbours are 3 or more, so L <= 36 < 64 and
+    /// `( s5 + 64 ) >> 7 == ( S + 1 ) >> 1`; when S >= 8, `s5 > 512` and the result is 4.
+    #[inline(always)]
+    fn base_ctx<const CLASS: usize>(&self, s5: usize, row: usize, col: usize) -> usize {
+        let ctx = if s5 > 512 { 4 } else { (s5 + 64) >> 7 };
+        if CLASS == TX_CLASS_2D {
             return ctx + usize::from(self.base_ctx_offset[row.min(4)][col.min(4)]);
         }
-        let idx = if self.tx_class == TX_CLASS_VERT {
-            row
-        } else {
-            col
-        };
+        let idx = if CLASS == TX_CLASS_VERT { row } else { col };
         ctx + COEFF_BASE_POS_CTX_OFFSET[idx.min(2)]
     }
 
-    /// The `ctx` of `coeff_br` (spec 9.3) at (`row`, `col`), from the padded `levels` as for
-    /// [`LevelCtx::base_ctx`].
-    fn br_ctx(&self, levels: &[u8], row: usize, col: usize) -> usize {
-        let i = row * self.stride + col;
-        let mag: usize = self
-            .br_offs
-            .iter()
-            .map(|&o| {
-                usize::from(levels[i + o].min((COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1) as u8))
-            })
-            .sum();
-        let mag = ((mag + 1) >> 1).min(6);
+    /// The `ctx` of `coeff_br` (spec 9.3) at (`row`, `col`). `s3` is the second sum of
+    /// [`LevelCtx::neighbours`]: the levels (at most 15, so the spec's `Min( 15, level )` is
+    /// the identity) are the low 6 bits of the packed values, and their sum is at most 45, so
+    /// it does not carry into the `Min( 3, level )` bits.
+    #[inline(always)]
+    fn br_ctx<const CLASS: usize>(&self, s3: usize, row: usize, col: usize) -> usize {
+        let mag = (((s3 & 63) + 1) >> 1).min(6);
         if row == 0 && col == 0 {
             mag
-        } else if self.tx_class == TX_CLASS_2D {
+        } else if CLASS == TX_CLASS_2D {
             if row < 2 && col < 2 {
                 mag + 7
             } else {
                 mag + 14
             }
-        } else if self.tx_class == TX_CLASS_HORIZ {
+        } else if CLASS == TX_CLASS_HORIZ {
             if col == 0 { mag + 7 } else { mag + 14 }
         } else if row == 0 {
             mag + 7
@@ -392,6 +393,95 @@ impl LevelCtx {
             mag + 14
         }
     }
+}
+
+/// A level (at most 15) as stored in the padded levels: `level | Min( 3, level ) << 6` (dav1d's
+/// way to get the sum of the `Min( 3, level )` of the base context with the same loads as the
+/// plain sum of the br context).
+#[inline(always)]
+fn pack_level(level: usize) -> u8 {
+    (level | (level.min(3) << 6)) as u8
+}
+
+/// Reads the `coeff_base_eob`, `coeff_base` and `coeff_br` levels of the scan positions
+/// `scan` (`eob` of them) from the last to the first, as the first loop of spec 5.11.39 does,
+/// for the transform class `CLASS`. Stores each level in `levels` (padded) and, for each
+/// nonzero one, `Quant[ pos ] = level << 11 | next` where `next` is the position of the next
+/// nonzero level in scan order (0 ends the list); the position returned is the head of that
+/// list (dav1d's way to visit only the nonzero positions in the sign pass). No node links to
+/// position 0, which is `scan[ 0 ]` for every scan (tested), so 0 is free as the end mark.
+/// The eob position is always nonzero, so the list is never empty.
+#[inline(always)]
+fn read_levels<const CLASS: usize>(
+    sd: &mut SymbolDecoder<'_>,
+    lc: &LevelCtx,
+    scan: &[u16],
+    eob_cdf: &mut [u16; 4],
+    base_cdfs: &mut [[u16; 5]; 42],
+    br_cdfs: &mut [[u16; 5]; 21],
+    levels: &mut [u8],
+    quant: &mut [i32],
+) -> usize {
+    // The brs of a level above NUM_BASE_LEVELS, from the neighbour sum `s3`.
+    let mut read_br = |sd: &mut SymbolDecoder<'_>, s3, row, col, mut level: usize| {
+        let br_cdf: &mut [u16] = &mut br_cdfs[lc.br_ctx::<CLASS>(s3, row, col)];
+        for _ in 0..COEFF_BASE_RANGE / (BR_CDF_SIZE - 1) {
+            let coeff_br = sd.read_symbol(br_cdf);
+            level += coeff_br;
+            if coeff_br < BR_CDF_SIZE - 1 {
+                break;
+            }
+        }
+        level
+    };
+    let last = scan.len() - 1;
+    // The eob position: its level is at least 1.
+    let mut next = {
+        let pos = usize::from(scan[last]);
+        let row = pos >> lc.bwl;
+        let col = pos - (row << lc.bwl);
+        let mut level = sd.read_symbol(&mut eob_cdf[..]) + 1;
+        if level > NUM_BASE_LEVELS {
+            level = read_br(&mut *sd, lc.neighbours(levels, row, col).1, row, col, level);
+        }
+        levels[row * lc.stride + col] = pack_level(level);
+        quant[pos] = (level as i32) << 11;
+        pos
+    };
+    for &pos in scan.get(1..last).unwrap_or_default().iter().rev() {
+        let pos = usize::from(pos);
+        let row = pos >> lc.bwl;
+        let col = pos - (row << lc.bwl);
+        let (s5, s3) = lc.neighbours(levels, row, col);
+        let mut level = sd.read_symbol(&mut base_cdfs[lc.base_ctx::<CLASS>(s5, row, col)]);
+        if level > NUM_BASE_LEVELS {
+            level = read_br(&mut *sd, s3, row, col, level);
+        }
+        levels[row * lc.stride + col] = pack_level(level);
+        if level != 0 {
+            quant[pos] = ((level as i32) << 11) | next as i32;
+            next = pos;
+        }
+    }
+    if last > 0 {
+        // DC: the context of a 2D class is 0, the other classes use the neighbours.
+        let (s5, s3) = lc.neighbours(levels, 0, 0);
+        let ctx = if CLASS == TX_CLASS_2D {
+            0
+        } else {
+            lc.base_ctx::<CLASS>(s5, 0, 0)
+        };
+        let mut level = sd.read_symbol(&mut base_cdfs[ctx]);
+        if level > NUM_BASE_LEVELS {
+            level = read_br(&mut *sd, s3, 0, 0, level);
+        }
+        levels[0] = pack_level(level);
+        if level != 0 {
+            quant[0] = ((level as i32) << 11) | next as i32;
+            next = 0;
+        }
+    }
+    next
 }
 
 /// The entries `start..start + n` of an above or left context array that lie inside the plane
@@ -1149,52 +1239,37 @@ impl TileDecoder<'_> {
                 [coeff_base_eob_ctx(tx_sz, eob - 1)];
             let base_cdfs = &mut self.cdf.coeff_base_cdf[tx_sz_ctx][ptype];
             let br_cdfs = &mut self.cdf.coeff_br_cdf[tx_sz_ctx.min(TX_32X32)][ptype];
-            let levels = &mut self.levels[..];
-            for (c, &pos) in scan.iter().enumerate().rev() {
-                let pos = usize::from(pos);
-                let row = pos >> lc.bwl;
-                let col = pos - (row << lc.bwl);
-                let mut level = if c == eob - 1 {
-                    self.sd.read_symbol(&mut eob_cdf[..]) + 1
-                } else {
-                    self.sd
-                        .read_symbol(&mut base_cdfs[lc.base_ctx(levels, row, col)])
-                };
-                if level > NUM_BASE_LEVELS {
-                    let br_cdf: &mut [u16] = &mut br_cdfs[lc.br_ctx(levels, row, col)];
-                    for _ in 0..COEFF_BASE_RANGE / (BR_CDF_SIZE - 1) {
-                        let coeff_br = self.sd.read_symbol(br_cdf);
-                        level += coeff_br;
-                        if coeff_br < BR_CDF_SIZE - 1 {
-                            break;
-                        }
-                    }
-                }
-                // At most NUM_BASE_LEVELS + 1 + COEFF_BASE_RANGE = 15.
-                levels[row * lc.stride + col] = level as u8;
-            }
+            let (sd, levels, quant) = (&mut self.sd, &mut self.levels[..], &mut self.quant[..]);
+            let mut pos = match tx_class {
+                TX_CLASS_2D => read_levels::<TX_CLASS_2D>(
+                    sd, &lc, scan, eob_cdf, base_cdfs, br_cdfs, levels, quant,
+                ),
+                TX_CLASS_HORIZ => read_levels::<TX_CLASS_HORIZ>(
+                    sd, &lc, scan, eob_cdf, base_cdfs, br_cdfs, levels, quant,
+                ),
+                _ => read_levels::<TX_CLASS_VERT>(
+                    sd, &lc, scan, eob_cdf, base_cdfs, br_cdfs, levels, quant,
+                ),
+            };
 
             // Reads no symbol, so it can run before the loop that needs it.
             let dc_ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
             let levels = &mut self.levels[..];
             let quant = &mut self.quant[..];
-            for (c, &pos) in scan.iter().enumerate() {
-                let pos = usize::from(pos);
+            // The sign pass visits the nonzero positions in scan order (see `read_levels`).
+            loop {
+                let packed = quant[pos];
+                let next = (packed & 0x7FF) as usize;
+                let mut q = packed >> 11;
                 let row = pos >> lc.bwl;
-                let li = pos + row * TX_PAD;
-                let mut q = i32::from(levels[li]);
-                levels[li] = 0;
-                let mut sign = false;
-                if q != 0 {
-                    if c == 0 {
-                        sign = self
-                            .sd
-                            .read_symbol(&mut self.cdf.dc_sign_cdf[ptype][dc_ctx])
-                            != 0;
-                    } else {
-                        sign = self.sd.read_bool();
-                    }
-                }
+                levels[pos + row * TX_PAD] = 0;
+                let sign = if pos == 0 {
+                    self.sd
+                        .read_symbol(&mut self.cdf.dc_sign_cdf[ptype][dc_ctx])
+                        != 0
+                } else {
+                    self.sd.read_bool()
+                };
                 if q > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
                     let mut length = 0;
                     loop {
@@ -1215,7 +1290,8 @@ impl TileDecoder<'_> {
                     }
                     q = x + (COEFF_BASE_RANGE + NUM_BASE_LEVELS) as i32;
                 }
-                if pos == 0 && q > 0 {
+                // q is at least 1 here.
+                if pos == 0 {
                     dc_category = if sign { 1 } else { 2 };
                 }
                 q &= 0xFFFFF;
@@ -1225,6 +1301,10 @@ impl TileDecoder<'_> {
                     cols = cols.max(pos - (row << lc.bwl) + 1);
                 }
                 quant[pos] = if sign { -q } else { q };
+                if next == 0 {
+                    break;
+                }
+                pos = next;
             }
             cul_level = cul_level.min(63);
         }
@@ -1307,6 +1387,79 @@ mod tests {
         }
     }
 
+    /// `LevelCtx::base_ctx` for a runtime class, with the DC context of a 2D class (0) that
+    /// `read_levels` applies itself.
+    fn base_ctx_of(tx_sz: usize, tx_class: usize, levels: &[u8], row: usize, col: usize) -> usize {
+        let lc = LevelCtx::new(tx_sz, tx_class);
+        let s5 = lc.neighbours(levels, row, col).0;
+        match tx_class {
+            TX_CLASS_2D if row == 0 && col == 0 => 0,
+            TX_CLASS_2D => lc.base_ctx::<TX_CLASS_2D>(s5, row, col),
+            TX_CLASS_HORIZ => lc.base_ctx::<TX_CLASS_HORIZ>(s5, row, col),
+            _ => lc.base_ctx::<TX_CLASS_VERT>(s5, row, col),
+        }
+    }
+
+    /// `LevelCtx::br_ctx` for a runtime class.
+    fn br_ctx_of(tx_sz: usize, tx_class: usize, levels: &[u8], row: usize, col: usize) -> usize {
+        let lc = LevelCtx::new(tx_sz, tx_class);
+        let s3 = lc.neighbours(levels, row, col).1;
+        match tx_class {
+            TX_CLASS_2D => lc.br_ctx::<TX_CLASS_2D>(s3, row, col),
+            TX_CLASS_HORIZ => lc.br_ctx::<TX_CLASS_HORIZ>(s3, row, col),
+            _ => lc.br_ctx::<TX_CLASS_VERT>(s3, row, col),
+        }
+    }
+
+    /// The packed sums equal the spec's sums for every set of neighbour levels 0..=15: the five
+    /// of the base context and the first three of the br context.
+    #[test]
+    fn packed_sums_are_exact() {
+        for a in 0..16 {
+            for b in 0..16 {
+                for c in 0..16 {
+                    let s3: usize = [a, b, c].iter().map(|&l| usize::from(pack_level(l))).sum();
+                    assert_eq!(s3 & 63, a + b + c);
+                    for d in 0..16 {
+                        for e in 0..16 {
+                            let ls = [a, b, c, d, e];
+                            let s5: usize = ls.iter().map(|&l| usize::from(pack_level(l))).sum();
+                            let mag: usize = ls.iter().map(|&l| l.min(3)).sum();
+                            let want = ((mag + 1) >> 1).min(4);
+                            assert_eq!(if s5 > 512 { 4 } else { (s5 + 64) >> 7 }, want);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The br neighbours are the first three base neighbours for every class.
+    #[test]
+    fn br_offsets_are_the_first_base_offsets() {
+        for class in 0..3 {
+            assert_eq!(
+                MAG_REF_OFFSET_WITH_TX_CLASS[class][..],
+                SIG_REF_DIFF_OFFSET[class][..3]
+            );
+        }
+    }
+
+    /// `read_levels` links the nonzero positions with 0 as the end mark and never links to
+    /// position 0, which needs every scan to start at 0.
+    #[test]
+    fn every_scan_starts_at_position_0() {
+        for tx_sz in 0..TX_SIZES_ALL {
+            for tx_type in 0..TX_TYPES {
+                assert_eq!(
+                    get_scan(tx_sz, tx_type)[0],
+                    0,
+                    "tx_sz {tx_sz} type {tx_type}"
+                );
+            }
+        }
+    }
+
     /// The padded-levels contexts equal these bounds-checked ones on random levels (0..=15),
     /// for every transform size and class and every position.
     #[test]
@@ -1328,17 +1481,17 @@ mod tests {
                             _ => rng.next_u32() % 16,
                         };
                         q[pos] = v as i32;
-                        levels[(pos >> bwl) * stride + (pos & (w - 1))] = v as u8;
+                        levels[(pos >> bwl) * stride + (pos & (w - 1))] = pack_level(v as usize);
                     }
                     for pos in 0..w * h {
                         let (row, col) = (pos >> bwl, pos & (w - 1));
                         assert_eq!(
-                            LevelCtx::new(tx_sz, tx_class).base_ctx(&levels, row, col),
+                            base_ctx_of(tx_sz, tx_class, &levels, row, col),
                             coeff_base_ctx_oracle(&q, tx_sz, tx_class, pos),
                             "tx_sz {tx_sz} class {tx_class} pos {pos}"
                         );
                         assert_eq!(
-                            LevelCtx::new(tx_sz, tx_class).br_ctx(&levels, row, col),
+                            br_ctx_of(tx_sz, tx_class, &levels, row, col),
                             coeff_br_ctx_oracle(&q, tx_sz, tx_class, pos),
                             "tx_sz {tx_sz} class {tx_class} pos {pos}"
                         );

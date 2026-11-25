@@ -121,10 +121,10 @@ pub(crate) fn reconstruct_region(
         return;
     };
 
-    let dq_denom: i64 = match p.tx_sz {
-        3 | 9 | 10 | 17 | 18 => 2, // TX_32X32, TX_16X32, TX_32X16, TX_16X64, TX_64X16
-        4 | 11 | 12 => 4,          // TX_64X64, TX_32X64, TX_64X32
-        _ => 1,
+    let dq_shift: u32 = match p.tx_sz {
+        3 | 9 | 10 | 17 | 18 => 1, // TX_32X32, TX_16X32, TX_32X16, TX_16X64, TX_64X16
+        4 | 11 | 12 => 2,          // TX_64X64, TX_32X64, TX_64X32
+        _ => 0,
     };
     let use_qm = p.qm_level < 15 && p.tx_type < IDTX;
     let qm = &QUANTIZER_MATRIX[p.qm_level.min(14)][usize::from(p.plane > 0)];
@@ -140,7 +140,7 @@ pub(crate) fn reconstruct_region(
                 i64::from(q)
             };
             let dq = i64::from(quant[i * tw + j]) * q2;
-            let mag = (dq.unsigned_abs() & 0xFF_FFFF) as i64 / dq_denom;
+            let mag = (dq.unsigned_abs() & 0xFF_FFFF) as i64 >> dq_shift;
             let dq2 = if dq < 0 { -mag } else { mag };
             scratch.dq[j * DQ_STRIDE + i] = dq2.clamp(-lim, lim - 1) as i32;
         }
