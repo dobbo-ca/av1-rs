@@ -238,7 +238,7 @@ pub(crate) fn palette(
 }
 
 /// `L( i, j ) - lumaAvg` of spec 7.11.5 at `ac[ i * tx_w + j ]`, with the arithmetic of
-/// [`predict::cfl_ref`]. `tx_w * tx_h` is at most 1024.
+/// [`predict::cfl_ref`]. `tx_w * tx_h` is at most 1024; only `ac[..tx_w * tx_h]` is written.
 fn cfl_ac(
     luma: &[u16],
     l_stride: usize,
@@ -250,8 +250,8 @@ fn cfl_ac(
     sub_y: usize,
     max_luma_w: usize,
     max_luma_h: usize,
-) -> [i32; 1024] {
-    let mut ac = [0i32; 1024];
+    ac: &mut [i32; 1024],
+) {
     let mut sum = 0i32;
     for i in 0..tx_h {
         let luma_y = ((start_y + i) << sub_y).min(max_luma_h.saturating_sub(1 << sub_y));
@@ -272,7 +272,6 @@ fn cfl_ac(
     for v in &mut ac[..tx_w * tx_h] {
         *v -= avg;
     }
-    ac
 }
 
 /// Chroma from luma (spec 7.11.5) of [`predict::predict_cfl`].
@@ -293,6 +292,7 @@ pub(crate) fn cfl(
     max_luma_h: usize,
     alpha: i32,
     bit_depth: u32,
+    ac: &mut [i32; 1024],
 ) {
     let ok = block_ok(chroma.len(), c_stride, start_x, start_y, tx_w, tx_h)
         && tx_w <= 32
@@ -304,27 +304,29 @@ pub(crate) fn cfl(
     match simd.tier() {
         #[cfg(target_arch = "x86_64")]
         Tier::Avx2 | Tier::Avx512 if ok => {
-            let ac = cfl_ac(
+            cfl_ac(
                 luma, l_stride, start_x, start_y, tx_w, tx_h, sub_x, sub_y, max_luma_w, max_luma_h,
+                ac,
             );
             // SAFETY: a Simd of tier Avx2 or Avx512 is made only by simd::available() / best()
             // after detecting AVX2 (Avx512 includes it).
             unsafe {
                 avx2::cfl(
-                    chroma, c_stride, start_x, start_y, tx_w, tx_h, &ac, alpha, max,
+                    chroma, c_stride, start_x, start_y, tx_w, tx_h, ac, alpha, max,
                 )
             }
         }
         #[cfg(target_arch = "aarch64")]
         Tier::Neon if ok => {
-            let ac = cfl_ac(
+            cfl_ac(
                 luma, l_stride, start_x, start_y, tx_w, tx_h, sub_x, sub_y, max_luma_w, max_luma_h,
+                ac,
             );
             // SAFETY: a Simd of tier Neon is made only by simd::available() / best() after
             // detecting NEON.
             unsafe {
                 neon::cfl(
-                    chroma, c_stride, start_x, start_y, tx_w, tx_h, &ac, alpha, max,
+                    chroma, c_stride, start_x, start_y, tx_w, tx_h, ac, alpha, max,
                 )
             }
         }
@@ -479,9 +481,11 @@ pub(crate) mod check {
         );
         for simd in available() {
             let mut got = chroma.clone();
+            // Garbage: `cfl_ac` must write every entry the kernels read.
+            let mut ac = [-77_777i32; 1024];
             super::cfl(
                 simd, &mut got, CS, &luma, LS, x, y, tx_w, tx_h, sub_x, sub_y, max_luma_w,
-                max_luma_h, alpha, bd,
+                max_luma_h, alpha, bd, &mut ac,
             );
             assert!(
                 got == want,

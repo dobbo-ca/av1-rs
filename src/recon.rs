@@ -38,6 +38,8 @@ pub(crate) struct ItxScratch {
     dq: [i32; DQ_LEN],
     /// The row pass output.
     mid: [i32; MID_LEN],
+    /// The chroma-from-luma AC values of one block (`predict_cfl`), not cleared between uses.
+    pub(crate) ac: [i32; 1024],
 }
 
 impl ItxScratch {
@@ -45,6 +47,7 @@ impl ItxScratch {
         Box::new(Self {
             dq: [0; DQ_LEN],
             mid: [0; MID_LEN],
+            ac: [0; 1024],
         })
     }
 }

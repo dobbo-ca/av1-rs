@@ -14,6 +14,7 @@ use crate::decoder::check_cancel;
 use crate::error::Error;
 use crate::frame::{FrameState, Plane, View};
 use crate::header::FrameHeader;
+use crate::ledger::{Buf, Ledger};
 use crate::seq::SequenceHeader;
 use crate::simd::lr as simd_lr;
 use std::sync::atomic::AtomicBool;
@@ -44,9 +45,26 @@ pub(crate) const BLOCK_W: usize = 64;
 /// Tallest block: a stripe is 64 luma rows (`64 >> subsampling_y` chroma rows).
 const STRIPE_H: usize = 64;
 
-/// Samples of the largest source window (a block with a 3 sample border); the per-block
-/// buffers live on the stack, so the filters allocate nothing.
+/// Samples of the largest source window (a block with a 3 sample border).
 const WIN: usize = (BLOCK_W + 6) * (STRIPE_H + 6);
+
+/// The buffers of loop restoration, made once per [`lr_frame`] call or per band item: the source
+/// window and the kernels' working arrays. They are charged to the ledger while they live, come
+/// from its pool (so a repeated call allocates nothing) and are not cleared between blocks
+/// (every entry read is written first).
+pub(crate) struct LrScratch<'a> {
+    win: Buf<'a, i32>,
+    mem: simd_lr::Mem<'a>,
+}
+
+impl<'a> LrScratch<'a> {
+    pub(crate) fn new(ledger: &'a Ledger) -> Result<LrScratch<'a>, Error> {
+        Ok(LrScratch {
+            win: ledger.zeros(WIN)?,
+            mem: simd_lr::Mem::new(ledger)?,
+        })
+    }
+}
 
 /// `Round2( x, n )` for signed `x` (arithmetic shift), `n` may be 0.
 fn round2(x: i64, n: usize) -> i64 {
@@ -311,6 +329,7 @@ pub(crate) fn lr_frame(
         .min(upscaled_cdef.len())
         .min(upscaled_curr.len())
         .min(out.len());
+    let mut scratch = LrScratch::new(&fs.ledger)?;
     for plane in 0..planes {
         let (cdef, curr) = (&upscaled_cdef[plane], &upscaled_curr[plane]);
         let dst = &mut out[plane];
@@ -324,7 +343,7 @@ pub(crate) fn lr_frame(
             if g.stripe(stripe_num).is_none() {
                 break;
             }
-            lr_stripe(fs, seq, &g, stripe_num, cdef, curr, &mut dst);
+            lr_stripe(fs, seq, &g, stripe_num, cdef, curr, &mut dst, &mut scratch);
             stripe_num += 1;
         }
     }
@@ -428,6 +447,7 @@ pub(crate) fn lr_stripe(
     cdef: &Plane,
     curr: &Plane,
     dst: &mut View<'_>,
+    scratch: &mut LrScratch<'_>,
 ) {
     let (Some(st), Some((y0, y1))) = (g.stripe(n), g.stripe_rows(n)) else {
         return;
@@ -438,7 +458,7 @@ pub(crate) fn lr_stripe(
     };
     let bd = usize::from(seq.bit_depth);
     let simd = crate::simd::best();
-    let mut win = [0i32; WIN];
+    let LrScratch { win, mem } = scratch;
     let plane = g.plane;
     let end_x = g.end_x;
     let luma_y = if n == 0 { 0 } else { n * 64 - 8 };
@@ -461,16 +481,16 @@ pub(crate) fn lr_stripe(
         let h = y1 - y0 + 1;
         for x in (x0..=x1).step_by(BLOCK_W) {
             let w = BLOCK_W.min(x1 - x + 1);
-            source_window(cdef, curr, &st, x, y0, w, h, &mut win);
+            source_window(cdef, curr, &st, x, y0, w, h, win);
             if r_type == RESTORE_WIENER {
                 if let Some(lr) = fs.lr_wiener[plane].get(idx) {
-                    simd_lr::wiener(simd, &win, w, h, bd, lr, dst, x, dst_y);
+                    simd_lr::wiener(simd, win, w, h, bd, lr, dst, x, dst_y, mem);
                 }
             } else if let (Some(&set), Some(xqd)) =
                 (fs.lr_sgr_set[plane].get(idx), fs.lr_sgr_xqd[plane].get(idx))
             {
                 let set = usize::from(set);
-                simd_lr::self_guided(simd, &win, w, h, bd, set, xqd, dst, x, dst_y);
+                simd_lr::self_guided(simd, win, w, h, bd, set, xqd, dst, x, dst_y, mem);
             }
         }
     }

@@ -41,10 +41,11 @@ parse and item reads an eighth each, so the three sum to `max_alloc`, not twice 
 2x2 grid at several `max_alloc` and `max_threads` values, and checks the peak against `max_alloc`
 plus the uncharged fixed buffers of each decoder).
 
-Not charged, because their size does not depend on the input: the loop restoration source window
-(70 x 70 `i32` on the stack, reused for every block), the stack buffers
-of the loop restoration SIMD kernels (about 70 KB) and, per tile decoder, the colour map
-buffers and the 12 KiB reconstruction scratch (`recon::ItxScratch`).
+Not charged, because their size does not depend on the input: per tile decoder, the colour map
+buffers and the 16 KiB reconstruction scratch (`recon::ItxScratch`). The loop restoration source
+window and the kernels' working arrays (about 100 KB, `lr::LrScratch`) are charged: one set per
+`lr_frame` call, or per stripe item when threaded, taken from the ledger pool and not cleared
+between blocks.
 
 ## Batches
 
@@ -91,8 +92,8 @@ stops allocating after the first frames:
   the `Vec` itself are reused for the next frames. It cannot fail.
 - **Per block, per transform, per superblock** the decode allocates nothing: the block decode
   (coefficients, transforms, prediction) works in fixed-size buffers, the loop restoration
-  windows and filter buffers are on the stack (about 100 KB), and so are the film grain
-  templates (72 KB).
+  windows and filter buffers come from the ledger pool (about 100 KB, once per frame or stripe
+  item), and the film grain templates (72 KB) are on the stack.
 
 With `max_threads = 1`, a `decode_temporal_unit` of the same shape as the previous one makes no
 heap allocation once the previous unit's frames were recycled (`tests/alloc.rs` counts them
