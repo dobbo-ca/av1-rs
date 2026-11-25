@@ -5,10 +5,29 @@ Information only: there is no speed bar. `.github/workflows/bench.yml` runs
 3.6.0 and av1-rs (`examples/oracle.rs --null`) decode the same frames of each bench class, once
 with one thread and once with the default threads (`nproc`). av1-rs runs twice: the default
 release build (runtime SIMD dispatch) and a release-binary build
-(`-C target-cpu=x86-64-v4 -C target-feature=+false-deps-tzcnt,+false-deps-bls`, fat LTO,
+(`-C target-cpu=x86-64-v4`, fat LTO,
 `panic=abort`), and a third table times the default build with each SIMD tier forced
 (`AV1_SIMD`). The figure is the wall time of the whole class, best of 5. No decoder writes
 samples (`--null`, `-o /dev/null`).
+
+## The v4 build
+
+`-C target-cpu=x86-64-v4` makes `rustc 1.99.1` enable these target features
+(`rustc -C target-cpu=x86-64-v4 --print cfg`): avx, avx2, avx512bw, avx512cd, avx512dq, avx512f,
+avx512vl, bmi1, bmi2, cmpxchg16b, f16c, fma, fxsr, lzcnt, movbe, popcnt, sse, sse2, sse3, sse4.1,
+sse4.2, ssse3, xsave.
+
+An earlier build also passed `-C target-feature=+false-deps-tzcnt,+false-deps-bls`. Both
+names are real LLVM tuning features (`rustc --print target-features` lists them with
+`false-deps-lzcnt`, `-popcnt`, `-perm`, `-range`, `-getmant`, `-mulc`, `-mullq`, `-compress`
+and `-expand`); `false-deps-lzcnt-tzcnt` is not one. rustc does not know them, so it warns
+"unknown and unstable feature specified for `-Ctarget-feature`" and passes them to LLVM, which
+accepts them. They work: with them, tzcnt and blsr in a loop get an `xor` of the destination
+first (the same as `-C target-cpu=znver5`; `znver4` and plain v4 have none). On this decoder
+they changed nothing measurable (v4 column of the 1 thread and default threads tables, same
+to within 1 to 2 ms per class and the same 894/898 ms total), so the build dropped them and has no
+warning. `tests/parity/v4-diag.sh` (workflow `v4-diag`, dispatch only) prints the toolchain's
+list and the asm, to recheck on a new rustc.
 
 ## Classes
 

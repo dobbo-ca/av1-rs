@@ -217,8 +217,8 @@ COPY . .
 RUN cargo +nightly fuzz build --fuzz-dir tests/fuzz --target aarch64-unknown-linux-gnu -s none
 
 # Benchmark (bench.yml) and profile (profile.yml) binaries: av1-oracle (the default release
-# build), av1-oracle-v4 (the release-binary flags: x86-64-v4 with the
-# false-deps features, fat LTO, panic=abort) and av1-avifx (extracts AVIF items for the classes).
+# build), av1-oracle-v4 (the release-binary flags: x86-64-v4,
+# fat LTO, panic=abort) and av1-avifx (extracts AVIF items for the classes).
 FROM oracles AS bench-bin
 COPY . .
 COPY --from=data /data.list /data.list
@@ -226,7 +226,7 @@ RUN --mount=type=cache,id=av1-rs-target-bench,sharing=locked,target=/src/target 
     find src examples tests -name '*.rs' -exec touch {} + \
     && cargo build --locked --release --example oracle --example avifx \
     && cp target/release/examples/oracle /usr/local/bin/av1-oracle && cp target/release/examples/avifx /usr/local/bin/av1-avifx \
-    && RUSTFLAGS="-C target-cpu=x86-64-v4 -C target-feature=+false-deps-tzcnt,+false-deps-bls" \
+    && RUSTFLAGS="-C target-cpu=x86-64-v4" \
        CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_PANIC=abort \
        cargo build --locked --release --example oracle --target-dir target/v4 \
     && cp target/v4/release/examples/oracle /usr/local/bin/av1-oracle-v4
@@ -258,3 +258,12 @@ RUN --mount=type=cache,id=av1-rs-target-bench,sharing=locked,target=/src/target 
     && cp target/noinline/release/examples/oracle /usr/local/bin/av1-oracle-noinline
 RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
     sh tests/parity/profile.sh prep /bench && du -sh /bench
+
+# v4-diag.yml: which false-deps target features this rustc knows (tests/parity/v4-diag.sh).
+FROM toolchain AS v4-diag
+ARG DIAG_RUN=0
+COPY tests/parity/v4-diag.sh /v4-diag.sh
+RUN echo "run $DIAG_RUN" && mkdir -p /report && sh /v4-diag.sh > /report/v4-diag.txt 2>&1; echo 0 > /report/status
+
+FROM scratch AS v4-diag-report
+COPY --from=v4-diag /report /

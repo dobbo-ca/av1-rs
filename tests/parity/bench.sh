@@ -73,7 +73,7 @@ tiers() {
 {
   echo "## av1-rs bench (information only)"
   echo
-  echo "Classes: tests/parity/bench-lib.sh. Best of 5 wall times; no decoder writes samples. av1-rs v4: built with -C target-cpu=x86-64-v4 and the false-deps flags."
+  echo "Classes: tests/parity/bench-lib.sh. Best of 5 wall times; no decoder writes samples. av1-rs v4: built with -C target-cpu=x86-64-v4, fat LTO and panic=abort."
   echo
   echo "### 1 thread"
   echo
