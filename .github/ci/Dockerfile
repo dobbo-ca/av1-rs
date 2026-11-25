@@ -226,7 +226,7 @@ RUN --mount=type=cache,id=av1-rs-target-bench,sharing=locked,target=/src/target 
     find src examples tests -name '*.rs' -exec touch {} + \
     && cargo build --locked --release --example oracle --example avifx \
     && cp target/release/examples/oracle /usr/local/bin/av1-oracle && cp target/release/examples/avifx /usr/local/bin/av1-avifx \
-    && RUSTFLAGS="-C target-cpu=x86-64-v4 -C target-feature=+false-deps-tzcnt,+false-deps-bls" \
+    && RUSTFLAGS="-C target-cpu=x86-64-v4" \
        CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_PANIC=abort \
        cargo build --locked --release --example oracle --target-dir target/v4 \
     && cp target/v4/release/examples/oracle /usr/local/bin/av1-oracle-v4
