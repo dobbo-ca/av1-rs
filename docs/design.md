@@ -136,7 +136,7 @@ against `Limits` and its planes against `max_alloc` before allocation, the cance
 between tiles, and `isobmff` errors are `Error::Container` with the `isobmff` error class.
 
 Transforms (`clap`, `irot`, `imir`), the `colr` properties and the premultiplied flag are passed
-through raw in `AvifImage`; nothing is applied. Exif, XMP, gain map, depth and thumbnail items are
+through raw in `AvifImage` (the transforms always, in `ipma` order). With `Options::apply_transforms` (default off) `isobmff::apply_transforms` also runs: on each grid tile and identity input (its own transforms, before the tile is pasted at its new size), on the derived result, and on the alpha image (the transforms of its master). The input is booked in the ledger while it runs and the new buffers are charged against what is left of `max_alloc` (`transform_frame` in `src/avif.rs`); the frame size limits apply to the result. A 4:2:2 image rotated by 90 or 270 comes out 4:4:4 (isobmff-rs docs/transforms.md). Exif, XMP, gain map, depth and thumbnail items are
 not returned and there is no option for them yet (a known gap against the owner metadata rule);
 callers can use the re-exported `isobmff::parse` on the same file.
 

@@ -7,7 +7,7 @@ its temporal units. Seeds: the parity corpus (`run.sh seeds`).
 | Target | Entry point |
 |---|---|
 | `probe` | `av1::probe`: OBU framing, sequence, frame and tile group headers |
-| `avif` | `av1::decode_avif`: isobmff-rs item graph, av1C, grid assembly, alpha |
+| `avif` | `av1::decode_avif`: isobmff-rs item graph, av1C, grid assembly, alpha (option bits: 2 threads, `apply_transforms`) |
 | `decode` | `Decoder::decode_temporal_unit` on every temporal unit (option bits: Annex B, 2 threads, no film grain) |
 | `simd_lf` | `av1::fuzzing::lf`: one loop filter edge run, every SIMD tier against scalar |
 | `simd_grain` | `av1::fuzzing::grain`: the film grain blend kernels (`simd::grain`), every tier against scalar |

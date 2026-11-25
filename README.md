@@ -22,7 +22,9 @@ let frames = av1::decode(&data, Format::Section5, &Options::default(), &limits, 
 ```
 
 AVIF stills are decoded with `av1::decode_avif` (the primary image and its alpha image, grids assembled).
-`av1::decode_avif_item` decodes any image item of an already parsed file (coded, grid or identity; no alpha, transforms not applied).
+`av1::decode_avif_item` decodes any image item of an already parsed file (coded, grid or identity; no alpha).
+
+`clap`, `irot` and `imir` come back raw, in `ipma` order, in `AvifImage::transforms` (never dropped). `Options { apply_transforms: true, .. }` (default `false`) also applies them with `isobmff::apply_transforms`: each grid tile and identity input gets its own transforms before it is used, then the derived item gets its own, and the alpha image gets those of its master. The new buffers are charged to `max_alloc`, the frame size limits apply to the result, and the cancel flag is checked. `decode_avif_item` applies the transforms of the item it decodes under the same option.
 
 ## Resource limits
 

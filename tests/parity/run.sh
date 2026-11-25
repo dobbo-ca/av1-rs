@@ -268,6 +268,11 @@ seeds() {
     o=0; case $b in *.annexb) o=1 ;; esac
     cp "$p" "$1/$b" && printf "\\$(printf %03o $o)" >> "$1/$b"
     cp "$p" "$1/t2-$b" && printf "\\$(printf %03o $((o + 2)))" >> "$1/t2-$b"
+    # Bit 3 (the avif target): apply_transforms, with one and two threads.
+    case $b in *.avif)
+      cp "$p" "$1/tr-$b" && printf "\\$(printf %03o $((o + 8)))" >> "$1/tr-$b"
+      cp "$p" "$1/tr2-$b" && printf "\\$(printf %03o $((o + 10)))" >> "$1/tr2-$b" ;;
+    esac
   done
   echo "$(ls "$1" | wc -l) seeds"
 }
