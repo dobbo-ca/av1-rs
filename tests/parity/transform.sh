@@ -17,6 +17,9 @@ W=/work-tr
 MIN_CORPUS=${TRANSFORM_MIN_CORPUS:-140}
 MIN_TR=${TRANSFORM_MIN_TRANSFORMED:-10}
 MIN_GEN=${TRANSFORM_MIN_GENERATED:-70}
+# The most images that pass on "luma within 2 via RGB" (the 29 of the run that pinned it). A
+# higher count means files left the exact classes: look at transform-files.txt.
+MAX_RGB=${TRANSFORM_MAX_RGB:-29}
 
 # gen <dst>: 4:2:0, 4:2:2 and 4:4:4 images of three sizes (a gradient with some noise inside the RGB gamut, so a wrong
 # row or column shows) written by avifenc with every combination of clap, irot and imir below. A
@@ -72,6 +75,22 @@ lumacmp() {
   echo rgb
 }
 
+# chromacmp <ours.yuv> <raw.yuv> <raw luma bytes> <w> <h> <bytes per sample> <layout> <transforms>:
+# av1-rs's chroma, which libheif's differs from by design, checked against av1-rs's raw decode
+# (no transform property in the file): the file size is the one of <layout>, and the chroma is equal
+# to the raw chroma when there is no transform, or the same samples in another order (rotate and
+# mirror keep the multiset) when the sizes are equal. A crop (clap) only gets the size check.
+chromacmp() {
+  cw=$4 ch=$5
+  case $7 in 420) cw=$((($4 + 1) / 2)); ch=$((($5 + 1) / 2)) ;; 422) cw=$((($4 + 1) / 2)) ;; 400) cw=0 ch=0 ;; esac
+  [ "$(wc -c < $1)" -eq $((($4 * $5 + 2 * cw * ch) * $6)) ] || return 1
+  [ "$8" -gt 0 ] || { cmp -s $1 $2; return; }
+  [ "$(wc -c < $1)" -eq "$(wc -c < $2)" ] || return 0
+  tail -c +$(($3 + 1)) $1 | od -An -v -tu$6 -w$6 | sort -n > $W/ch.a
+  tail -c +$(($3 + 1)) $2 | od -An -v -tu$6 -w$6 | sort -n > $W/ch.b
+  cmp -s $W/ch.a $W/ch.b
+}
+
 full() {
   REP=$1 bad=0
   rm -rf $W; mkdir -p "$REP" $W/in $W/raw $W/ours $W/lh
@@ -88,7 +107,7 @@ full() {
   av1-oracle $W/in $W/raw || bad=1
   av1-oracle --transforms $W/in $W/ours || bad=1
   heif-transform-oracle $W/in $W/lh 2> $W/lh.err || bad=1
-  : > $W/transform.diff
+  : > $W/transform.diff; : > $W/files.txt
   c_exact=0 c_doc=0 c_rgb=0 c_skip=0 c_tr=0 c_cmp=0 g_exact=0 g_doc=0 g_rgb=0 g_skip=0 g_cmp=0 g_tr=0
   for p in $W/in/*; do
     f=${p##*/}; s=${f%.*}
@@ -107,18 +126,30 @@ full() {
     [ "$ntr" -gt 0 ] && eval "${k}_tr=\$((${k}_tr + 1))"
     read -r ow oh obd olay < $W/ours/$s.frames
     read -r lw lhh lbd llay < $W/lh/$s.frames
-    read -r _ _ _ rlay < $W/raw/$s.frames 2>/dev/null || rlay=none
+    [ -f $W/raw/$s.frames ] || { echo "$f: no raw decode of av1-rs" >> $W/transform.diff; continue; }
+    read -r _ _ _ rlay < $W/raw/$s.frames
     if [ "$ow $oh $obd $olay" = "$lw $lhh $lbd $llay" ] && cmp -s $W/ours/$s.yuv $W/lh/$s.yuv; then
-      eval "${k}_exact=\$((${k}_exact + 1))"; continue
+      eval "${k}_exact=\$((${k}_exact + 1))"; echo "$f exact" >> $W/files.txt; continue
     fi
     # The documented difference (docs/parity.md): libheif converts a 4:2:0 or 4:2:2 image to 4:4:4
     # for odd geometry, and av1-rs keeps the format (or, for 4:2:2 rotated by 90 or 270, makes
-    # 4:4:4 by another rule). Same size and depth, and the chroma format of either decoder differs
-    # from the raw one: the luma plane is compared.
+    # 4:4:4 by another rule). Same size and depth, libheif's chroma format differs from the raw
+    # one, and av1-rs's is the expected one (the raw one, or 4:4:4 for raw 4:2:2): the luma plane
+    # is compared with libheif's, and the chroma of av1-rs with its own raw decode.
     b=1; [ "$obd" -gt 8 ] && b=2
-    if [ "$ow $oh $obd" = "$lw $lhh $lbd" ] && { [ "$llay" != "$rlay" ] || [ "$olay" != "$rlay" ]; }; then
+    if [ "$ow $oh $obd" = "$lw $lhh $lbd" ] && [ "$llay" != "$rlay" ] &&
+      { [ "$olay" = "$rlay" ] || { [ "$rlay" = 422 ] && [ "$olay" = 444 ]; }; }; then
       how=$(lumacmp $W/ours/$s.yuv $W/lh/$s.yuv $((ow * oh * b)) "$obd") && {
-        case $how in exact) eval "${k}_doc=\$((${k}_doc + 1))" ;; *) eval "${k}_rgb=\$((${k}_rgb + 1))" ;; esac
+        # A layout that differs from the raw one (4:2:2 turned 4:4:4) has no raw chroma to compare.
+        if [ "$olay" = "$rlay" ]; then
+          chromacmp $W/ours/$s.yuv $W/raw/$s.yuv $((ow * oh * b)) $ow $oh $b "$olay" "$ntr" ||
+            { echo "$f: av1-rs chroma differs from its raw decode (raw $rlay, ${ow}x$oh, $obd-bit, $ntr transforms)" >> $W/transform.diff; continue; }
+        fi
+        case $how in
+          exact) eval "${k}_doc=\$((${k}_doc + 1))" ;;
+          *) eval "${k}_rgb=\$((${k}_rgb + 1))" ;;
+        esac
+        echo "$f luma-$how raw=$rlay ours=$olay libheif=$llay ${ow}x$oh $obd-bit $ntr-transforms" >> $W/files.txt
         continue
       }
       echo "$f: luma differs from libheif (raw $rlay, av1-rs $olay, libheif $llay, ${ow}x$oh, $obd-bit, $ntr transforms)" >> $W/transform.diff
@@ -130,6 +161,7 @@ full() {
   [ "$c_cmp" -ge "$MIN_CORPUS" ] || echo "only $c_cmp corpus images compared, want at least $MIN_CORPUS" >> $W/d-cover
   [ "$c_tr" -ge "$MIN_TR" ] || echo "only $c_tr corpus images with transform properties compared, want at least $MIN_TR" >> $W/d-cover
   [ "$g_cmp" -ge "$MIN_GEN" ] || echo "only $g_cmp generated images compared, want at least $MIN_GEN" >> $W/d-cover
+  [ $((c_rgb + g_rgb)) -le "$MAX_RGB" ] || echo "$((c_rgb + g_rgb)) images pass on luma within 2 via RGB, want at most $MAX_RGB" >> $W/d-cover
   {
     echo "## av1-rs transform parity (libheif 1.23.7 with dav1d)"; echo
     echo "| set | files | compared | with transform properties | exact | luma exact, chroma format differs (documented) | luma within 2 via RGB (documented) | not compared (both fail, or libheif refuses) |"
@@ -145,6 +177,7 @@ full() {
   done
   cat $W/d-cover $W/transform.diff | head -n 100 | sed 's/^/    /' >> "$REP/summary.md"
   head -n 5000 $W/transform.diff > "$REP/transform.diff"
+  cp $W/files.txt "$REP/transform-files.txt"
   head -n 5000 $W/lh.err > "$REP/libheif.err" 2>/dev/null
   rm -rf $W
   return $bad

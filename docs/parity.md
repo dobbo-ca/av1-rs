@@ -105,8 +105,8 @@ A file passes when the frame line (`W H bitdepth layout`) and every plane are eq
 difference: libheif converts a 4:2:0 or 4:2:2 image to 4:4:4 when the geometry is odd (an odd crop
 offset, an odd side that is rotated or mirrored), and av1-rs keeps the chroma format (isobmff-rs
 docs/transforms.md; 4:2:2 rotated by 90 or 270 is 4:4:4 in both, but the chroma is interpolated by
-libheif). When the chroma format of either decoder differs from the raw one, only the luma plane is
-compared, and it must be equal, or for 8-bit samples when libheif went through RGB (its 4:2:0 to 4:4:4 step refuses some inputs, and the conversion moves the luma to another range and rounds it twice) within 2 of ours or of ours rescaled from studio to full range, `round((v - 16) * 255 / 219)`. Any other difference fails the gate. The summary lists the counts:
+libheif). When libheif's chroma format differs from the raw one and av1-rs's is the raw one (or
+4:4:4 for raw 4:2:2), only the luma plane is compared with libheif, and it must be equal, or for 8-bit samples when libheif went through RGB (its 4:2:0 to 4:4:4 step refuses some inputs, and the conversion moves the luma to another range and rounds it twice) within 2 of ours or of ours rescaled from studio to full range, `round((v - 16) * 255 / 219)`. The chroma of av1-rs is checked against its own raw decode: the file size of its layout, the same bytes when there is no transform property, the same samples in another order when only rotations and mirrors apply. A missing raw decode fails, and so does an av1-rs layout other than the expected one. At most 29 images (`TRANSFORM_MAX_RGB`) may pass on the RGB tolerance; the per-file class is the artifact `transform-files.txt`. Any other difference fails the gate. The summary lists the counts:
 files, compared, with transform properties, exact, luma only (format differs), luma through RGB, and
 not compared (both decoders fail, libheif refuses and av1-rs decodes, or av1-rs stops at an inter frame of a layered Xiph item). Floors
 (`TRANSFORM_MIN_CORPUS`, `TRANSFORM_MIN_TRANSFORMED`, `TRANSFORM_MIN_GENERATED`) keep a broken tool

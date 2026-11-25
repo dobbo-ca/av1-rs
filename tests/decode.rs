@@ -229,3 +229,42 @@ fn decode_charges_the_unit_list_to_max_alloc() {
     );
     assert_eq!(r.err(), Some(Error::AllocLimit));
 }
+
+// The unit list and the frames of one `decode` call are booked together: with 4096 empty units
+// added, the call needs exactly the list's 64 KiB more than the stream alone, though the list and
+// the frames each fit `max_alloc` on their own.
+#[test]
+fn decode_books_the_unit_list_and_the_frames_together() {
+    let seed = include_bytes!("fuzz/seeds/regress-show-existing-redundant-header.bin");
+    let base = &seed[..seed.len() - 1]; // without the fuzz option byte
+    let mut stream = [0x12u8, 0x00].repeat(4096); // one temporal delimiter OBU is one unit
+    stream.extend_from_slice(base);
+    let run = |data: &[u8], max_alloc| {
+        let limits = Limits {
+            max_alloc,
+            max_threads: 1,
+            ..Limits::default()
+        };
+        let cancel = AtomicBool::new(false);
+        decode(
+            data,
+            Format::Section5,
+            &Options::default(),
+            &limits,
+            &cancel,
+        )
+    };
+    // The smallest `max_alloc` the stream alone decodes in.
+    let (mut lo, mut hi) = (0usize, 64usize << 20);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if run(base, mid).is_ok() {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let extra = 4096 * 16;
+    assert_eq!(run(&stream, hi + extra).map(|f| f.len()), Ok(1));
+    assert_eq!(run(&stream, hi + extra - 1).err(), Some(Error::AllocLimit));
+}
