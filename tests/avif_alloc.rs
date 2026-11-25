@@ -1,11 +1,15 @@
-//! Peak heap of `decode_avif`, measured by a counting global allocator over every thread: for a
-//! plain item, an item with an alpha image and a 2x2 grid, at several `max_alloc` and
-//! `max_threads`, the heap held at once (the parse, the item bytes, the item copy, the decoders,
-//! the canvas and the output) stays within `max_alloc` plus the few fixed-size buffers that are not
-//! charged.
+//! Peak heap of `decode_avif` and of `Decoder::decode_temporal_units`, measured by a counting
+//! global allocator over every thread. For AVIF: a plain item, an item with an alpha image, a
+//! 2x2 grid, and items and a grid whose decoded size is far above the uncharged slack (rotated
+//! tiles, a mirrored grid, with `apply_transforms` on), at many `max_alloc` and `max_threads`
+//! values, the heap held at once (the parse, the item bytes, the item copy, the decoders, the
+//! transforms, the canvas and the output) stays within `max_alloc` plus the few fixed-size
+//! buffers that are not charged, and a grid gives the same result (the image or the error) for
+//! every thread count. For a batch of units: the same peak bound at 2 and 4 threads.
 
 use av1::{AvifImage, Decoder, Error, Format, Frame, Limits, Options};
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::Relaxed};
 
 struct Counting;
@@ -50,6 +54,9 @@ unsafe impl GlobalAlloc for Counting {
 
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
+
+/// The counters see every thread of the process, so the tests take turns.
+static TURN: Mutex<()> = Mutex::new(());
 
 /// Runs `f`; returns its result and the most heap bytes, on all threads, it held at once above
 /// what was live when it started (the result counts while it is alive).
@@ -98,9 +105,8 @@ fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
     v
 }
 
-/// A reduced still picture sequence header: `width` x `height` (one superblock: at most 64x64),
-/// 8-bit (10-bit when `high_bitdepth` is 1) 4:2:0, 64x64 superblocks, CDEF and loop restoration
-/// on.
+/// A reduced still picture sequence header: `width` x `height` (at most 4096x4096), 8-bit
+/// (10-bit when `high_bitdepth` is 1) 4:2:0, 64x64 superblocks, CDEF and loop restoration on.
 fn sequence_header(high_bitdepth: u64, width: u64, height: u64) -> Vec<u8> {
     let mut w = Bits::default();
     for (bits, value) in [
@@ -108,10 +114,10 @@ fn sequence_header(high_bitdepth: u64, width: u64, height: u64) -> Vec<u8> {
         (1, 1),             // still_picture
         (1, 1),             // reduced_still_picture_header
         (5, 4),             // seq_level_idx[0]
-        (4, 7),             // frame_width_bits_minus_1
-        (4, 6),             // frame_height_bits_minus_1
-        (8, width - 1),     // max_frame_width_minus_1
-        (7, height - 1),    // max_frame_height_minus_1
+        (4, 11),            // frame_width_bits_minus_1
+        (4, 11),            // frame_height_bits_minus_1
+        (12, width - 1),    // max_frame_width_minus_1
+        (12, height - 1),   // max_frame_height_minus_1
         (1, 0),             // use_128x128_superblock
         (1, 1),             // enable_filter_intra
         (1, 1),             // enable_intra_edge_filter
@@ -134,13 +140,19 @@ fn sequence_header(high_bitdepth: u64, width: u64, height: u64) -> Vec<u8> {
 }
 
 /// The key frame header of that sequence (loop filter, CDEF, switchable loop restoration on U),
-/// byte aligned, then `tile` as the data of its one tile.
-fn frame(tile: &[u8]) -> Vec<u8> {
+/// byte aligned, then `tile` as the data of its one tile (of a `width` x `height` frame).
+fn frame(tile: &[u8], (width, height): (u64, u64)) -> Vec<u8> {
     let mut w = Bits::default();
     w.put(1, 0); // disable_cdf_update
     w.put(1, 0); // allow_screen_content_tools
     w.put(1, 0); // render_and_frame_size_different
     w.put(1, 1); // uniform_tile_spacing_flag
+    if width > 64 {
+        w.put(1, 0); // increment_tile_cols_log2: one tile column
+    }
+    if height > 64 {
+        w.put(1, 0); // increment_tile_rows_log2: one tile row
+    }
     w.put(8, 100); // base_q_idx
     w.put(4, 0); // DeltaQYDc, DeltaQUDc, DeltaQUAc not coded; using_qmatrix 0
     w.put(1, 0); // segmentation_enabled
@@ -178,7 +190,7 @@ fn unit(tile: &[u8], high_bitdepth: u64, size: (u64, u64)) -> Vec<u8> {
     [
         obu(2, &[]),
         obu(1, &sequence_header(high_bitdepth, size.0, size.1)),
-        obu(6, &frame(tile)),
+        obu(6, &frame(tile, size)),
     ]
     .concat()
 }
@@ -288,7 +300,9 @@ fn ispe(w: u32, h: u32) -> Vec<u8> {
     )
 }
 
-/// The `ipco` list: tile `ispe` (1), `av1C` (2), alpha `auxC` (3), grid `ispe` (4).
+/// The `ipco` list: small item and tile `ispe` (1), `av1C` (2), alpha `auxC` (3), small grid
+/// `ispe` (4), `irot` 90 (5), `imir` (6), large tile `ispe` (7), large grid `ispe` (8), large
+/// item `ispe` (9).
 fn props() -> Vec<Vec<u8>> {
     let urn = b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0";
     vec![
@@ -296,8 +310,17 @@ fn props() -> Vec<Vec<u8>> {
         bx(b"av1C", &[0x81, 0, 0x4c, 0]),
         bx(b"auxC", &[&[0; 4][..], urn].concat()),
         ispe(128, 64),
+        bx(b"irot", &[1]),
+        bx(b"imir", &[0]),
+        ispe(BIG_TILE, BIG_TILE),
+        ispe(2 * BIG_TILE, 2 * BIG_TILE),
+        ispe(BIG_TILE, BIG_TILE / 2),
     ]
 }
+
+/// The tiles of the large grid are this square size: each decoded tile, and the canvas even
+/// more, is far above the uncharged slack.
+const BIG_TILE: u32 = 512;
 
 fn av01(id: u8, data: &[u8], props: &[u8]) -> Item {
     Item {
@@ -316,7 +339,11 @@ fn refs(kind: &[u8; 4], from: u8, to: &[u8]) -> Vec<u8> {
     bx(kind, &v)
 }
 
-fn files() -> Vec<(&'static str, Vec<u8>)> {
+/// The test files: name, file, and whether the result must be the same for every thread count
+/// tested. That holds for a grid of at least as many tiles as threads (each tile decodes with
+/// one thread, so its memory does not depend on the thread count); a single item decodes with
+/// all the threads, and its threaded wrapup books bands a serial one does not.
+fn files() -> Vec<(&'static str, Vec<u8>, bool)> {
     let (data, _) = decodable_unit(0, (64, 32));
     let plain = build(&[av01(1, &data, &[1, 0x82])], &props(), &[]);
     let alpha = build(
@@ -324,42 +351,86 @@ fn files() -> Vec<(&'static str, Vec<u8>)> {
         &props(),
         &[refs(b"auxl", 2, &[1])],
     );
-    let mut items = vec![Item {
-        id: 1,
-        kind: b"grid",
-        data: vec![0, 0, 1, 1, 0, 128, 0, 64],
-        props: vec![4],
-    }];
-    items.extend((2..=5).map(|id| av01(id, &data, &[1, 0x82])));
-    let grid = build(&items, &props(), &[refs(b"dimg", 1, &[2, 3, 4, 5])]);
-    vec![("plain", plain), ("alpha", alpha), ("grid", grid)]
+    // 128x64 from four 64x32 tiles.
+    let small_grid = {
+        let mut items = vec![Item {
+            id: 1,
+            kind: b"grid",
+            data: vec![0, 0, 1, 1, 0, 128, 0, 64],
+            props: vec![4],
+        }];
+        items.extend((2..=5).map(|id| av01(id, &data, &[1, 0x82])));
+        build(&items, &props(), &[refs(b"dimg", 1, &[2, 3, 4, 5])])
+    };
+    let (item, _) = decodable_unit(0, (u64::from(BIG_TILE), u64::from(BIG_TILE / 2)));
+    // Rotated by 90 degrees, so the transform makes new planes.
+    let big = build(&[av01(1, &item, &[9, 0x82, 0x85])], &props(), &[]);
+    let (tile, _) = decodable_unit(0, (u64::from(BIG_TILE), u64::from(BIG_TILE)));
+    // Every tile is rotated before it is pasted; the grid is mirrored after.
+    let big_grid = {
+        let side = (2 * BIG_TILE) as u16;
+        let mut items = vec![Item {
+            id: 1,
+            kind: b"grid",
+            data: [&[0, 0, 1, 1][..], &side.to_be_bytes(), &side.to_be_bytes()].concat(),
+            props: vec![8, 0x86],
+        }];
+        items.extend((2..=5).map(|id| av01(id, &tile, &[7, 0x82, 0x85])));
+        build(&items, &props(), &[refs(b"dimg", 1, &[2, 3, 4, 5])])
+    };
+    vec![
+        ("plain", plain, false),
+        ("alpha", alpha, false),
+        ("grid", small_grid, true),
+        ("big", big, false),
+        ("big grid", big_grid, true),
+    ]
+}
+
+/// `max_alloc` values from `from` to 64 MiB, a quarter apart, so the boundary between fitting
+/// and not is crossed in small steps.
+fn sweep(from: usize) -> Vec<usize> {
+    let mut v = vec![from];
+    while let Some(&m) = v.last()
+        && m < 64 << 20
+    {
+        v.push(m + m / 4);
+    }
+    v
 }
 
 #[test]
 fn decode_avif_keeps_the_heap_within_max_alloc() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let cancel = AtomicBool::new(false);
+    let options = Options {
+        apply_transforms: true,
+        ..Options::default()
+    };
     let decode = |file: &[u8], max_alloc: usize, max_threads: usize| {
         let limits = Limits {
             max_alloc,
             max_threads,
             ..Limits::default()
         };
-        measured(|| av1::decode_avif(file, &Options::default(), &limits, &cancel))
+        measured(|| av1::decode_avif(file, &options, &limits, &cancel))
     };
-    for (name, file) in files() {
+    for (name, file, same) in files() {
         let (want, _) = decode(&file, 64 << 20, 1);
         let want: AvifImage = want.unwrap_or_else(|e| panic!("{name}: reference decode: {e:?}"));
         let want_frames: Vec<&Frame> = std::iter::once(&want.image).chain(&want.alpha).collect();
-        let mut fitted = 0;
-        for threads in [1, 2, 4] {
-            for max_alloc in (0..=11).map(|k| 16usize << k << 10).chain([64 << 20]) {
+        let (mut fitted, mut runs) = (0, 0);
+        for max_alloc in sweep(16 << 10) {
+            let mut first: Option<Result<AvifImage, Error>> = None;
+            for threads in [1, 2, 4] {
                 let (r, peak) = decode(&file, max_alloc, threads);
+                runs += 1;
                 assert!(
                     peak <= max_alloc as isize + UNCHARGED * (threads as isize + 1),
                     "{name} max_alloc {max_alloc} threads {threads}: {peak} bytes held, result {:?}",
                     r.as_ref().map(|_| ())
                 );
-                match r {
+                match &r {
                     Ok(got) => {
                         fitted += 1;
                         let frames: Vec<&Frame> =
@@ -374,9 +445,70 @@ fn decode_avif_keeps_the_heap_within_max_alloc() {
                         "{name} max_alloc {max_alloc} threads {threads}: {e:?}"
                     ),
                 }
+                if !same {
+                    continue;
+                }
+                match &first {
+                    None => first = Some(r),
+                    Some(f) => assert!(
+                        *f == r,
+                        "{name} max_alloc {max_alloc}: {threads} threads give {:?}, 1 thread {:?}",
+                        r.as_ref().map(|_| ()),
+                        f.as_ref().map(|_| ())
+                    ),
+                }
             }
         }
         // Some limits fit and some do not, so both paths were checked.
-        assert!(fitted > 0 && fitted < 3 * 13, "{name}: {fitted} fitted");
+        assert!(
+            fitted > 0 && fitted < runs,
+            "{name}: {fitted} of {runs} fitted"
+        );
     }
+}
+
+#[test]
+fn decode_temporal_units_keeps_the_heap_within_max_alloc() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let cancel = AtomicBool::new(false);
+    // Eight key frames far above the slack, decoded several at once.
+    let (data, _) = decodable_unit(0, (u64::from(BIG_TILE), u64::from(BIG_TILE / 2)));
+    let units: Vec<&[u8]> = vec![&data[..]; 8];
+    let mut d = Decoder::new(Options::default(), limits(64 << 20));
+    let mut want = Vec::new();
+    for u in &units {
+        want.extend(
+            d.decode_temporal_unit(u, Format::Section5, &cancel)
+                .unwrap(),
+        );
+    }
+    let (mut fitted, mut runs) = (0, 0);
+    for threads in [2, 4] {
+        for max_alloc in sweep(64 << 10) {
+            let limits = Limits {
+                max_alloc,
+                max_threads: threads,
+                ..Limits::default()
+            };
+            let mut d = Decoder::new(Options::default(), limits);
+            let (r, peak) = measured(|| d.decode_temporal_units(&units, Format::Section5, &cancel));
+            runs += 1;
+            assert!(
+                peak <= max_alloc as isize + UNCHARGED * (threads as isize + 1),
+                "max_alloc {max_alloc} threads {threads}: {peak} bytes held, result {:?}",
+                r.as_ref().map(|f| f.len())
+            );
+            match r {
+                Ok(got) => {
+                    fitted += 1;
+                    assert!(got == want, "max_alloc {max_alloc} threads {threads}");
+                }
+                Err(e) => assert!(
+                    matches!(e, Error::AllocLimit | Error::OutOfMemory),
+                    "max_alloc {max_alloc} threads {threads}: {e:?}"
+                ),
+            }
+        }
+    }
+    assert!(fitted > 0 && fitted < runs, "{fitted} of {runs} fitted");
 }
