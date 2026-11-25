@@ -132,6 +132,50 @@ RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
 FROM scratch AS parity-report
 COPY --from=parity /report /
 
+# libheif v1.23.7 (LGPL-3.0, commit 12a259a5882d), the oracle of the transform gate (CI only, never
+# linked into the crate): built from git, static, with dav1d from bookworm as its AV1 decoder and
+# no other codec. Only transform_oracle.c is copied, after the library build, so a change to it
+# does not rebuild libheif. The -dev packages ship static libraries; the runtime package of dav1d
+# is installed in `transform` (`oracles`) in case the link falls back to the shared one.
+FROM debian:bookworm AS c-oracle
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake git ca-certificates pkg-config libdav1d-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone -q --depth 1 --branch v1.23.7 https://github.com/strukturag/libheif /src/libheif \
+    && test "$(git -C /src/libheif rev-parse HEAD)" = 12a259a5882dd99d45ec5fc77e296a3b620d1e2e \
+    && cmake -S /src/libheif -B /b/heif -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/oracle \
+       -DBUILD_SHARED_LIBS=OFF -DENABLE_PLUGIN_LOADING=OFF -DBUILD_TESTING=OFF -DBUILD_DOCUMENTATION=OFF \
+       -DWITH_DAV1D=ON -DWITH_LIBDE265=OFF -DWITH_X265=OFF -DWITH_X264=OFF -DWITH_OpenH264_DECODER=OFF -DWITH_KVAZAAR=OFF \
+       -DWITH_AOM_DECODER=OFF -DWITH_AOM_ENCODER=OFF -DWITH_RAV1E=OFF -DWITH_SvtEnc=OFF \
+       -DWITH_JPEG_DECODER=OFF -DWITH_JPEG_ENCODER=OFF -DWITH_OpenJPEG_DECODER=OFF -DWITH_OpenJPEG_ENCODER=OFF \
+       -DWITH_OPENJPH_ENCODER=OFF -DWITH_FFMPEG_DECODER=OFF -DWITH_UVG266=OFF -DWITH_VVDEC=OFF -DWITH_VVENC=OFF \
+       -DWITH_UNCOMPRESSED_CODEC=OFF -DWITH_HEADER_COMPRESSION=OFF -DWITH_LIBSHARPYUV=OFF \
+       -DWITH_EXAMPLES=OFF -DWITH_GDK_PIXBUF=OFF \
+    && cmake --build /b/heif -j"$(nproc)" && cmake --install /b/heif \
+    && rm -rf /src/libheif /b/heif
+ENV PKG_CONFIG_PATH=/opt/oracle/lib/pkgconfig:/opt/oracle/lib/x86_64-linux-gnu/pkgconfig
+COPY tests/parity/c/transform_oracle.c /c/transform_oracle.c
+# libheif is C++: the C oracle is compiled with gcc and linked with g++.
+RUN gcc -O2 -std=gnu99 -Wall -c -o /tmp/transform_oracle.o /c/transform_oracle.c $(pkg-config --cflags libheif) \
+    && g++ -o /usr/local/bin/heif-transform-oracle /tmp/transform_oracle.o -static-libstdc++ -static-libgcc $(pkg-config --static --libs libheif)
+
+# Transform gate (tests/parity/transform.sh): libheif against decode_avif with
+# Options::apply_transforms, on the corpus and on files that avifenc (libavif 0.11.1 from bookworm,
+# in `oracles`) writes with clap, irot and imir. Same layout as the parity stage: the stage never
+# fails on a diff, the report (summary.md, transform.diff, status) is the build output (target
+# transform-report), and the workflow fails on `status`.
+FROM oracles AS transform
+COPY . .
+COPY --from=c-oracle /usr/local/bin/heif-transform-oracle /usr/local/bin/heif-transform-oracle
+COPY --from=data /data.list /data.list
+RUN --mount=type=cache,id=av1-rs-target-parity,sharing=locked,target=/src/target \
+    find src examples tests -name '*.rs' -exec touch {} + \
+    && cargo build --locked --release --example oracle && cp target/release/examples/oracle /usr/local/bin/av1-oracle
+RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
+    mkdir -p /report && { sh tests/parity/transform.sh /report; echo $? > /report/status; }
+
+FROM scratch AS transform-report
+COPY --from=transform /report /
+
 # The oracle built for aarch64, run under qemu-user on a subset of the corpus, compared with the
 # x86_64 output above.
 FROM qemu-arm64 AS parity-arm64

@@ -84,3 +84,36 @@ The `parity` job on `main` gates: 289 streams (240 libaom + 49 dav1d-test-data) 
   sample of its alpha track has no shown frame; av1-rs returns no alpha plane, while both
   avifdecs decode the first frame of the track with its alpha plane, so the file is compared
   through its items only.
+
+## Transforms
+
+`Options::apply_transforms` (off by default; the default returns `clap`, `irot` and `imir` raw) is
+checked against libheif 1.23.7 (LGPL-3.0, CI only, never linked into the crate), built in the
+Dockerfile stage `c-oracle` with dav1d from bookworm as its AV1 decoder. `tests/parity/c/transform_oracle.c`
+decodes the primary image of each file with the transforms applied by libheif and writes it in the
+`oracle.rs` layout (`<stem>.yuv`, `.frames`); `tests/parity/transform.sh` (Dockerfile stage
+`transform`, job `parity`, artifact `parity-transform`) compares it with `av1-oracle --transforms`
+on two sets:
+
+- the corpus AVIF files (the libavif `poc_*` reproducers excluded), some of which carry `clap`,
+  `irot` or `imir` (`<stem>.tr` counts the properties);
+- files that `avifenc` (libavif 0.11.1 from bookworm) writes in the image: 4:2:0, 4:2:2 and 4:4:4
+  at 64x48, 63x47 and 33x17 with no transform, each `irot`, each `imir`, two `clap` rectangles and
+  combinations of the three. A combination that avifenc refuses is skipped.
+
+A file passes when the frame line (`W H bitdepth layout`) and every plane are equal. The documented
+difference: libheif converts a 4:2:0 or 4:2:2 image to 4:4:4 when the geometry is odd (an odd crop
+offset, an odd side that is rotated or mirrored), and av1-rs keeps the chroma format (isobmff-rs
+docs/transforms.md; 4:2:2 rotated by 90 or 270 is 4:4:4 in both, but the chroma is interpolated by
+libheif). When the chroma format of either decoder differs from the raw one, only the luma plane is
+compared, and it must be equal, or within 2 for 8-bit samples when libheif went through RGB (it
+rescales the luma a little). Any other difference fails the gate. The summary lists the counts:
+files, compared, with transform properties, exact, luma only (format differs), luma within 2, and
+not compared (both decoders fail, or libheif refuses and av1-rs decodes). Floors
+(`TRANSFORM_MIN_CORPUS`, `TRANSFORM_MIN_TRANSFORMED`, `TRANSFORM_MIN_GENERATED`) keep a broken tool
+from shrinking the gate.
+
+Not covered by libheif: the alpha plane (libheif decodes an alpha item with its own `ipma` list
+and does not transform it with its master, which av1-rs does), and the tile-own transforms of a
+grid (no encoder here writes them). Both follow the order of isobmff-rs docs/transforms.md and are
+covered by the unit tests of `src/avif.rs` and by the `avif` fuzz target (option bit 3).

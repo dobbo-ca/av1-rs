@@ -1,13 +1,16 @@
 //! The AVIF layer: the item graph comes from `isobmff`, the pixels from [`Decoder`].
 //!
 //! Coded items are decoded with their own decoder, grid tiles on up to `max_threads` threads; tiles are pasted into
-//! the output as they are decoded. Transforms, colour and the alpha plane are passed through
-//! raw: nothing is applied.
+//! the output as they are decoded. Colour and the alpha plane are passed through raw. Transforms
+//! are returned raw too, unless `Options::apply_transforms` is on: then `isobmff::apply_transforms`
+//! runs on each grid tile and identity input, on the derived result and on the alpha image.
 
 use crate::ledger::{Held, Ledger};
 use crate::parallel::run_parallel;
 use crate::{Decoder, Error, Format, Frame, Limits, Options, Plane, PlaneData};
-use isobmff::{Av1c, Codec, CodecConfig, Grid, Heif, Image, ImageKind};
+use isobmff::{
+    Av1c, Chroma, Codec, CodecConfig, Grid, Heif, Image, ImageKind, PlaneSamples, Transform,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -19,7 +22,8 @@ pub struct AvifImage {
     /// The alpha auxiliary image, decoded the same way.
     pub alpha: Option<Frame>,
     /// The transformative properties of the primary image (`clap`, `irot`, `imir`), raw, in
-    /// `ipma` order. Not applied to `image`.
+    /// `ipma` order, whatever `Options::apply_transforms` is. Applied to `image` and `alpha` only
+    /// when that option is on.
     pub transforms: Vec<isobmff::Transform>,
     /// The alpha plane is premultiplied.
     pub premultiplied: bool,
@@ -53,6 +57,10 @@ struct Ctx<'a> {
 /// ledger for every decoder, the assembled grid, the item copies and the primary image while the
 /// alpha item decodes. `cancel`
 /// is checked between tiles and inside every decode.
+///
+/// With `Options::apply_transforms` the `clap`, `irot` and `imir` properties are applied: to each
+/// grid tile and identity input first, then to the derived image, and to the alpha image as to its
+/// master; the output is charged to `max_alloc`. `AvifImage::transforms` is raw either way.
 ///
 /// Exif, XMP, gain map, depth and thumbnail items are not returned; use `isobmff::parse` for them.
 ///
@@ -88,10 +96,13 @@ pub fn decode_avif(
     };
     let primary = heif.primary_image().map_err(container)?;
     let image = decode_image(&ctx, &primary, false)?;
+    let image = ctx.transformed_booked(&primary.transforms, image)?;
     let alpha = match primary.alpha {
         Some(id) => {
             let item = heif.image(id).map_err(container)?;
-            Some(decode_image(&ctx, &item, false)?)
+            let alpha = decode_image(&ctx, &item, false)?;
+            // The alpha image gets the transforms of its master.
+            Some(ctx.transformed_booked(&primary.transforms, alpha)?)
         }
         None => None,
     };
@@ -106,7 +117,8 @@ pub fn decode_avif(
 
 /// Decodes image item `id` of `heif`, the parse of `file`, as [`decode_avif`] decodes the primary
 /// image: a coded `av01` item, a grid or an identity image. There is no alpha image, the
-/// transforms are not applied, and nothing is parsed again.
+/// transforms of the item are applied only with `Options::apply_transforms`, and nothing is
+/// parsed again.
 ///
 /// `limits.max_alloc` is the peak of this call: an eighth is given to the `isobmff` reads of the
 /// item bytes and the rest to one ledger for every decoder, the assembled grid, the item copies
@@ -143,7 +155,127 @@ pub fn decode_avif_item(
         cancel,
     };
     let image = heif.image(id).map_err(container)?;
-    decode_image(&ctx, &image, false)
+    let frame = decode_image(&ctx, &image, false)?;
+    ctx.transformed_booked(&image.transforms, frame)
+}
+
+impl Ctx<'_> {
+    /// [`transform_frame`] for a frame the ledger holds (a decoded image): its bytes are given
+    /// back for the transform, and the result is booked for the rest of the call.
+    fn transformed_booked(&self, ts: &[Transform], frame: Frame) -> Result<Frame, Error> {
+        if !self.options.apply_transforms || ts.is_empty() {
+            return Ok(frame);
+        }
+        self.ledger.release(frame_bytes(&frame));
+        let frame = self.transformed(ts, frame)?;
+        self.ledger.reserve(frame_bytes(&frame))?;
+        Ok(frame)
+    }
+
+    /// [`transform_frame`] for a frame the ledger does not hold; the result is not held either.
+    fn transformed(&self, ts: &[Transform], frame: Frame) -> Result<Frame, Error> {
+        transform_frame(
+            self.options,
+            self.limits,
+            &self.ledger,
+            self.cancel,
+            ts,
+            frame,
+        )
+    }
+}
+
+/// Applies `ts` to `frame` with `isobmff::apply_transforms` when `options.apply_transforms` is
+/// on. The input is booked in `ledger` while it runs, and the new buffers are charged against
+/// what is left of `max_alloc`; the output is not booked. The frame size limits apply to the
+/// result.
+fn transform_frame(
+    options: &Options,
+    limits: &Limits,
+    ledger: &Ledger,
+    cancel: &AtomicBool,
+    ts: &[Transform],
+    mut frame: Frame,
+) -> Result<Frame, Error> {
+    if !options.apply_transforms || ts.is_empty() {
+        return Ok(frame);
+    }
+    let chroma = match (frame.mono_chrome, frame.subsampling_x, frame.subsampling_y) {
+        (true, _, _) => Chroma::Mono,
+        (false, true, true) => Chroma::Yuv420,
+        (false, true, false) => Chroma::Yuv422,
+        (false, false, false) => Chroma::Yuv444,
+        (false, false, true) => return Err(Error::Unsupported("avif transform of 4:4:0")),
+    };
+    let ilimits = isobmff::Limits {
+        max_alloc: 0,
+        max_threads: limits.max_threads,
+        max_pixels: limits.max_pixels,
+        ..isobmff::Limits::default()
+    };
+    let (w, h) = isobmff::transformed_size(frame.width, frame.height, ts, &ilimits)
+        .map_err(transform_error)?;
+    if w > limits.max_width {
+        return Err(Error::WidthLimit);
+    }
+    if h > limits.max_height {
+        return Err(Error::HeightLimit);
+    }
+    // The input is booked while the output is made.
+    let _input = ledger.charge(frame_bytes(&frame))?;
+    let ilimits = isobmff::Limits {
+        max_alloc: ledger.left(),
+        ..ilimits
+    };
+    let planes = std::mem::take(&mut frame.planes)
+        .into_iter()
+        .map(|p| isobmff::Plane {
+            width: p.width,
+            height: p.height,
+            samples: match p.data {
+                PlaneData::U8(v) => PlaneSamples::U8(v),
+                PlaneData::U16(v) => PlaneSamples::U16(v),
+            },
+        })
+        .collect();
+    let planes = isobmff::Planes {
+        width: frame.width,
+        height: frame.height,
+        chroma,
+        planes,
+    };
+    let out = isobmff::apply_transforms(planes, ts, &ilimits, cancel).map_err(transform_error)?;
+    (frame.width, frame.height) = (out.width, out.height);
+    (frame.render_width, frame.render_height) = (out.width, out.height);
+    (frame.subsampling_x, frame.subsampling_y) = match out.chroma {
+        Chroma::Mono => (frame.subsampling_x, frame.subsampling_y),
+        Chroma::Yuv420 => (true, true),
+        Chroma::Yuv422 => (true, false),
+        Chroma::Yuv444 => (false, false),
+    };
+    frame.planes = out
+        .planes
+        .into_iter()
+        .map(|p| Plane {
+            width: p.width,
+            height: p.height,
+            data: match p.samples {
+                PlaneSamples::U8(v) => PlaneData::U8(v),
+                PlaneSamples::U16(v) => PlaneData::U16(v),
+            },
+        })
+        .collect();
+    Ok(frame)
+}
+
+fn transform_error(e: isobmff::Error) -> Error {
+    match e {
+        isobmff::Error::LimitExceeded(isobmff::Limit::Alloc) => Error::AllocLimit,
+        isobmff::Error::LimitExceeded(isobmff::Limit::Pixels) => Error::PixelLimit,
+        isobmff::Error::OutOfMemory => Error::OutOfMemory,
+        isobmff::Error::Cancelled => Error::Cancelled,
+        e => container(e),
+    }
 }
 
 fn decode_image(ctx: &Ctx<'_>, image: &Image, nested: bool) -> Result<Frame, Error> {
@@ -153,7 +285,9 @@ fn decode_image(ctx: &Ctx<'_>, image: &Image, nested: bool) -> Result<Frame, Err
         // The input of an identity image is a coded image or a grid, not another identity.
         ImageKind::Identity { input } if !nested => {
             let inner = ctx.heif.image(*input).map_err(container)?;
-            decode_image(ctx, &inner, true)
+            // The input gets its own transforms before the identity image's.
+            let frame = decode_image(ctx, &inner, true)?;
+            ctx.transformed_booked(&inner.transforms, frame)
         }
         ImageKind::Identity { .. } => Err(Error::Unsupported("avif nested identity")),
         ImageKind::Overlay(_) => Err(Error::Unsupported("avif overlay")),
@@ -251,6 +385,8 @@ fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
         let tile = ctx.heif.image(*id).map_err(container)?;
         let decoder = Decoder::with_ledger(ctx.options.clone(), inner, Arc::clone(&ctx.ledger));
         let frame = decode_item(ctx, &tile, decoder)?;
+        // Each tile gets its own transforms before it is pasted at its new size.
+        let frame = ctx.transformed(&tile.transforms, frame)?;
         // The tile's samples are booked until it is pasted; its metadata stays booked by the
         // decoder.
         let _held = ctx.ledger.charge(frame_bytes(&frame))?;
@@ -614,6 +750,80 @@ mod tests {
         assert!(matches!(
             Canvas::new(&a, &grid(2, 1, 8, 2), &narrow, &led(&narrow)),
             Err(Error::WidthLimit)
+        ));
+    }
+
+    /// The 4:2:0 test frame (4x2) with luma 1..=8.
+    fn numbered() -> Frame {
+        let mut f = frame(4, 2, 0, 10);
+        f.planes[0].data = PlaneData::U8((1..=8).collect());
+        f
+    }
+
+    fn transform(
+        options: &Options,
+        limits: &Limits,
+        cancel: bool,
+        ts: &[Transform],
+    ) -> Result<Frame, Error> {
+        let cancel = AtomicBool::new(cancel);
+        transform_frame(options, limits, &led(limits), &cancel, ts, numbered())
+    }
+
+    const ON: Options = Options {
+        operating_point: 0,
+        all_layers: false,
+        film_grain: true,
+        keep_metadata: true,
+        apply_transforms: true,
+    };
+
+    #[test]
+    fn transforms_are_raw_by_default() {
+        let ts = [
+            Transform::Rotate(90),
+            Transform::Mirror(isobmff::Axis::LeftRight),
+        ];
+        let l = Limits::default();
+        let out = transform(&Options::default(), &l, false, &ts).unwrap();
+        assert_eq!(out, numbered());
+    }
+
+    #[test]
+    fn transforms_apply_when_asked() {
+        let l = Limits::default();
+        let mirror = [Transform::Mirror(isobmff::Axis::LeftRight)];
+        let f = transform(&ON, &l, false, &mirror).unwrap();
+        assert_eq!(bytes(&f.planes[0]), &[4, 3, 2, 1, 8, 7, 6, 5]);
+        let f = transform(&ON, &l, false, &[Transform::Rotate(90)]).unwrap();
+        assert_eq!((f.width, f.height), (2, 4));
+        assert_eq!((f.render_width, f.render_height), (2, 4));
+        assert_eq!(bytes(&f.planes[0]), &[4, 8, 3, 7, 2, 6, 1, 5]);
+        assert_eq!((f.planes[1].width, f.planes[1].height), (1, 2));
+    }
+
+    #[test]
+    fn transform_obeys_the_limits_and_cancel() {
+        let rot = [Transform::Rotate(90)];
+        let small = Limits {
+            max_alloc: 8,
+            ..Limits::default()
+        };
+        assert!(matches!(
+            transform(&ON, &small, false, &rot),
+            Err(Error::AllocLimit)
+        ));
+        let narrow = Limits {
+            max_width: 1,
+            ..Limits::default()
+        };
+        assert!(matches!(
+            transform(&ON, &narrow, false, &rot),
+            Err(Error::WidthLimit)
+        ));
+        assert!(matches!(
+            transform(&ON, &Limits::default(), true, &rot),
+            Err(Error::Cancelled)
         ));
     }
 }

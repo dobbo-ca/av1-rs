@@ -1,6 +1,6 @@
 #![no_main]
 //! `avif`: `decode_avif` on a whole file (isobmff-rs item graph, av1C, grid assembly, alpha).
-//! The last byte holds the options (bit 1: two threads).
+//! The last byte holds the options (bit 1: two threads, bit 3: `apply_transforms`).
 
 use libfuzzer_sys::fuzz_target;
 use std::sync::atomic::AtomicBool;
@@ -21,7 +21,10 @@ fuzz_target!(|data: &[u8]| {
     };
     let _ = av1::decode_avif(
         file,
-        &av1::Options::default(),
+        &av1::Options {
+            apply_transforms: opt & 8 != 0,
+            ..av1::Options::default()
+        },
         &limits,
         &AtomicBool::new(false),
     );

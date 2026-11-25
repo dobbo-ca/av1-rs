@@ -2,7 +2,7 @@
 //! comparing with other decoders.
 //!
 //! ```text
-//! oracle [--info] [--null] [--threads N] [--no-filmgrain] [--op N] [--all-layers] <in-dir> <out-dir>
+//! oracle [--info] [--null] [--threads N] [--no-filmgrain] [--op N] [--all-layers] [--transforms] <in-dir> <out-dir>
 //! ```
 //!
 //! Inputs (sorted by name): `.ivf` (each IVF frame is one temporal unit), `.obu`, `.av1` and
@@ -20,8 +20,10 @@
 //!   inter frames).
 //!
 //! An `.avif` input goes through `av1::decode_avif`: `<stem>.yuv` is the primary image (grid
-//! assembled and cropped; transforms are not applied), `<stem>.frames` has its one line, and
+//! assembled and cropped; transforms are not applied unless `--transforms` is given), `<stem>.frames` has its one line, and
 //! `<stem>.alpha.yuv` the alpha image when there is one. `--info` does not apply to `.avif`.
+//! With `--transforms` (`Options::apply_transforms`) `clap`, `irot` and `imir` are applied, and
+//! `<stem>.tr` has the number of transform properties of the primary image.
 //!
 //! With `--null` the samples are decoded but no `.yuv` is written (the bench and profile runs).
 //!
@@ -48,6 +50,7 @@ struct Args {
     film_grain: bool,
     operating_point: usize,
     all_layers: bool,
+    transforms: bool,
     in_dir: PathBuf,
     out_dir: PathBuf,
 }
@@ -67,6 +70,7 @@ fn parse_args() -> Result<Args, String> {
         film_grain: true,
         operating_point: 0,
         all_layers: false,
+        transforms: false,
         in_dir: PathBuf::new(),
         out_dir: PathBuf::new(),
     };
@@ -83,6 +87,7 @@ fn parse_args() -> Result<Args, String> {
             "--null" => args.null = true,
             "--no-filmgrain" => args.film_grain = false,
             "--all-layers" => args.all_layers = true,
+            "--transforms" => args.transforms = true,
             "--threads" => args.threads = Some(number("--threads")?),
             "--op" => args.operating_point = number("--op")?,
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
@@ -194,12 +199,16 @@ fn run_file(
         let options = Options {
             operating_point: args.operating_point,
             all_layers: args.all_layers,
+            apply_transforms: args.transforms,
             film_grain: args.film_grain,
             ..Options::default()
         };
         return match decode_avif(&data, &options, limits, &AtomicBool::new(false)) {
             Ok(avif) => {
                 write_frames(std::slice::from_ref(&avif.image), &stem, args.null)?;
+                if args.transforms {
+                    fs::write(out(&stem, "tr"), avif.transforms.len().to_string())?;
+                }
                 if let Some(alpha) = avif.alpha.as_ref().filter(|_| !args.null) {
                     let mut yuv = Vec::new();
                     append_planes(&mut yuv, alpha);
@@ -312,7 +321,7 @@ fn main() -> ExitCode {
         Err(msg) => {
             eprintln!("oracle: {msg}");
             eprintln!(
-                "usage: oracle [--info] [--null] [--threads N] [--no-filmgrain] [--op N] [--all-layers] <in-dir> <out-dir>"
+                "usage: oracle [--info] [--null] [--threads N] [--no-filmgrain] [--op N] [--all-layers] [--transforms] <in-dir> <out-dir>"
             );
             return ExitCode::from(2);
         }

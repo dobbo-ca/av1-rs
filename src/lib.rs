@@ -136,6 +136,13 @@ pub struct Options {
     /// type) raw in [`Frame::metadata`] (default `true`). `false` drops them. The colour
     /// configuration is always in [`Frame::color`].
     pub keep_metadata: bool,
+    /// [`decode_avif`] and [`decode_avif_item`] only (default `false`): apply the `clap`, `irot`
+    /// and `imir` properties with [`isobmff::apply_transforms`] instead of returning the image
+    /// raw. Each grid tile and each identity input gets its own transforms before it is used, the
+    /// derived item then gets its own, and the alpha image gets those of the primary image.
+    /// `false` returns every image untransformed; [`AvifImage::transforms`] always lists the
+    /// properties as stored. The result is charged to `max_alloc`. A decoder ignores it.
+    pub apply_transforms: bool,
 }
 
 impl Default for Options {
@@ -145,6 +152,7 @@ impl Default for Options {
             all_layers: false,
             film_grain: true,
             keep_metadata: true,
+            apply_transforms: false,
         }
     }
 }
