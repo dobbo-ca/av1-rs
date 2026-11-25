@@ -12,14 +12,22 @@ crate denies `unsafe` outside `src/simd` (docs/safety.md).
   The team has `min(max_threads, max(tiles, 64-row bands x planes))` threads; with one, the
   frame decodes on the calling thread exactly as before (`wrapup` on whole planes).
 - **Tiles of an AVIF grid** (`avif.rs`, `decode_grid`). Each grid tile is a coded item with its own
-  `Decoder`; they run on `min(max_threads, tiles)` threads and are pasted into the output as they
-  finish. Each inner decode gets `max_threads / workers` threads (so one when the grid has at least
-  as many tiles as threads), and all inner decoders share one ledger (the one of the whole
-  `decode_avif` call), so `max_alloc` covers them
-  together. The assembled canvas, the temporal-unit copy of each item and the primary image held
-  while the alpha item decodes are charged to it too. Item bytes inside `isobmff` (an eighth of
-  `max_alloc`, split between the workers, and kept out of the ledger's share) and a decoded
-  tile waiting for the canvas lock are not.
+  `Decoder`. Tile 0 decodes first, alone: it sizes the canvas and gives the output its
+  properties. The other tiles then run on `min(max_threads, tiles - 1)` threads and are pasted
+  into the output as they finish. Each inner decode gets `max_threads / workers` threads
+  (`workers = min(max_threads, tiles)`, so one thread when the grid has at least as many tiles as
+  threads, tile 0 included), and all inner decoders share one ledger (the one of the whole
+  `decode_avif` call), so `max_alloc` covers them together. The assembled canvas, the
+  temporal-unit copy of each item, every decoded tile from when its decoder makes it until it is
+  pasted and freed, the transforms of each tile (their output and the scratch `isobmff` may
+  allocate, booked before they run and passed to `isobmff` as its exact limit) and the primary
+  image held while the alpha item decodes are charged to it too. Item bytes inside `isobmff` (an
+  eighth of `max_alloc`, split between the workers, and kept out of the ledger's share) are not.
+  A tile refused (`AllocLimit`, `OutOfMemory`) while others decoded beside it is retried as
+  `decode` retries a batch: the tiles from the lowest refused one decode again one at a time,
+  each with only the canvas booked beside it, as in a serial decode. So for a grid with at least
+  as many tiles as threads the result, the image or the error, is the same for every thread count
+  (`tests/avif_alloc.rs`).
 
 - **Film grain** (`grain.rs`, `apply_film_grain`). The frame is cut into bands of 32 luma rows
   (one noise stripe each), run by `run_parallel` on `min(max_threads, bands)` threads. A band

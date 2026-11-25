@@ -48,12 +48,14 @@ from when they are built until the
 temporal unit returns; `decode` keeps every frame it collects charged (for the capacity of its
 planes, which may be pooled buffers larger than the samples, plus a fixed per-frame overhead for
 the `Frame`, its plane list and allocator chunks) until it returns. AVIF: one
-ledger per `decode_avif` call covers every item decoder, the grid canvas, the item copy and the
-primary image (docs/threading.md); it gets three quarters of `max_alloc`, and the `isobmff`
+ledger per `decode_avif` call covers every item decoder, the grid canvas, the item copy, every
+decoded tile until it is pasted, the transforms (output and scratch, booked before they run) and
+the primary image (docs/threading.md); it gets three quarters of `max_alloc`, and the `isobmff`
 parse and item reads an eighth each, so the three sum to `max_alloc`, not twice it
-(`tests/avif_alloc.rs` counts the heap of every thread for a plain item, an item with alpha and a
-2x2 grid at several `max_alloc` and `max_threads` values, and checks the peak against `max_alloc`
-plus the uncharged fixed buffers of each decoder).
+(`tests/avif_alloc.rs` counts the heap of every thread for small items and grids and for items
+and a grid with transforms far larger than the uncharged slack, at many `max_alloc` and
+`max_threads` values, and checks the peak against `max_alloc` plus the uncharged fixed buffers
+of each decoder; it does the same for `Decoder::decode_temporal_units` at 2 and 4 threads).
 
 Not charged, because their size does not depend on the input: per tile decoder, the colour map
 buffers and the 16 KiB reconstruction scratch (`recon::ItxScratch`). The loop restoration source
