@@ -20,6 +20,9 @@ MIN_GEN=${TRANSFORM_MIN_GENERATED:-70}
 # The most images that pass on "luma within 2 via RGB" (the 29 of the run that pinned it). A
 # higher count means files left the exact classes: look at transform-files.txt.
 MAX_RGB=${TRANSFORM_MAX_RGB:-29}
+# The most a chroma sample of av1-rs may be from the range of the libheif samples of its cell, in
+# 8-bit units (scaled up for deeper samples), see chrompos.
+CHROMA_CAP=${TRANSFORM_CHROMA_CAP:-3}
 
 # gen <dst>: 4:2:0, 4:2:2 and 4:4:4 images of three sizes (a gradient with some noise inside the RGB gamut, so a wrong
 # row or column shows) written by avifenc with every combination of clap, irot and imir below. A
@@ -91,6 +94,42 @@ chromacmp() {
   cmp -s $W/ch.a $W/ch.b
 }
 
+# chrompos <ours.yuv> <libheif.yuv> <w> <h> <bytes per sample> <ours layout> <libheif layout> <bit depth> <rgb>:
+# av1-rs's chroma against libheif's by position, in the output geometry (rotation, mirror and crop
+# are already applied to both, so they need no mapping). A chroma sample sits at the luma positions
+# of its cell (2x2 for 4:2:0, 2x1 for 4:2:2, one for 4:4:4). Every libheif sample, at its luma
+# position, must lie within CHROMA_CAP (scaled to the bit depth) of the range of the av1-rs samples
+# whose cells touch the 5x5 luma window around it: libheif's bilinear 4:2:0 and 4:2:2 to 4:4:4 step
+# (and, for 4:2:2 rotated by 90 or 270, the interpolation of the sample copied into two columns by
+# av1-rs) is a blend of neighbouring samples, and an odd crop or mirror moves av1-rs's chroma by one
+# luma sample. With <rgb> = rgb (libheif went through RGB) the av1-rs samples rescaled from studio
+# to full range, round((v - 128) * 255 / 224 + 128), may be used instead. Prints exact (every
+# libheif sample equals the av1-rs sample of its cell) or cap and the largest distance; status 1
+# above the cap.
+chrompos() {
+  case $6 in 420) sx=2 sy=2 ;; 422) sx=2 sy=1 ;; *) sx=1 sy=1 ;; esac
+  case $7 in 420) lsx=2 lsy=2 ;; 422) lsx=2 lsy=1 ;; *) lsx=1 lsy=1 ;; esac
+  cw=$((($3 + sx - 1) / sx)) ch=$((($4 + sy - 1) / sy))
+  lcw=$((($3 + lsx - 1) / lsx)) lch=$((($4 + lsy - 1) / lsy))
+  tail -c +$(($3 * $4 * $5 + 1)) $1 | od -An -v -tu$5 -w$5 > $W/cp.a
+  tail -c +$(($3 * $4 * $5 + 1)) $2 | od -An -v -tu$5 -w$5 > $W/cp.b
+  awk -v w=$3 -v h=$4 -v cw=$cw -v ch=$ch -v sx=$sx -v sy=$sy -v lcw=$lcw -v lch=$lch -v lsx=$lsx -v lsy=$lsy \
+    -v cap=$((CHROMA_CAP << ($8 - 8))) -v rgb="$9" '
+    function rs(v,  t) { t = (v - 128) * 255 / 224 + 128.5; return t < 0 ? 0 : int(t) }
+    NR == FNR { o[NR - 1] = $1; next }
+    { i = FNR - 1; n = lcw * lch; p = int(i / n); r = i - p * n; y = int(r / lcw) * lsy; x = (r - int(r / lcw) * lcw) * lsx
+      x0 = x < 2 ? 0 : x - 2; x1 = x + 2 > w - 1 ? w - 1 : x + 2; y0 = y < 2 ? 0 : y - 2; y1 = y + 2 > h - 1 ? h - 1 : y + 2
+      lo = 1e9; hi = -1
+      for (yy = int(y0 / sy); yy <= int(y1 / sy); yy++) for (xx = int(x0 / sx); xx <= int(x1 / sx); xx++) {
+        v = o[p * cw * ch + yy * cw + xx]; if (v < lo) lo = v; if (v > hi) hi = v }
+      d = $1 < lo ? lo - $1 : ($1 > hi ? $1 - hi : 0)
+      if (rgb == "rgb") { e = $1 < rs(lo) ? rs(lo) - $1 : ($1 > rs(hi) ? $1 - rs(hi) : 0); if (e < d) d = e }
+      if (d > worst) worst = d
+      if ($1 != o[p * cw * ch + int(y / sy) * cw + int(x / sx)]) ne = 1 }
+    END { if (worst > cap) { print "over " worst; exit 1 }
+      if (ne) print "cap " worst + 0; else print "exact" }' $W/cp.a $W/cp.b
+}
+
 full() {
   REP=$1 bad=0
   rm -rf $W; mkdir -p "$REP" $W/in $W/raw $W/ours $W/lh
@@ -108,7 +147,7 @@ full() {
   av1-oracle --transforms $W/in $W/ours || bad=1
   heif-transform-oracle $W/in $W/lh 2> $W/lh.err || bad=1
   : > $W/transform.diff; : > $W/files.txt
-  c_exact=0 c_doc=0 c_rgb=0 c_skip=0 c_tr=0 c_cmp=0 g_exact=0 g_doc=0 g_rgb=0 g_skip=0 g_cmp=0 g_tr=0
+  c_cx=0 c_cc=0 g_cx=0 g_cc=0 c_exact=0 c_doc=0 c_rgb=0 c_skip=0 c_tr=0 c_cmp=0 g_exact=0 g_doc=0 g_rgb=0 g_skip=0 g_cmp=0 g_tr=0
   for p in $W/in/*; do
     f=${p##*/}; s=${f%.*}
     case $f in gen_*) k=g ;; *) k=c ;; esac
@@ -145,11 +184,18 @@ full() {
           chromacmp $W/ours/$s.yuv $W/raw/$s.yuv $((ow * oh * b)) $ow $oh $b "$olay" "$ntr" ||
             { echo "$f: av1-rs chroma differs from its raw decode (raw $rlay, ${ow}x$oh, $obd-bit, $ntr transforms)" >> $W/transform.diff; continue; }
         fi
+        # The chroma by position against libheif's 4:4:4 (or other) chroma, after any rotate, mirror or crop.
+        cp=exact
+        if [ "$olay" != 400 ] && [ "$llay" != 400 ]; then
+          cp=$(chrompos $W/ours/$s.yuv $W/lh/$s.yuv $ow $oh $b "$olay" "$llay" "$obd" "$how") ||
+            { echo "$f: av1-rs chroma differs from libheif by position ($cp, cap $CHROMA_CAP; raw $rlay, av1-rs $olay, libheif $llay, ${ow}x$oh, $obd-bit, $ntr transforms)" >> $W/transform.diff; continue; }
+        fi
+        case $cp in exact) eval "${k}_cx=\$((${k}_cx + 1))" ;; *) eval "${k}_cc=\$((${k}_cc + 1))" ;; esac
         case $how in
           exact) eval "${k}_doc=\$((${k}_doc + 1))" ;;
           *) eval "${k}_rgb=\$((${k}_rgb + 1))" ;;
         esac
-        echo "$f luma-$how raw=$rlay ours=$olay libheif=$llay ${ow}x$oh $obd-bit $ntr-transforms" >> $W/files.txt
+        echo "$f luma-$how chroma-$cp raw=$rlay ours=$olay libheif=$llay ${ow}x$oh $obd-bit $ntr-transforms" >> $W/files.txt
         continue
       }
       echo "$f: luma differs from libheif (raw $rlay, av1-rs $olay, libheif $llay, ${ow}x$oh, $obd-bit, $ntr transforms)" >> $W/transform.diff
@@ -164,10 +210,10 @@ full() {
   [ $((c_rgb + g_rgb)) -le "$MAX_RGB" ] || echo "$((c_rgb + g_rgb)) images pass on luma within 2 via RGB, want at most $MAX_RGB" >> $W/d-cover
   {
     echo "## av1-rs transform parity (libheif 1.23.7 with dav1d)"; echo
-    echo "| set | files | compared | with transform properties | exact | luma exact, chroma format differs (documented) | luma within 2 via RGB (documented) | not compared (both fail, or libheif refuses) |"
-    echo "|---|---|---|---|---|---|---|---|"
-    echo "| corpus | $cn | $c_cmp | $c_tr | $c_exact | $c_doc | $c_rgb | $c_skip |"
-    echo "| generated (avifenc) | $gn | $g_cmp | $g_tr | $g_exact | $g_doc | $g_rgb | $g_skip |"
+    echo "| set | files | compared | with transform properties | exact | luma exact, chroma format differs (documented) | luma within 2 via RGB (documented) | of those, chroma by position equal | of those, chroma by position within the cap | not compared (both fail, or libheif refuses) |"
+    echo "|---|---|---|---|---|---|---|---|---|---|"
+    echo "| corpus | $cn | $c_cmp | $c_tr | $c_exact | $c_doc | $c_rgb | $c_cx | $c_cc | $c_skip |"
+    echo "| generated (avifenc) | $gn | $g_cmp | $g_tr | $g_exact | $g_doc | $g_rgb | $g_cx | $g_cc | $g_skip |"
     echo; echo "| gate | result |"; echo "|---|---|"
   } > "$REP/summary.md"
   for g in transform.diff d-cover; do
