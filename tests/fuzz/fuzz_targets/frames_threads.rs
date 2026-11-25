@@ -1,7 +1,8 @@
 #![no_main]
 //! `frames_threads`: `Decoder::decode_temporal_units` with 1, 2, 3 and 8 threads against a loop of
 //! `decode_temporal_unit` calls on one thread: the same frames (those before an error too) and the
-//! same error. Option bits: 0 = Annex B (non-IVF input), 2 = no film grain.
+//! same error, unless the ledger refused either side (`AllocLimit`), where only the frames up to
+//! the refusal must agree. Option bits: 0 = Annex B (non-IVF input), 2 = no film grain.
 
 use av1::Error;
 use libfuzzer_sys::fuzz_target;
@@ -66,7 +67,7 @@ fuzz_target!(|data: &[u8]| {
         }
     }
     // A failed system allocation is the one error that may differ with the number of frames in
-    // flight; `AllocLimit` is the same at every thread count.
+    // flight.
     let limit = |e: &Option<Error>| matches!(e, Some(Error::OutOfMemory));
     if limit(&want_err) {
         return;
@@ -82,6 +83,20 @@ fuzz_target!(|data: &[u8]| {
             Err(e) => (dec.take_frames(), Some(e)),
         };
         if limit(&got_err) {
+            continue;
+        }
+        // The batch keeps the frames of every unit booked until it returns, where the loop hands
+        // each unit's frames back, and it decodes with more threads, which book more: it can run
+        // out of `max_alloc` at an earlier unit than the loop does, or where the loop does not.
+        // So when either side is refused by the ledger, the frames output up to there agree and
+        // nothing else is required; any other difference is a bug.
+        let refused = |e: &Option<Error>| matches!(e, Some(Error::AllocLimit));
+        if refused(&got_err) || refused(&want_err) {
+            let n = got.len().min(want.len());
+            assert!(
+                got[..n] == want[..n],
+                "{threads} threads: the frames differ"
+            );
             continue;
         }
         assert_eq!(got_err, want_err, "{threads} threads");

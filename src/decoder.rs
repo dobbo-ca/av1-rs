@@ -288,6 +288,18 @@ impl Decoder {
         format: Format,
         cancel: &AtomicBool,
     ) -> Result<Vec<Frame>, Error> {
+        self.decode_obus(data, format, cancel)?;
+        Ok(self.select_output())
+    }
+
+    /// [`Decoder::decode_temporal_unit`] up to the layer selection: the output frames are left in
+    /// `ready`, still booked.
+    fn decode_obus(
+        &mut self,
+        data: &[u8],
+        format: Format,
+        cancel: &AtomicBool,
+    ) -> Result<(), Error> {
         // Tile ranges are offsets into one call's `data`: a frame cannot continue in the next call.
         self.pending = None;
         self.ready.clear();
@@ -304,7 +316,27 @@ impl Decoder {
                 return Err(e);
             }
         }
-        Ok(self.select_output())
+        Ok(())
+    }
+
+    /// [`Decoder::decode_temporal_unit`] for a caller that books the output itself (an AVIF
+    /// item): the ledger bytes the output frames hold (their planes, plane lists and, on a shared
+    /// ledger, their metadata) are not given back but returned with them, so the frames are never
+    /// live without a booking. After an error nothing of the unit stays booked.
+    pub(crate) fn decode_unit_booked(
+        &mut self,
+        data: &[u8],
+        format: Format,
+        cancel: &AtomicBool,
+    ) -> Result<(Vec<Frame>, usize), Error> {
+        if let Err(e) = self.decode_obus(data, format, cancel) {
+            self.ready.clear();
+            self.release_ready();
+            self.clear_metadata();
+            return Err(e);
+        }
+        let booked = std::mem::take(&mut self.ready_bytes);
+        Ok((self.select_output(), booked))
     }
 
     /// Decodes `units`, consecutive temporal units of one stream, and returns their output
@@ -1185,8 +1217,11 @@ impl Decoder {
                 out.push(self.public_plane(p, p.width, p.height, s.bit_depth)?);
             }
         }
-        // The frame owns the metadata now; a shared ledger keeps it booked for the rest of the call.
+        // The frame owns the metadata now; a shared ledger keeps it booked with the frame's planes.
         let metadata = std::mem::take(&mut self.metadata);
+        if self.charge_metadata {
+            self.ready_bytes += self.metadata_bytes;
+        }
         self.metadata_bytes = 0;
         Ok(Frame {
             width: s.width,
