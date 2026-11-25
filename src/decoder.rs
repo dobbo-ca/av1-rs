@@ -39,7 +39,7 @@ struct Pending {
 /// A frame of a batch ([`Decoder::decode_temporal_units`]) whose header is parsed and whose
 /// reference update (the header half) is done; its pixels are decoded at the next flush.
 #[derive(Debug)]
-struct Job {
+struct QueuedFrame {
     header: FrameHeader,
     seq: SequenceHeader,
     /// Index of its temporal unit in the batch; `tiles` point into that unit.
@@ -197,7 +197,7 @@ pub struct Decoder {
     /// is queued in `jobs` instead of decoded.
     batching: bool,
     /// The frames queued since the last flush, in stream order.
-    jobs: Vec<Job>,
+    jobs: Vec<QueuedFrame>,
     /// The batch unit being parsed.
     parse_unit: usize,
     /// The frames of the finished units of a batch that failed, for [`Decoder::take_frames`].
@@ -519,7 +519,7 @@ impl Decoder {
         } else {
             (Vec::new(), 0)
         };
-        self.jobs.push(Job {
+        self.jobs.push(QueuedFrame {
             header,
             seq,
             unit: self.parse_unit,
@@ -631,7 +631,7 @@ impl Decoder {
     /// The output frame of a committed job: its unit's earlier frames are finished first.
     fn commit_output(
         &mut self,
-        job: &mut Job,
+        job: &mut QueuedFrame,
         planes: &[WorkPlane],
         cancel: &AtomicBool,
         b: &mut Batch,
@@ -651,7 +651,7 @@ impl Decoder {
 
     /// A frame failed in a flush: the references are as a loop of single decodes leaves them
     /// (`updated` once the frame went into the slots), and nothing after it runs.
-    fn job_failed(&mut self, job: &Job, e: Error, updated: bool, b: &mut Batch) -> Error {
+    fn job_failed(&mut self, job: &QueuedFrame, e: Error, updated: bool, b: &mut Batch) -> Error {
         self.refs = job.refs.clone();
         if updated {
             self.refs.update(&job.header, &job.seq);
@@ -1270,6 +1270,29 @@ fn decode_frame(
     fs.lr_frame = planes;
     fs.frame_cdf = Some(w.frame_cdf);
     Ok(fs)
+}
+
+/// The pixel work of a queued frame: its frame state (on the arrays of `spare` when the shape
+/// fits) and [`decode_frame`] with `threads` threads. `data` is the frame's temporal unit.
+fn decode_job(
+    ledger: &Arc<Ledger>,
+    threads: usize,
+    job: &QueuedFrame,
+    data: &[u8],
+    spare: Option<FrameState>,
+    cancel: &AtomicBool,
+) -> Result<FrameState, Error> {
+    let fs = FrameState::reuse(spare, &job.header, &job.seq, ledger)?;
+    decode_frame(
+        fs,
+        ledger,
+        threads,
+        &job.header,
+        &job.seq,
+        data,
+        &job.tiles,
+        cancel,
+    )
 }
 
 /// The threads of a frame decode: `max_threads` (0 counts as 1), but no more than its largest
