@@ -14,11 +14,11 @@
 set -u
 export LC_ALL=C
 W=/work-tr
-MIN_CORPUS=${TRANSFORM_MIN_CORPUS:-100}
-MIN_TR=${TRANSFORM_MIN_TRANSFORMED:-5}
-MIN_GEN=${TRANSFORM_MIN_GENERATED:-60}
+MIN_CORPUS=${TRANSFORM_MIN_CORPUS:-140}
+MIN_TR=${TRANSFORM_MIN_TRANSFORMED:-10}
+MIN_GEN=${TRANSFORM_MIN_GENERATED:-70}
 
-# gen <dst>: 4:2:0, 4:2:2 and 4:4:4 images of three sizes (a gradient with some noise, so a wrong
+# gen <dst>: 4:2:0, 4:2:2 and 4:4:4 images of three sizes (a gradient with some noise inside the RGB gamut, so a wrong
 # row or column shows) written by avifenc with every combination of clap, irot and imir below. A
 # combination that avifenc refuses (a crop that 4:2:0 cannot hold) is skipped.
 gen() {
@@ -30,8 +30,8 @@ gen() {
       tag=C${c}; [ "$c" = 420 ] && tag=C420jpeg
       perl -e '($w, $h, $c, $t) = @ARGV; print "YUV4MPEG2 W$w H$h F30:1 Ip A1:1 $t\nFRAME\n";
         ($cw, $ch) = $c == 444 ? ($w, $h) : $c == 422 ? (int(($w + 1) / 2), $h) : (int(($w + 1) / 2), int(($h + 1) / 2));
-        for $y (0 .. $h - 1) { print pack("C*", map { ($_ * 7 + $y * 13 + ($_ * $y) % 31) % 256 } 0 .. $w - 1) }
-        for $p (1, 2) { for $y (0 .. $ch - 1) { print pack("C*", map { ($_ * 5 + $y * 11 + $p * 40 + ($_ * $y) % 17) % 256 } 0 .. $cw - 1) } }' \
+        for $y (0 .. $h - 1) { print pack("C*", map { 40 + ($_ * 7 + $y * 13 + ($_ * $y) % 31) % 176 } 0 .. $w - 1) }
+        for $p (1, 2) { for $y (0 .. $ch - 1) { print pack("C*", map { 120 + ($_ * 5 + $y * 11 + $p * 3 + ($_ * $y) % 17) % 16 } 0 .. $cw - 1) } }' \
         $w $h $c $tag > $W/gen/src.y4m
       i=0
       while IFS= read -r opts; do
@@ -57,14 +57,18 @@ EOF
 }
 
 # lumacmp <ours.yuv> <libheif.yuv> <bytes> <bit depth>: the first <bytes> bytes (the luma plane)
-# are equal, or for 8-bit samples within 2 (libheif converts through RGB, which can rescale the
-# luma by a little: docs/parity.md). Prints exact or rgb, status 1 when neither.
+# are equal, or for 8-bit samples libheif's luma is within 2 of ours or of ours rescaled from
+# studio to full range, round((v - 16) * 255 / 219) (libheif converts through RGB, which moves the
+# luma to another range and rounds it twice: docs/parity.md). Prints exact or rgb, status 1 when
+# neither.
 lumacmp() {
   if cmp -s -n "$3" "$1" "$2"; then echo exact; return 0; fi
   [ "$4" -eq 8 ] || return 1
-  cmp -l -n "$3" "$1" "$2" | awk '{ a = 0; b = 0; for (i = 1; i <= length($2); i++) a = a * 8 + substr($2, i, 1);
-    for (i = 1; i <= length($3); i++) b = b * 8 + substr($3, i, 1);
-    d = a - b; if (d < 0) d = -d; if (d > 2) bad = 1 } END { exit bad }' || return 1
+  od -An -v -tu1 -w1 -N "$3" "$1" > $W/lum.a
+  od -An -v -tu1 -w1 -N "$3" "$2" > $W/lum.b
+  paste $W/lum.a $W/lum.b | awk '{ d = $1 - $2; if (d < 0) d = -d; if (d > 2) b0 = 1
+    r = int(($1 - 16) * 255 / 219 + 0.5); if (r < 0) r = 0; if (r > 255) r = 255
+    d = r - $2; if (d < 0) d = -d; if (d > 2) b1 = 1 } END { exit (b0 && b1) }' || return 1
   echo rgb
 }
 
@@ -90,7 +94,8 @@ full() {
     f=${p##*/}; s=${f%.*}
     case $f in gen_*) k=g ;; *) k=c ;; esac
     if [ -f $W/ours/$s.err ]; then
-      if [ -f $W/lh/$s.err ]; then eval "${k}_skip=\$((${k}_skip + 1))"
+      # inter: a layered item (Xiph) whose frames av1-rs stops at, as in run.sh; libheif decodes one layer.
+      if [ -f $W/lh/$s.err ] || [ "$(cat $W/ours/$s.err)" = inter ]; then eval "${k}_skip=\$((${k}_skip + 1))"
       else echo "$f: av1-rs error $(cat $W/ours/$s.err), libheif decoded it" >> $W/transform.diff; fi
       continue
     fi
