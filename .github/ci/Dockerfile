@@ -258,3 +258,12 @@ RUN --mount=type=cache,id=av1-rs-target-bench,sharing=locked,target=/src/target 
     && cp target/noinline/release/examples/oracle /usr/local/bin/av1-oracle-noinline
 RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked,readonly \
     sh tests/parity/profile.sh prep /bench && du -sh /bench
+
+# v4-diag.yml: which false-deps target features this rustc knows (tests/parity/v4-diag.sh).
+FROM toolchain AS v4-diag
+ARG DIAG_RUN=0
+COPY tests/parity/v4-diag.sh /v4-diag.sh
+RUN echo "run $DIAG_RUN" && mkdir -p /report && sh /v4-diag.sh > /report/v4-diag.txt 2>&1; echo 0 > /report/status
+
+FROM scratch AS v4-diag-report
+COPY --from=v4-diag /report /
