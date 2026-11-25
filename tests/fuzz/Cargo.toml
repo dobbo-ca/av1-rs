@@ -97,3 +97,10 @@ path = "fuzz_targets/simd_alloc.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "frames_threads"
+path = "fuzz_targets/frames_threads.rs"
+test = false
+doc = false
+bench = false

@@ -280,8 +280,10 @@ fn run_file(
     let mut decoder = Decoder::new(options, *limits);
     let mut frames = Vec::new();
     let mut stopped = None;
-    for unit in units {
-        match decoder.decode_temporal_unit(unit, format, &cancel) {
+    // Groups of `max_threads` units: the frames of a group decode in parallel, and the output of
+    // a group stays booked only until the group is done.
+    for group in units.chunks(limits.max_threads.max(1)) {
+        match decoder.decode_temporal_units(group, format, &cancel) {
             Ok(f) => frames.extend(f),
             Err(e) => {
                 frames.extend(decoder.take_frames());

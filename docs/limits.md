@@ -46,6 +46,20 @@ Not charged, because their size does not depend on the input: the loop restorati
 of the loop restoration SIMD kernels (about 70 KB) and, per tile decoder, the colour map
 buffers and the 12 KiB reconstruction scratch (`recon::ItxScratch`).
 
+## Batches
+
+`Decoder::decode_temporal_units` (and so `decode`) keeps the output frames of all its units
+charged until it returns (`decode` always did). With `max_threads` above 1 it also has up to
+`W` frames decoding at once, each holding its own `FrameState`, `CurrFrame`, `CdefFrame` and
+`LrFrame`, so the ledger peak is about `W` times that of one frame (`W x threads <= max_threads`,
+docs/threading.md). `W` is lowered until `W` times an estimate of one frame (three sets of
+16-bit planes of the padded luma area times three, with a margin) fits in what is left of
+`max_alloc`; if a buffer is refused anyway, the whole group is dropped and decoded one frame at a
+time. A stream of large frames therefore runs one frame at a time when `max_alloc` is small, and
+the output limit applies as before: pass a few units at a time (the oracle passes `max_threads`
+units) to stream a long file. The slots a frame refreshes are emptied when the frame is
+committed, so in a batch the planes they held stay charged while the group decodes.
+
 ## Buffer reuse
 
 A `Decoder` keeps its buffers from one frame to the next, so a stream of frames of one shape
