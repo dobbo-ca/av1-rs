@@ -85,6 +85,15 @@ impl<'a> SymbolDecoder<'a> {
     #[inline]
     fn refill(&mut self) {
         let mut c = 40 - self.cnt;
+        // Eight bytes left: one big-endian load. The first `n` of them go where the loop below
+        // puts them: the first at bit `c`, each next one 8 lower, i.e. as one number at `c & 7`.
+        if let Some(w) = self.data.get(self.pos..).and_then(|d| d.first_chunk::<8>()) {
+            let n = (c >> 3) + 1;
+            self.dif ^= (u64::from_be_bytes(*w) >> (64 - 8 * n)) << (c & 7);
+            self.pos += n as usize;
+            self.cnt = 40 - (c - 8 * n);
+            return;
+        }
         while c >= 0 {
             let Some(&b) = self.data.get(self.pos) else {
                 break;
