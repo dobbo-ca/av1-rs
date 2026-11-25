@@ -24,6 +24,92 @@ threads, AVX-512) are not comparable with these: compare runs on the same runner
 `dav1d C` is the same binary with `--cpumask none`) and av1-rs with `AV1_SIMD=scalar` and with
 NEON, with one thread and with the default threads. No aomdec and no v4 build there.
 
+## Baseline on hosted runners
+
+Bench run 45705147876 (dispatch, commit d86861a, the branch that moved CI to hosted runners).
+`bench`: AMD EPYC 7763, 4 vCPU, no AVX-512, so this run has no v4 times and no avx512 tier; the
+first run on an AVX-512 runner fills them in. `bench-arm64`: Neoverse-N2, 4 vCPU.
+
+x86_64, 1 thread:
+
+| class | streams | frames | dav1d ms | aomdec ms | av1-rs ms | av1-rs v4 ms | av1-rs / dav1d | av1-rs / aomdec |
+|---|---|---|---|---|---|---|---|---|
+| q8 | 5 | 5 | 27 | 49 | 33 | - | 122% | 67% |
+| q10 | 5 | 5 | 46 | 94 | 74 | - | 160% | 78% |
+| allintra | 2 | 78 | 293 | 570 | 681 | - | 232% | 119% |
+| size | 16 | 16 | 52 | 88 | 24 | - | 46% | 27% |
+| grain | 2 | 2 | 11 | 22 | 14 | - | 127% | 63% |
+| avif8 | 4 | 4 | 45 | 106 | 97 | - | 215% | 91% |
+| avifhi | 4 | 4 | 109 | 293 | 256 | - | 234% | 87% |
+| tiles8 | 1 | 8 | 76 | 172 | 273 | - | 359% | 158% |
+| tiles10 | 1 | 8 | 84 | 213 | 280 | - | 333% | 131% |
+| all | | | 743 | 1607 | 1732 | - | 233% | 107% |
+
+x86_64, default threads (4):
+
+| class | streams | frames | dav1d ms | aomdec ms | av1-rs ms | av1-rs v4 ms | av1-rs / dav1d | av1-rs / aomdec |
+|---|---|---|---|---|---|---|---|---|
+| q8 | 5 | 5 | 35 | 51 | 33 | - | 94% | 64% |
+| q10 | 5 | 5 | 57 | 93 | 71 | - | 124% | 76% |
+| allintra | 2 | 78 | 170 | 568 | 317 | - | 186% | 55% |
+| size | 16 | 16 | 73 | 88 | 30 | - | 41% | 34% |
+| grain | 2 | 2 | 14 | 22 | 15 | - | 107% | 68% |
+| avif8 | 4 | 4 | 50 | 102 | 88 | - | 176% | 86% |
+| avifhi | 4 | 4 | 128 | 292 | 220 | - | 171% | 75% |
+| tiles8 | 1 | 8 | 39 | 85 | 133 | - | 341% | 156% |
+| tiles10 | 1 | 8 | 46 | 104 | 132 | - | 286% | 126% |
+| all | | | 612 | 1405 | 1039 | - | 169% | 73% |
+
+x86_64 SIMD tiers (default build, 1 thread; AVX2 is the best tier on this CPU):
+
+| class | scalar ms | avx2 ms | avx512 ms | avx2 / scalar |
+|---|---|---|---|---|
+| q8 | 69 | 34 | - | 49% |
+| q10 | 172 | 75 | - | 43% |
+| allintra | 1243 | 684 | - | 55% |
+| size | 84 | 29 | - | 34% |
+| grain | 33 | 14 | - | 42% |
+| avif8 | 226 | 97 | - | 42% |
+| avifhi | 567 | 256 | - | 45% |
+| tiles8 | 934 | 273 | - | 29% |
+| tiles10 | 963 | 277 | - | 28% |
+
+aarch64 NEON, 1 thread:
+
+| class | dav1d ms | dav1d C ms | av1-rs scalar ms | av1-rs neon ms | neon / scalar | neon / dav1d |
+|---|---|---|---|---|---|---|
+| q8 | 27 | 38 | 48 | 27 | 56% | 100% |
+| q10 | 48 | 78 | 121 | 60 | 49% | 125% |
+| allintra | 273 | 356 | 840 | 486 | 57% | 178% |
+| size | 56 | 75 | 60 | 28 | 46% | 50% |
+| grain | 11 | 16 | 23 | 13 | 56% | 118% |
+| avif8 | 48 | 88 | 157 | 80 | 50% | 166% |
+| avifhi | 123 | 235 | 381 | 215 | 56% | 174% |
+| tiles8 | 82 | 230 | 631 | 235 | 37% | 286% |
+| tiles10 | 93 | 243 | 644 | 240 | 37% | 258% |
+| all | 761 | 1359 | 2905 | 1384 | 47% | 181% |
+
+aarch64 NEON, default threads (4):
+
+| class | dav1d ms | dav1d C ms | av1-rs scalar ms | av1-rs neon ms | neon / scalar | neon / dav1d |
+|---|---|---|---|---|---|---|
+| q8 | 30 | 39 | 35 | 27 | 77% | 90% |
+| q10 | 54 | 64 | 74 | 50 | 67% | 92% |
+| allintra | 137 | 156 | 249 | 155 | 62% | 113% |
+| size | 71 | 83 | 40 | 24 | 60% | 33% |
+| grain | 13 | 15 | 16 | 12 | 75% | 92% |
+| avif8 | 44 | 58 | 94 | 62 | 65% | 140% |
+| avifhi | 107 | 178 | 245 | 163 | 66% | 152% |
+| tiles8 | 29 | 67 | 170 | 70 | 41% | 241% |
+| tiles10 | 33 | 72 | 170 | 70 | 41% | 212% |
+| all | 518 | 732 | 1093 | 633 | 57% | 122% |
+
+NEON roughly halves the scalar time (47% over all classes with one thread) and is 1.8x dav1d
+with one thread, 1.2x with four. dav1d's own NEON asm saves less here (dav1d / dav1d C 55% with
+one thread), so the gap to dav1d with one thread is smaller on aarch64 (1.8x) than on x86_64
+with AVX2 (2.3x). `dav1d C` shows that the NEON asm is in use: the same dav1d with
+`--cpumask none` is slower in every class.
+
 ## The v4 build
 
 `-C target-cpu=x86-64-v4` makes `rustc 1.99.1` enable these target features
