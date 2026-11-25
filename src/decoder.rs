@@ -16,7 +16,7 @@ use crate::header::{FrameHeader, RefInfo, RefState, TileRange, parse_tile_group}
 use crate::ledger::Ledger;
 use crate::lf::{lf_on, lf_plane_on, loop_filter_frame, loop_filter_rows};
 use crate::limits::Limits;
-use crate::lr::{lr_frame, lr_plane, lr_stripe};
+use crate::lr::{LrScratch, lr_frame, lr_plane, lr_stripe};
 use crate::obu::{Obu, ObuIter, parse_metadata};
 use crate::parallel::{Team, run_parallel, with_team};
 use crate::seq::SequenceHeader;
@@ -1391,20 +1391,35 @@ impl Wrap<'_> {
             team.run(Job::LfRows, fs.num_planes * bands)?;
             team.run(Job::LfCols, fs.num_planes * self.strips(fs))?;
         }
-        // `CdefFrame` starts as a copy of `CurrFrame`, which it stays with CDEF off.
-        let cdef = cdef_planes(&read_lock(&self.curr), self.ledger)?;
-        let on = cdef_on(fs, &read_lock(&self.curr), seq, h, &cdef);
-        *write_lock(&self.cdef) = cdef;
+        // With CDEF off `CdefFrame` is `CurrFrame` itself (`cdef` stays empty, see
+        // `cdef_src`), so no copy is made.
+        let on = {
+            let curr = read_lock(&self.curr);
+            cdef_on(fs, &curr, seq, h, &curr)
+        };
         if on {
+            // `CdefFrame` starts as a copy of `CurrFrame`, which the unfiltered blocks keep.
+            let cdef = cdef_planes(&read_lock(&self.curr), self.ledger)?;
+            *write_lock(&self.cdef) = cdef;
             team.run(Job::Cdef, bands)?;
         }
         let lr_items = fs.num_planes.min(3) * stripes(fs);
         if h.frame_width == h.upscaled_width {
-            // No superres: loop restoration reads `CdefFrame` and `CurrFrame` as they are.
-            *lock(&self.out) = exact_planes(fs, Some(read_lock(&self.cdef).as_slice()))?;
-            if h.uses_lr {
-                team.run(Job::Lr, lr_items)?;
+            if !h.uses_lr {
+                // Nothing reads the planes after this: they are the output, cropped.
+                let planes = if on {
+                    std::mem::take(&mut *write_lock(&self.cdef))
+                } else {
+                    let mut curr = write_lock(&self.curr);
+                    let mut v = self.ledger.planes(curr.len())?;
+                    v.append(&mut curr);
+                    v
+                };
+                return Ok(crop_planes(fs, planes));
             }
+            // No superres: loop restoration reads `CdefFrame` and `CurrFrame` as they are.
+            *lock(&self.out) = exact_planes(fs, Some(read_lock(self.cdef_src()).as_slice()))?;
+            team.run(Job::Lr, lr_items)?;
             return Ok(std::mem::take(&mut *lock(&self.out)));
         }
         let row_bands = fs.num_planes * fs.frame_height.div_ceil(64);
@@ -1419,6 +1434,15 @@ impl Wrap<'_> {
         *lock(&self.out) = exact_planes(fs, Some(read_lock(&self.up_cdef).as_slice()))?;
         team.run(Job::Lr, lr_items)?;
         Ok(std::mem::take(&mut *lock(&self.out)))
+    }
+
+    /// `CdefFrame`: `cdef`, or `CurrFrame` itself when CDEF did not run (`cdef` is empty).
+    fn cdef_src(&self) -> &RwLock<Vec<WorkPlane>> {
+        if read_lock(&self.cdef).is_empty() {
+            &self.curr
+        } else {
+            &self.cdef
+        }
     }
 
     /// Item `i` of stage `job`:
@@ -1437,7 +1461,7 @@ impl Wrap<'_> {
             Job::LfRows => self.lf_rows(i),
             Job::LfCols => self.lf_cols(i),
             Job::Cdef => self.cdef_band(i),
-            Job::UpCdef => self.upscale_band(&self.cdef, &self.up_cdef, i),
+            Job::UpCdef => self.upscale_band(self.cdef_src(), &self.up_cdef, i),
             Job::UpCurr => self.upscale_band(&self.curr, &self.up_curr, i),
             Job::Lr => self.lr_band(i),
         }
@@ -1686,7 +1710,7 @@ impl Wrap<'_> {
         let (cdef, curr) = if self.h.frame_width != self.h.upscaled_width {
             (read_lock(&self.up_cdef), read_lock(&self.up_curr))
         } else {
-            (read_lock(&self.cdef), read_lock(&self.curr))
+            (read_lock(self.cdef_src()), read_lock(&self.curr))
         };
         // `LrFrame` has `num_planes` planes of `exact_size`.
         if plane >= fs.num_planes.min(3).min(cdef.len()).min(curr.len()) {
@@ -1712,7 +1736,8 @@ impl Wrap<'_> {
             x0: 0,
             y0,
         };
-        lr_stripe(fs, self.seq, &g, n, c, u, &mut v);
+        let mut scratch = LrScratch::new(self.ledger)?;
+        lr_stripe(fs, self.seq, &g, n, c, u, &mut v, &mut scratch);
         drop((cdef, curr));
         let mut out = lock(&self.out);
         let p = out.get_mut(plane).ok_or(Error::Invalid("plane missing"))?;
@@ -1793,6 +1818,18 @@ fn exact_planes(fs: &FrameState, src: Option<&[WorkPlane]>) -> Result<Vec<WorkPl
     Ok(out)
 }
 
+/// `planes` as output planes of exactly `UpscaledWidth` x `FrameHeight` (chroma `(size + ss) >>
+/// ss`) without copying: the same buffers with the size cropped and the stride kept (the output
+/// reads rows with the stride, see `row_of`).
+fn crop_planes(fs: &FrameState, mut planes: Vec<WorkPlane>) -> Vec<WorkPlane> {
+    for (i, p) in planes.iter_mut().enumerate() {
+        let (w, ht) = exact_size(fs, i);
+        p.width = p.width.min(w);
+        p.height = p.height.min(ht);
+    }
+    planes
+}
+
 /// `Err(Cancelled)` once the flag is set. The wrapup filters and film grain check it per row band.
 pub(crate) fn check_cancel(cancel: &AtomicBool) -> Result<(), Error> {
     if cancel.load(Ordering::Relaxed) {
@@ -1811,20 +1848,42 @@ fn wrapup(
     cancel: &AtomicBool,
 ) -> Result<Vec<WorkPlane>, Error> {
     loop_filter_frame(fs, seq, h, cancel)?;
-    let cdef = cdef_alloc(fs, seq, h, cancel)?;
+    // With CDEF off `CdefFrame` is `CurrFrame` itself (`cdef_on` reads `out` only for its
+    // strides and sizes, the same as `curr`'s), so no copy is made.
+    let cdef = if cdef_on(fs, &fs.curr_frame, seq, h, &fs.curr_frame) {
+        Some(cdef_alloc(fs, seq, h, cancel)?)
+    } else {
+        None
+    };
+    let cdef_ref = cdef.as_deref().unwrap_or(&fs.curr_frame);
     if h.frame_width == h.upscaled_width {
+        if !h.uses_lr {
+            // Nothing reads the planes after this: they are the output, cropped.
+            let planes = match cdef {
+                Some(c) => c,
+                None => {
+                    // Into a pooled list, so the next frame's `CurrFrame` list needs no allocation.
+                    let mut v = fs.ledger.planes(fs.curr_frame.len())?;
+                    v.append(&mut fs.curr_frame);
+                    v
+                }
+            };
+            return Ok(crop_planes(fs, planes));
+        }
         // No superres: `UpscaledCdefFrame` and `UpscaledCurrFrame` are `CdefFrame` and
         // `CurrFrame`, which loop restoration reads as they are.
-        let mut out = exact_planes(fs, Some(cdef.as_slice()))?;
-        if h.uses_lr {
-            lr_frame(fs, seq, h, &cdef, &fs.curr_frame, &mut out, cancel)?;
+        let mut out = exact_planes(fs, Some(cdef_ref))?;
+        lr_frame(fs, seq, h, cdef_ref, &fs.curr_frame, &mut out, cancel)?;
+        if let Some(c) = cdef {
+            fs.ledger.put_planes(c);
         }
-        fs.ledger.put_planes(cdef);
         return Ok(out);
     }
     let mut up_cdef = exact_planes(fs, None)?;
-    upscale(&cdef, fs, seq, h, &mut up_cdef, cancel)?;
-    fs.ledger.put_planes(cdef);
+    upscale(cdef_ref, fs, seq, h, &mut up_cdef, cancel)?;
+    if let Some(c) = cdef {
+        fs.ledger.put_planes(c);
+    }
     if !h.uses_lr {
         return Ok(up_cdef);
     }

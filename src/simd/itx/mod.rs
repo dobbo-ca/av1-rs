@@ -38,9 +38,6 @@ macro_rules! itx_kernels {
             SINPI_4_9, brev, cos128, sin128,
         };
 
-        /// The transform array `T`, one transform per lane.
-        type T = [V; 64];
-
         /// `L` lanes of `s` from `o`.
         #[inline]
         #[target_feature(enable = $feat)]
@@ -84,7 +81,13 @@ macro_rules! itx_kernels {
         /// Spec 7.13.2.1 butterfly `B( a, b, angle, flip )`.
         #[inline]
         #[target_feature(enable = $feat)]
-        fn bf<const HBD: bool>(t: &mut T, a: i32, b: i32, angle: i32, flip: bool) {
+        fn bf<const HBD: bool, const N: usize>(
+            t: &mut [V; N],
+            a: i32,
+            b: i32,
+            angle: i32,
+            flip: bool,
+        ) {
             let (a, b) = (a as usize, b as usize);
             let (c, s) = (cos128(angle), sin128(angle));
             let (ta, tb) = (t[a], t[b]);
@@ -102,7 +105,7 @@ macro_rules! itx_kernels {
         /// Spec 7.13.2.1 Hadamard rotation `H( a, b, flip, r )`.
         #[inline]
         #[target_feature(enable = $feat)]
-        fn hd(t: &mut T, a: i32, b: i32, flip: bool, r: u32) {
+        fn hd<const N: usize>(t: &mut [V; N], a: i32, b: i32, flip: bool, r: u32) {
             let (a, b) = if flip {
                 (b as usize, a as usize)
             } else {
@@ -118,7 +121,7 @@ macro_rules! itx_kernels {
         /// Spec 7.13.2.2 inverse DCT array permutation.
         #[inline]
         #[target_feature(enable = $feat)]
-        fn dct_permute(t: &mut T, n: u32) {
+        fn dct_permute<const N: usize>(t: &mut [V; N], n: u32) {
             let copy = *t;
             for i in 0..(1i32 << n) {
                 t[i as usize] = copy[brev(n, i) as usize];
@@ -128,7 +131,7 @@ macro_rules! itx_kernels {
         /// Spec 7.13.2.4 inverse ADST input array permutation, `n` is 3 or 4.
         #[inline]
         #[target_feature(enable = $feat)]
-        fn adst_in_permute(t: &mut T, n: u32) {
+        fn adst_in_permute<const N: usize>(t: &mut [V; N], n: u32) {
             let n0 = 1usize << n;
             let copy = *t;
             for i in 0..n0 {
@@ -140,7 +143,7 @@ macro_rules! itx_kernels {
         /// Spec 7.13.2.5 inverse ADST output array permutation, `n` is 3 or 4.
         #[inline]
         #[target_feature(enable = $feat)]
-        fn adst_out_permute(t: &mut T, n: u32) {
+        fn adst_out_permute<const N: usize>(t: &mut [V; N], n: u32) {
             let n0 = 1usize << n;
             let copy = *t;
             for i in 0..n0 {
@@ -161,7 +164,7 @@ macro_rules! itx_kernels {
         /// (the scalar code's `i64` steps expanded).
         #[inline]
         #[target_feature(enable = $feat)]
-        fn adst4<const HBD: bool>(t: &mut T) {
+        fn adst4<const HBD: bool, const N: usize>(t: &mut [V; N]) {
             let (s1, s2, s3, s4) = (
                 SINPI_1_9 as i32,
                 SINPI_2_9 as i32,
@@ -178,7 +181,7 @@ macro_rules! itx_kernels {
         /// Spec 7.13.2.11 to 7.13.2.15 inverse identity transform, `2 <= n <= 5`.
         #[inline]
         #[target_feature(enable = $feat)]
-        fn identity<const HBD: bool>(t: &mut T, n: u32) {
+        fn identity<const HBD: bool, const N: usize>(t: &mut [V; N], n: u32) {
             let len = 1usize << n;
             match n {
                 2 => {
@@ -209,16 +212,16 @@ macro_rules! itx_kernels {
         /// Spec 7.13.2.3 inverse DCT of length `1 << n`, `2 <= n <= 6`, with clamping range `r`.
         #[inline]
         #[target_feature(enable = $feat)]
-        fn dct<const HBD: bool>(t: &mut T, n: u32, r: u32) {
+        fn dct<const HBD: bool, const N: usize>(t: &mut [V; N], n: u32, r: u32) {
             dct_permute(t, n);
             if n == 6 {
                 for i in 0..16 {
-                    bf::<HBD>(t, 32 + i, 63 - i, 63 - 4 * brev(4, i), false);
+                    bf::<HBD, N>(t, 32 + i, 63 - i, 63 - 4 * brev(4, i), false);
                 }
             }
             if n >= 5 {
                 for i in 0..8 {
-                    bf::<HBD>(t, 16 + i, 31 - i, 6 + (brev(3, 7 - i) << 3), false);
+                    bf::<HBD, N>(t, 16 + i, 31 - i, 6 + (brev(3, 7 - i) << 3), false);
                 }
             }
             if n == 6 {
@@ -228,7 +231,7 @@ macro_rules! itx_kernels {
             }
             if n >= 4 {
                 for i in 0..4 {
-                    bf::<HBD>(t, 8 + i, 15 - i, 12 + (brev(2, 3 - i) << 4), false);
+                    bf::<HBD, N>(t, 8 + i, 15 - i, 12 + (brev(2, 3 - i) << 4), false);
                 }
             }
             if n >= 5 {
@@ -239,7 +242,7 @@ macro_rules! itx_kernels {
             if n == 6 {
                 for i in 0..4 {
                     for j in 0..2 {
-                        bf::<HBD>(
+                        bf::<HBD, N>(
                             t,
                             62 - i * 4 - j,
                             33 + i * 4 + j,
@@ -251,7 +254,7 @@ macro_rules! itx_kernels {
             }
             if n >= 3 {
                 for i in 0..2 {
-                    bf::<HBD>(t, 4 + i, 7 - i, 56 - 32 * i, false);
+                    bf::<HBD, N>(t, 4 + i, 7 - i, 56 - 32 * i, false);
                 }
             }
             if n >= 4 {
@@ -262,7 +265,7 @@ macro_rules! itx_kernels {
             if n >= 5 {
                 for i in 0..2 {
                     for j in 0..2 {
-                        bf::<HBD>(
+                        bf::<HBD, N>(
                             t,
                             30 - 4 * i - j,
                             17 + 4 * i + j,
@@ -280,7 +283,7 @@ macro_rules! itx_kernels {
                 }
             }
             for i in 0..2 {
-                bf::<HBD>(t, 2 * i, 2 * i + 1, 32 + 16 * i, i == 0);
+                bf::<HBD, N>(t, 2 * i, 2 * i + 1, 32 + 16 * i, i == 0);
             }
             if n >= 3 {
                 for i in 0..2 {
@@ -289,7 +292,7 @@ macro_rules! itx_kernels {
             }
             if n >= 4 {
                 for i in 0..2 {
-                    bf::<HBD>(t, 14 - i, 9 + i, 48 + 64 * i, true);
+                    bf::<HBD, N>(t, 14 - i, 9 + i, 48 + 64 * i, true);
                 }
             }
             if n >= 5 {
@@ -302,7 +305,7 @@ macro_rules! itx_kernels {
             if n == 6 {
                 for i in 0..2 {
                     for j in 0..4 {
-                        bf::<HBD>(
+                        bf::<HBD, N>(
                             t,
                             61 - i * 8 - j,
                             34 + i * 8 + j,
@@ -316,7 +319,7 @@ macro_rules! itx_kernels {
                 hd(t, i, 3 - i, false, r);
             }
             if n >= 3 {
-                bf::<HBD>(t, 6, 5, 32, true);
+                bf::<HBD, N>(t, 6, 5, 32, true);
             }
             if n >= 4 {
                 for i in 0..2 {
@@ -327,7 +330,7 @@ macro_rules! itx_kernels {
             }
             if n >= 5 {
                 for i in 0..4 {
-                    bf::<HBD>(t, 29 - i, 18 + i, 48 + (i >> 1) * 64, true);
+                    bf::<HBD, N>(t, 29 - i, 18 + i, 48 + (i >> 1) * 64, true);
                 }
             }
             if n == 6 {
@@ -344,7 +347,7 @@ macro_rules! itx_kernels {
             }
             if n >= 4 {
                 for i in 0..2 {
-                    bf::<HBD>(t, 13 - i, 10 + i, 32, true);
+                    bf::<HBD, N>(t, 13 - i, 10 + i, 32, true);
                 }
             }
             if n >= 5 {
@@ -356,7 +359,7 @@ macro_rules! itx_kernels {
             }
             if n == 6 {
                 for i in 0..8 {
-                    bf::<HBD>(t, 59 - i, 36 + i, if i < 4 { 48 } else { 112 }, true);
+                    bf::<HBD, N>(t, 59 - i, 36 + i, if i < 4 { 48 } else { 112 }, true);
                 }
             }
             if n >= 4 {
@@ -366,7 +369,7 @@ macro_rules! itx_kernels {
             }
             if n >= 5 {
                 for i in 0..4 {
-                    bf::<HBD>(t, 27 - i, 20 + i, 32, true);
+                    bf::<HBD, N>(t, 27 - i, 20 + i, 32, true);
                 }
             }
             if n == 6 {
@@ -382,7 +385,7 @@ macro_rules! itx_kernels {
             }
             if n == 6 {
                 for i in 0..8 {
-                    bf::<HBD>(t, 55 - i, 40 + i, 32, true);
+                    bf::<HBD, N>(t, 55 - i, 40 + i, 32, true);
                 }
                 for i in 0..32 {
                     hd(t, i, 63 - i, false, r);
@@ -393,16 +396,16 @@ macro_rules! itx_kernels {
         /// Spec 7.13.2.7 inverse ADST8.
         #[inline]
         #[target_feature(enable = $feat)]
-        fn adst8<const HBD: bool>(t: &mut T, r: u32) {
+        fn adst8<const HBD: bool, const N: usize>(t: &mut [V; N], r: u32) {
             adst_in_permute(t, 3);
             for i in 0..4 {
-                bf::<HBD>(t, 2 * i, 2 * i + 1, 60 - 16 * i, true);
+                bf::<HBD, N>(t, 2 * i, 2 * i + 1, 60 - 16 * i, true);
             }
             for i in 0..4 {
                 hd(t, i, 4 + i, false, r);
             }
             for i in 0..2 {
-                bf::<HBD>(t, 4 + 3 * i, 5 + i, 48 - 32 * i, true);
+                bf::<HBD, N>(t, 4 + 3 * i, 5 + i, 48 - 32 * i, true);
             }
             for i in 0..2 {
                 for j in 0..2 {
@@ -410,7 +413,7 @@ macro_rules! itx_kernels {
                 }
             }
             for i in 0..2 {
-                bf::<HBD>(t, 2 + 4 * i, 3 + 4 * i, 32, true);
+                bf::<HBD, N>(t, 2 + 4 * i, 3 + 4 * i, 32, true);
             }
             adst_out_permute(t, 3);
         }
@@ -418,17 +421,17 @@ macro_rules! itx_kernels {
         /// Spec 7.13.2.8 inverse ADST16.
         #[inline]
         #[target_feature(enable = $feat)]
-        fn adst16<const HBD: bool>(t: &mut T, r: u32) {
+        fn adst16<const HBD: bool, const N: usize>(t: &mut [V; N], r: u32) {
             adst_in_permute(t, 4);
             for i in 0..8 {
-                bf::<HBD>(t, 2 * i, 2 * i + 1, 62 - 8 * i, true);
+                bf::<HBD, N>(t, 2 * i, 2 * i + 1, 62 - 8 * i, true);
             }
             for i in 0..8 {
                 hd(t, i, 8 + i, false, r);
             }
             for i in 0..2 {
-                bf::<HBD>(t, 8 + 2 * i, 9 + 2 * i, 56 - 32 * i, true);
-                bf::<HBD>(t, 13 + 2 * i, 12 + 2 * i, 8 + 32 * i, true);
+                bf::<HBD, N>(t, 8 + 2 * i, 9 + 2 * i, 56 - 32 * i, true);
+                bf::<HBD, N>(t, 13 + 2 * i, 12 + 2 * i, 8 + 32 * i, true);
             }
             for i in 0..4 {
                 for j in 0..2 {
@@ -437,7 +440,7 @@ macro_rules! itx_kernels {
             }
             for i in 0..2 {
                 for j in 0..2 {
-                    bf::<HBD>(t, 4 + 8 * j + 3 * i, 5 + 8 * j + i, 48 - 32 * i, true);
+                    bf::<HBD, N>(t, 4 + 8 * j + 3 * i, 5 + 8 * j + i, 48 - 32 * i, true);
                 }
             }
             for i in 0..2 {
@@ -446,7 +449,7 @@ macro_rules! itx_kernels {
                 }
             }
             for i in 0..4 {
-                bf::<HBD>(t, 2 + 4 * i, 3 + 4 * i, 32, true);
+                bf::<HBD, N>(t, 2 + 4 * i, 3 + 4 * i, 32, true);
             }
             adst_out_permute(t, 4);
         }
@@ -454,16 +457,21 @@ macro_rules! itx_kernels {
         /// The 1D transform `kind` of length `1 << n` (the dispatch of 7.13.3).
         #[inline]
         #[target_feature(enable = $feat)]
-        fn transform_1d<const HBD: bool>(t: &mut T, kind: Kind, n: u32, r: u32) {
+        fn transform_1d<const HBD: bool, const N: usize>(
+            t: &mut [V; N],
+            kind: Kind,
+            n: u32,
+            r: u32,
+        ) {
             match kind {
-                Kind::Dct => dct::<HBD>(t, n, r),
+                Kind::Dct => dct::<HBD, N>(t, n, r),
                 Kind::Adst => match n {
-                    2 => adst4::<HBD>(t),
-                    3 => adst8::<HBD>(t, r),
-                    4 => adst16::<HBD>(t, r),
+                    2 => adst4::<HBD, N>(t),
+                    3 => adst8::<HBD, N>(t, r),
+                    4 => adst16::<HBD, N>(t, r),
                     _ => {}
                 },
-                Kind::Identity => identity::<HBD>(t, n),
+                Kind::Identity => identity::<HBD, N>(t, n),
             }
         }
 
@@ -494,16 +502,37 @@ macro_rules! itx_kernels {
             px: &mut [u16],
             stride: usize,
         ) {
+            let n = p.w().max(p.h());
             if p.bit_depth > 10 {
-                run::<true>(p, dq, mid, px, stride);
+                run_n::<true>(n, p, dq, mid, px, stride);
             } else {
-                run::<false>(p, dq, mid, px, stride);
+                run_n::<false>(n, p, dq, mid, px, stride);
+            }
+        }
+
+        /// `run` with the transform array sized to the longest side `n` (4 to 64), so a small
+        /// block does not zero a full 64-entry array.
+        #[inline]
+        #[target_feature(enable = $feat)]
+        fn run_n<const HBD: bool>(
+            n: usize,
+            p: &Plan,
+            dq: &[i32; DQ_LEN],
+            mid: &mut [i32; MID_LEN],
+            px: &mut [u16],
+            stride: usize,
+        ) {
+            match n {
+                0..=8 => run::<HBD, 8>(p, dq, mid, px, stride),
+                9..=16 => run::<HBD, 16>(p, dq, mid, px, stride),
+                17..=32 => run::<HBD, 32>(p, dq, mid, px, stride),
+                _ => run::<HBD, 64>(p, dq, mid, px, stride),
             }
         }
 
         #[inline]
         #[target_feature(enable = $feat)]
-        fn run<const HBD: bool>(
+        fn run<const HBD: bool, const N: usize>(
             p: &Plan,
             dq: &[i32; DQ_LEN],
             mid: &mut [i32; MID_LEN],
@@ -512,7 +541,7 @@ macro_rules! itx_kernels {
         ) {
             let (w, h) = (p.w(), p.h());
             let zero = vsplat(0);
-            let mut t: T = [zero; 64];
+            let mut t = [zero; N];
 
             // Row pass, lanes = rows r0..r0 + L. 32 is a multiple of L, so the loads stay in
             // the coded rows' 32-entry columns of `dq`; the lanes past `p.rows` are not stored.
@@ -533,7 +562,7 @@ macro_rules! itx_kernels {
                         *v = lin::<HBD, 1>([*v], [2896]);
                     }
                 }
-                transform_1d::<HBD>(&mut t, p.row_kind, p.log2_w, p.row_r());
+                transform_1d::<HBD, N>(&mut t, p.row_kind, p.log2_w, p.row_r());
                 let n = (p.rows - r0).min(L);
                 for k in 0..w {
                     let v = clamp(vsra(vadd(t[k], bias), p.row_shift), col_lo, col_hi);
@@ -565,7 +594,7 @@ macro_rules! itx_kernels {
                         zero
                     };
                 }
-                transform_1d::<HBD>(&mut t, p.col_kind, p.log2_h, p.col_r());
+                transform_1d::<HBD, N>(&mut t, p.col_kind, p.log2_h, p.col_r());
                 let n = (w - j0).min(L);
                 for i in 0..h {
                     let y = if p.flip_ud { h - i - 1 } else { i };

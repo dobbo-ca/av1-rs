@@ -15,7 +15,9 @@
 
 use super::{Simd, Tier};
 use crate::consts::{FILTER_BITS, SGRPROJ_MTABLE_BITS, SGRPROJ_PRJ_BITS, SGRPROJ_RECIP_BITS};
+use crate::error::Error;
 use crate::frame::View;
+use crate::ledger::{Buf, Ledger};
 use crate::lr::{BLOCK_W, SGR_PARAMS, self_guided_filter, wiener_coefficients, wiener_filter};
 
 #[cfg(target_arch = "x86_64")]
@@ -25,6 +27,40 @@ mod neon;
 
 /// Tallest block: one stripe.
 const BLOCK_H: usize = 64;
+
+/// The kernels' working arrays, shared by every block of a restoration call and not cleared
+/// between blocks: each kernel writes every entry it reads (the cross-tier test starts them
+/// full of garbage to prove it).
+pub(crate) struct Mem<'a> {
+    /// The two box filter outputs `F`, `BLOCK_H * BLOCK_W` each.
+    flt: Buf<'a, i32>,
+    /// `A` and `B` of a box filter pass, `(BLOCK_H + 2) * (BLOCK_W + 2)` each.
+    a: Buf<'a, i32>,
+    b: Buf<'a, i32>,
+    /// The horizontal Wiener pass, `(BLOCK_H + 6) * BLOCK_W`.
+    inter: Buf<'a, i32>,
+}
+
+impl<'a> Mem<'a> {
+    /// The arrays, charged to `ledger` while they live.
+    pub(crate) fn new(ledger: &'a Ledger) -> Result<Mem<'a>, Error> {
+        let ab = (BLOCK_H + 2) * (BLOCK_W + 2);
+        Ok(Mem {
+            flt: ledger.zeros(2 * BLOCK_H * BLOCK_W)?,
+            a: ledger.zeros(ab)?,
+            b: ledger.zeros(ab)?,
+            inter: ledger.zeros((BLOCK_H + 6) * BLOCK_W)?,
+        })
+    }
+
+    /// Fills every array with `v`.
+    #[cfg(any(test, feature = "fuzzing"))]
+    fn fill(&mut self, v: i32) {
+        for a in [&mut self.flt, &mut self.a, &mut self.b, &mut self.inter] {
+            a.fill(v);
+        }
+    }
+}
 
 /// The Wiener constants of a block (spec 7.17.4, 7.11.3.2), as the oracle derives them.
 struct WienerK {
@@ -168,6 +204,7 @@ pub(crate) fn wiener(
     dst: &mut View<'_>,
     x: usize,
     y: usize,
+    m: &mut Mem<'_>,
 ) {
     let stride = dst.stride;
     #[cfg(target_arch = "x86_64")]
@@ -178,7 +215,17 @@ pub(crate) fn wiener(
             // SAFETY: `simd` proves that this CPU has AVX2 (only `simd::available` and
             // `simd::best` make a `Simd`, after runtime detection; the Avx512 tier includes it).
             // `block_out` checked the sizes the kernel indexes with.
-            unsafe { avx2::wiener(win, w, h, &WienerK::new(bd, coef), out, stride) };
+            unsafe {
+                avx2::wiener(
+                    win,
+                    w,
+                    h,
+                    &WienerK::new(bd, coef),
+                    out,
+                    stride,
+                    &mut m.inter,
+                )
+            };
             return;
         }
     }
@@ -190,7 +237,17 @@ pub(crate) fn wiener(
             // SAFETY: `simd` proves that this CPU has NEON (only `simd::available` and
             // `simd::best` make a `Simd`, after runtime detection). `block_out` checked the
             // sizes the kernel indexes with.
-            unsafe { neon::wiener(win, w, h, &WienerK::new(bd, coef), out, stride) };
+            unsafe {
+                neon::wiener(
+                    win,
+                    w,
+                    h,
+                    &WienerK::new(bd, coef),
+                    out,
+                    stride,
+                    &mut m.inter,
+                )
+            };
             return;
         }
     }
@@ -211,6 +268,7 @@ pub(crate) fn self_guided(
     dst: &mut View<'_>,
     x: usize,
     y: usize,
+    m: &mut Mem<'_>,
 ) {
     let stride = dst.stride;
     #[cfg(target_arch = "x86_64")]
@@ -222,7 +280,7 @@ pub(crate) fn self_guided(
             // SAFETY: `simd` proves that this CPU has AVX2 (only `simd::available` and
             // `simd::best` make a `Simd`, after runtime detection; the Avx512 tier includes it).
             // `block_out` checked the sizes the kernel indexes with.
-            unsafe { avx2::self_guided(win, w, h, &k, out, stride) };
+            unsafe { avx2::self_guided(win, w, h, &k, out, stride, m) };
             return;
         }
     }
@@ -235,7 +293,7 @@ pub(crate) fn self_guided(
             // SAFETY: `simd` proves that this CPU has NEON (only `simd::available` and
             // `simd::best` make a `Simd`, after runtime detection). `block_out` checked the
             // sizes the kernel indexes with.
-            unsafe { neon::self_guided(win, w, h, &k, out, stride) };
+            unsafe { neon::self_guided(win, w, h, &k, out, stride, m) };
             return;
         }
     }
@@ -268,13 +326,30 @@ pub(crate) fn cross_check(
     else {
         return;
     };
+    let Ok(mut m) = Mem::new(&ledger) else {
+        return;
+    };
     for sgr in [false, true] {
-        let run = |simd: Simd, p: &mut Plane| {
+        let mut run = |simd: Simd, p: &mut Plane| {
             p.px.fill(0x5555);
+            // Garbage: every entry a kernel reads must be written first.
+            m.fill(0x2a5a_a5a5);
             if sgr {
-                self_guided(simd, win, w, h, bd, set, xqd, &mut View::of(p), x, 0);
+                self_guided(
+                    simd,
+                    win,
+                    w,
+                    h,
+                    bd,
+                    set,
+                    xqd,
+                    &mut View::of(p),
+                    x,
+                    0,
+                    &mut m,
+                );
             } else {
-                wiener(simd, win, w, h, bd, coef, &mut View::of(p), x, 0);
+                wiener(simd, win, w, h, bd, coef, &mut View::of(p), x, 0, &mut m);
             }
         };
         run(Simd::scalar(), &mut want);

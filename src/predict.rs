@@ -714,6 +714,7 @@ pub(crate) fn predict_cfl(
     max_luma_h: usize,
     alpha: i32,
     bit_depth: u32,
+    ac: &mut [i32; 1024],
 ) {
     ipred::cfl(
         crate::simd::best(),
@@ -731,6 +732,7 @@ pub(crate) fn predict_cfl(
         max_luma_h,
         alpha,
         bit_depth,
+        ac,
     );
 }
 
@@ -994,7 +996,23 @@ mod tests {
     fn cfl_with_zero_alpha_keeps_dc() {
         let luma: Vec<u16> = (0..64).map(|v| v * 3).collect();
         let mut chroma = vec![50u16; 16];
-        predict_cfl(&mut chroma, 4, &luma, 8, 0, 0, 4, 4, true, true, 8, 8, 0, 8);
+        predict_cfl(
+            &mut chroma,
+            4,
+            &luma,
+            8,
+            0,
+            0,
+            4,
+            4,
+            true,
+            true,
+            8,
+            8,
+            0,
+            8,
+            &mut [7; 1024],
+        );
         assert!(chroma.iter().all(|&c| c == 50));
     }
 
@@ -1022,6 +1040,7 @@ mod tests {
             4,
             4,
             8,
+            &mut [7; 1024],
         );
         assert_eq!(&chroma[..4], &[103, 153, 103, 153]);
     }

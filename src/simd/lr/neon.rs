@@ -2,7 +2,7 @@
 //! 32-bit lanes. The same steps as `avx2.rs`. No `unsafe`: memory goes through `simd::arm` and
 //! safe slices.
 
-use super::{BLOCK_H, BoxK, SgrK, WienerK, starts};
+use super::{BLOCK_H, BoxK, Mem, SgrK, WienerK, starts};
 use crate::consts::{
     SGRPROJ_MTABLE_BITS, SGRPROJ_PRJ_BITS, SGRPROJ_RECIP_BITS, SGRPROJ_RST_BITS, SGRPROJ_SGR_BITS,
 };
@@ -74,7 +74,15 @@ fn taps7(s: &[i32], i: usize, step: usize, f: &[int32x4_t; 4]) -> int32x4_t {
 /// The Wiener filter of a `w` x `h` block (`4 <= w <= BLOCK_W`, `h <= BLOCK_H`) from its window
 /// `win` (`w + 6` wide) into `out` (row `r` at `r * stride`).
 #[target_feature(enable = "neon")]
-pub(super) fn wiener(win: &[i32], w: usize, h: usize, k: &WienerK, out: &mut [u16], stride: usize) {
+pub(super) fn wiener(
+    win: &[i32],
+    w: usize,
+    h: usize,
+    k: &WienerK,
+    out: &mut [u16],
+    stride: usize,
+    inter: &mut [i32],
+) {
     let ww = w + 6;
     let mut hf = [vdupq_n_s32(0); 4];
     let mut vf = hf;
@@ -86,16 +94,15 @@ pub(super) fn wiener(win: &[i32], w: usize, h: usize, k: &WienerK, out: &mut [u1
     let (lo, hi) = (vdupq_n_s32(k.lo), vdupq_n_s32(k.hi));
     let (zero, max) = (vdupq_n_s32(0), vdupq_n_s32(k.max));
     // The horizontal pass of window rows 0..h + 6, `BLOCK_W` values per row.
-    let mut inter = [0i32; (BLOCK_H + 6) * BLOCK_W];
     for r in 0..h + 6 {
         for c in starts(w, L) {
             let v = round(taps7(win, r * ww + c, 1, &hf), r0);
-            st(&mut inter, r * BLOCK_W + c, clip(v, lo, hi));
+            st(inter, r * BLOCK_W + c, clip(v, lo, hi));
         }
     }
     for r in 0..h {
         for c in starts(w, L) {
-            let v = round(taps7(&inter, r * BLOCK_W + c, BLOCK_W, &vf), r1);
+            let v = round(taps7(inter, r * BLOCK_W + c, BLOCK_W, &vf), r1);
             st_px(out, r * stride + c, clip(v, zero, max));
         }
     }
@@ -130,10 +137,16 @@ fn weigh(s: &[i32], o: usize, i: usize, pass0: bool) -> int32x4_t {
 
 /// One box filter pass (spec 7.17.3) of a `w` x `h` block: `F` into `f`, `BLOCK_W` per row.
 #[target_feature(enable = "neon")]
-fn box_pass(win: &[i32], w: usize, h: usize, p: &BoxK, f: &mut [i32]) {
+fn box_pass(
+    win: &[i32],
+    w: usize,
+    h: usize,
+    p: &BoxK,
+    f: &mut [i32],
+    a_arr: &mut [i32],
+    b_arr: &mut [i32],
+) {
     let (ww, r) = (w + 6, p.r);
-    let mut a_arr = [0i32; (BLOCK_H + 2) * AS];
-    let mut b_arr = [0i32; (BLOCK_H + 2) * AS];
     // Column sums and sums of squares of the current box rows.
     let mut sum = [0i32; BLOCK_W + 6];
     let mut sq = [0i32; BLOCK_W + 6];
@@ -184,9 +197,9 @@ fn box_pass(win: &[i32], w: usize, h: usize, p: &BoxK, f: &mut [i32]) {
             // (256 - a2) * oneOverN * b is below 2^32: wrapping multiplies, logical shift.
             let m = vmulq_s32(vsubq_s32(c256, a2), one_over_n);
             let b2 = vreinterpretq_u32_s32(vaddq_s32(vmulq_s32(m, b), rnd_b));
-            st(&mut a_arr, i * AS + j, a2);
+            st(a_arr, i * AS + j, a2);
             st(
-                &mut b_arr,
+                b_arr,
                 i * AS + j,
                 vreinterpretq_s32_u32(vshrq_n_u32::<{ SGRPROJ_RECIP_BITS as i32 }>(b2)),
             );
@@ -199,8 +212,8 @@ fn box_pass(win: &[i32], w: usize, h: usize, p: &BoxK, f: &mut [i32]) {
         let rr = if p.pass0 && i & 1 == 1 { r4 } else { r5 };
         for j in starts(w, L) {
             let o = i * AS + j;
-            let a = weigh(&a_arr, o, i, p.pass0);
-            let b = weigh(&b_arr, o, i, p.pass0);
+            let a = weigh(a_arr, o, i, p.pass0);
+            let b = weigh(b_arr, o, i, p.pass0);
             let v = vaddq_s32(vmulq_s32(a, ld(win, (i + 3) * ww + j + 3)), b);
             st(f, i * BLOCK_W + j, round(v, rr));
         }
@@ -217,15 +230,15 @@ pub(super) fn self_guided(
     k: &SgrK,
     out: &mut [u16],
     stride: usize,
+    m: &mut Mem<'_>,
 ) {
     let ww = w + 6;
-    let mut flt = [[0i32; BLOCK_H * BLOCK_W]; 2];
-    let [f0, f1] = &mut flt;
+    let (f0, f1) = m.flt.split_at_mut(BLOCK_H * BLOCK_W);
     if let Some(p) = &k.pass[0] {
-        box_pass(win, w, h, p, f0);
+        box_pass(win, w, h, p, f0, &mut m.a, &mut m.b);
     }
     if let Some(p) = &k.pass[1] {
-        box_pass(win, w, h, p, f1);
+        box_pass(win, w, h, p, f1, &mut m.a, &mut m.b);
     }
     let (w0, w1, w2) = (vdupq_n_s32(k.w0), vdupq_n_s32(k.w1), vdupq_n_s32(k.w2));
     let rnd = vdupq_n_s32(1 << (SGRPROJ_RST_BITS + SGRPROJ_PRJ_BITS - 1));
@@ -234,16 +247,8 @@ pub(super) fn self_guided(
         for j in starts(w, L) {
             let u = vshlq_n_s32::<{ SGRPROJ_RST_BITS as i32 }>(ld(win, (i + 3) * ww + j + 3));
             let o = i * BLOCK_W + j;
-            let x0 = if k.pass[0].is_some() {
-                ld(&flt[0], o)
-            } else {
-                u
-            };
-            let x1 = if k.pass[1].is_some() {
-                ld(&flt[1], o)
-            } else {
-                u
-            };
+            let x0 = if k.pass[0].is_some() { ld(f0, o) } else { u };
+            let x1 = if k.pass[1].is_some() { ld(f1, o) } else { u };
             let v = vaddq_s32(
                 vaddq_s32(vmulq_s32(w1, u), vmulq_s32(w0, x0)),
                 vmulq_s32(w2, x1),

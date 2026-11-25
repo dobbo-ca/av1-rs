@@ -1,7 +1,7 @@
 //! AVX2 loop restoration kernels (see `super` for the arithmetic): 8 samples per vector, in
 //! 32-bit lanes. No `unsafe`: memory goes through `simd::x86` and safe slices.
 
-use super::{BLOCK_H, BoxK, SgrK, WienerK, starts};
+use super::{BLOCK_H, BoxK, Mem, SgrK, WienerK, starts};
 use crate::consts::{
     SGRPROJ_MTABLE_BITS, SGRPROJ_PRJ_BITS, SGRPROJ_RECIP_BITS, SGRPROJ_RST_BITS, SGRPROJ_SGR_BITS,
 };
@@ -74,7 +74,15 @@ fn taps7(s: &[i32], i: usize, step: usize, f: &[__m256i; 4]) -> __m256i {
 /// The Wiener filter of a `w` x `h` block (`8 <= w <= BLOCK_W`, `h <= BLOCK_H`) from its window
 /// `win` (`w + 6` wide) into `out` (row `r` at `r * stride`).
 #[target_feature(enable = "avx2")]
-pub(super) fn wiener(win: &[i32], w: usize, h: usize, k: &WienerK, out: &mut [u16], stride: usize) {
+pub(super) fn wiener(
+    win: &[i32],
+    w: usize,
+    h: usize,
+    k: &WienerK,
+    out: &mut [u16],
+    stride: usize,
+    inter: &mut [i32],
+) {
     let ww = w + 6;
     let mut hf = [_mm256_setzero_si256(); 4];
     let mut vf = hf;
@@ -86,16 +94,15 @@ pub(super) fn wiener(win: &[i32], w: usize, h: usize, k: &WienerK, out: &mut [u1
     let (lo, hi) = (_mm256_set1_epi32(k.lo), _mm256_set1_epi32(k.hi));
     let (zero, max) = (_mm256_setzero_si256(), _mm256_set1_epi32(k.max));
     // The horizontal pass of window rows 0..h + 6, `BLOCK_W` values per row.
-    let mut inter = [0i32; (BLOCK_H + 6) * BLOCK_W];
     for r in 0..h + 6 {
         for c in starts(w, L) {
             let v = round(taps7(win, r * ww + c, 1, &hf), r0);
-            st(&mut inter, r * BLOCK_W + c, clip(v, lo, hi));
+            st(inter, r * BLOCK_W + c, clip(v, lo, hi));
         }
     }
     for r in 0..h {
         for c in starts(w, L) {
-            let v = round(taps7(&inter, r * BLOCK_W + c, BLOCK_W, &vf), r1);
+            let v = round(taps7(inter, r * BLOCK_W + c, BLOCK_W, &vf), r1);
             st_px(out, r * stride + c, clip(v, zero, max));
         }
     }
@@ -133,10 +140,16 @@ fn weigh(s: &[i32], o: usize, i: usize, pass0: bool) -> __m256i {
 
 /// One box filter pass (spec 7.17.3) of a `w` x `h` block: `F` into `f`, `BLOCK_W` per row.
 #[target_feature(enable = "avx2")]
-fn box_pass(win: &[i32], w: usize, h: usize, p: &BoxK, f: &mut [i32]) {
+fn box_pass(
+    win: &[i32],
+    w: usize,
+    h: usize,
+    p: &BoxK,
+    f: &mut [i32],
+    a_arr: &mut [i32],
+    b_arr: &mut [i32],
+) {
     let (ww, r) = (w + 6, p.r);
-    let mut a_arr = [0i32; (BLOCK_H + 2) * AS];
-    let mut b_arr = [0i32; (BLOCK_H + 2) * AS];
     // Column sums and sums of squares of the current box rows.
     let mut sum = [0i32; BLOCK_W + 6];
     let mut sq = [0i32; BLOCK_W + 6];
@@ -195,9 +208,9 @@ fn box_pass(win: &[i32], w: usize, h: usize, p: &BoxK, f: &mut [i32]) {
             // (256 - a2) * oneOverN * b is below 2^32: wrapping multiplies, logical shift.
             let m = _mm256_mullo_epi32(_mm256_sub_epi32(c256, a2), one_over_n);
             let b2 = _mm256_add_epi32(_mm256_mullo_epi32(m, b), rnd_b);
-            st(&mut a_arr, i * AS + j, a2);
+            st(a_arr, i * AS + j, a2);
             st(
-                &mut b_arr,
+                b_arr,
                 i * AS + j,
                 _mm256_srli_epi32::<{ SGRPROJ_RECIP_BITS as i32 }>(b2),
             );
@@ -210,8 +223,8 @@ fn box_pass(win: &[i32], w: usize, h: usize, p: &BoxK, f: &mut [i32]) {
         let rr = if p.pass0 && i & 1 == 1 { r4 } else { r5 };
         for j in starts(w, L) {
             let o = i * AS + j;
-            let a = weigh(&a_arr, o, i, p.pass0);
-            let b = weigh(&b_arr, o, i, p.pass0);
+            let a = weigh(a_arr, o, i, p.pass0);
+            let b = weigh(b_arr, o, i, p.pass0);
             let v = _mm256_add_epi32(_mm256_mullo_epi32(a, ld(win, (i + 3) * ww + j + 3)), b);
             st(f, i * BLOCK_W + j, round(v, rr));
         }
@@ -228,15 +241,15 @@ pub(super) fn self_guided(
     k: &SgrK,
     out: &mut [u16],
     stride: usize,
+    m: &mut Mem<'_>,
 ) {
     let ww = w + 6;
-    let mut flt = [[0i32; BLOCK_H * BLOCK_W]; 2];
-    let [f0, f1] = &mut flt;
+    let (f0, f1) = m.flt.split_at_mut(BLOCK_H * BLOCK_W);
     if let Some(p) = &k.pass[0] {
-        box_pass(win, w, h, p, f0);
+        box_pass(win, w, h, p, f0, &mut m.a, &mut m.b);
     }
     if let Some(p) = &k.pass[1] {
-        box_pass(win, w, h, p, f1);
+        box_pass(win, w, h, p, f1, &mut m.a, &mut m.b);
     }
     let (w0, w1, w2) = (
         _mm256_set1_epi32(k.w0),
@@ -249,16 +262,8 @@ pub(super) fn self_guided(
         for j in starts(w, L) {
             let u = _mm256_slli_epi32::<{ SGRPROJ_RST_BITS as i32 }>(ld(win, (i + 3) * ww + j + 3));
             let o = i * BLOCK_W + j;
-            let x0 = if k.pass[0].is_some() {
-                ld(&flt[0], o)
-            } else {
-                u
-            };
-            let x1 = if k.pass[1].is_some() {
-                ld(&flt[1], o)
-            } else {
-                u
-            };
+            let x0 = if k.pass[0].is_some() { ld(f0, o) } else { u };
+            let x1 = if k.pass[1].is_some() { ld(f1, o) } else { u };
             let v = _mm256_add_epi32(
                 _mm256_add_epi32(_mm256_mullo_epi32(w1, u), _mm256_mullo_epi32(w0, x0)),
                 _mm256_mullo_epi32(w2, x1),

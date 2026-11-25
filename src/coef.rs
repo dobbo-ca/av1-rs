@@ -787,6 +787,7 @@ impl TileDecoder<'_> {
                     s.max_luma_h,
                     alpha,
                     bit_depth,
+                    &mut self.itx.ac,
                 );
             }
         }
