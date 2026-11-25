@@ -36,7 +36,10 @@ planes, which may be pooled buffers larger than the samples, plus a fixed per-fr
 the `Frame`, its plane list and allocator chunks) until it returns. AVIF: one
 ledger per `decode_avif` call covers every item decoder, the grid canvas, the item copy and the
 primary image (docs/threading.md); it gets three quarters of `max_alloc`, and the `isobmff`
-parse and item reads an eighth each.
+parse and item reads an eighth each, so the three sum to `max_alloc`, not twice it
+(`tests/avif_alloc.rs` counts the heap of every thread for a plain item, an item with alpha and a
+2x2 grid at several `max_alloc` and `max_threads` values, and checks the peak against `max_alloc`
+plus the uncharged fixed buffers of each decoder).
 
 Not charged, because their size does not depend on the input: the loop restoration source window
 (70 x 70 `i32` on the stack, reused for every block), the stack buffers
