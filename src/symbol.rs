@@ -135,6 +135,33 @@ impl<'a> SymbolDecoder<'a> {
         symbol
     }
 
+    /// [`SymbolDecoder::read_symbol`] for a CDF whose length is known at compile time (`L` = N + 1
+    /// entries: the N values, then the counter), for the coefficient CDFs. The search runs over
+    /// the array, so it has no bounds checks and `EC_MIN_PROB * (N - 1 - i)` is a constant. N = 2
+    /// is dav1d's `decode_bool_adapt` (the last `cur` is 0 as the last value is 32768); N <= 4
+    /// adapts inline and branchlessly on every tier; larger rows use the tier's kernel.
+    ///
+    /// The last value of `cdf` must be 32768 (the spec's form, which every CDF of the decoder
+    /// has): any other gives some symbol below N and no panic, but not the spec's.
+    #[inline(always)]
+    pub(crate) fn read_cdf<const L: usize>(&mut self, cdf: &mut [u16; L]) -> usize {
+        const { assert!(L >= 3) };
+        let c = (self.dif >> 48) as u32;
+        let (symbol, prev, v) = search_const(cdf, c, self.rng);
+        if !self.disable_cdf_update {
+            if L <= 5 {
+                adapt_const(cdf, symbol);
+            } else {
+                simd::entropy::adapt_cdf(self.simd, cdf, symbol);
+            }
+        }
+        self.norm(
+            self.dif.wrapping_sub(u64::from(v) << 48),
+            prev.wrapping_sub(v) & 0xffff,
+        );
+        symbol
+    }
+
     /// Spec 8.2.3 `read_bool( )`: a symbol with the fixed cdf { 1 << 14, 1 << 15, 0 }, whose
     /// `cur` for symbol 0 is `((SymbolRange >> 8) << 7) + EC_MIN_PROB` (dav1d's
     /// `decode_bool_equi`). No update: the spec rebuilds this cdf on every call.
@@ -254,6 +281,39 @@ pub(crate) fn search(cdf: &[u16], c: u32, rng: u32) -> (usize, u32, u32) {
         prev = v;
     }
     (0, rng, 0)
+}
+
+/// [`search`] for a row of `L` = N + 1 entries known at compile time, whose last value is 32768
+/// (so the `cur` of symbol N - 1 is 0, and N = 2 needs only the first `cur`).
+#[inline(always)]
+fn search_const<const L: usize>(cdf: &[u16; L], c: u32, rng: u32) -> (usize, u32, u32) {
+    let n = L - 1;
+    let r = rng >> 8;
+    let mut prev = rng;
+    for i in 0..n - 1 {
+        let v = cur(r, cdf[i], n, i);
+        if c >= v {
+            return (i, prev, v);
+        }
+        prev = v;
+    }
+    (n - 1, prev, 0)
+}
+
+/// [`adapt_cdf`] for a row of `L` = N + 1 entries known at compile time: a loop the compiler
+/// unrolls, with a select instead of a branch for each value.
+#[inline(always)]
+fn adapt_const<const L: usize>(cdf: &mut [u16; L], symbol: usize) {
+    let n = L - 1;
+    let count = cdf[n];
+    let rate = adapt_rate(count, n);
+    for i in 0..n - 1 {
+        let c = cdf[i];
+        let down = c - (c >> rate);
+        let up = c.wrapping_add(32768u16.wrapping_sub(c) >> rate);
+        cdf[i] = if i >= symbol { up } else { down };
+    }
+    cdf[n] = count + u16::from(count < 32);
 }
 
 /// The adaptation rate of spec 8.2.6 for a CDF of `n` symbols whose counter is `count`.
@@ -484,6 +544,34 @@ pub(crate) fn random_cdf(rng: &mut XorShift) -> Vec<u16> {
     cdf
 }
 
+/// [`random_cdf`] with `L` - 1 symbols.
+#[cfg(any(test, feature = "fuzzing"))]
+fn random_array<const L: usize>(rng: &mut XorShift) -> [u16; L] {
+    let mut cdf = [0u16; L];
+    for c in &mut cdf[..L - 2] {
+        *c = match rng.next_u32() % 8 {
+            0 => 0,
+            1 => 32768,
+            _ => (rng.next_u32() % 32769) as u16,
+        };
+    }
+    cdf[..L - 2].sort_unstable();
+    cdf[L - 2] = 32768;
+    cdf[L - 1] = (rng.next_u32() % 33) as u16;
+    cdf
+}
+
+/// One [`SymbolDecoder::read_cdf`] of `L` - 1 symbols against the oracle's `read_symbol`.
+#[cfg(any(test, feature = "fuzzing"))]
+fn read_cdf_pair<const L: usize>(
+    a: &mut SymbolDecoder<'_>,
+    b: &mut oracle::SymbolDecoder<'_>,
+    cdf: &mut [u16; L],
+    old: &mut [u16; L],
+) {
+    assert_eq!(a.read_cdf(cdf), b.read_symbol(old));
+}
+
 /// Runs `ops` random reads (`seed` picks them and the CDFs) on `data` with [`SymbolDecoder`]
 /// at tier `simd` and with [`oracle::SymbolDecoder`], and asserts that every result, every
 /// state, the adapted CDFs and the exit result agree.
@@ -509,13 +597,29 @@ pub(crate) fn check_against_oracle(
     let mut rng = XorShift(seed);
     let mut cdfs: Vec<Vec<u16>> = (0..8).map(|_| random_cdf(&mut rng)).collect();
     let mut old_cdfs = cdfs.clone();
+    // Rows of 2, 3, 4, 5 (inline adaptation), 6, 9 and 16 symbols for `read_cdf`.
+    let mut f3 = random_array::<3>(&mut rng);
+    let mut f4 = random_array::<4>(&mut rng);
+    let mut f5 = random_array::<5>(&mut rng);
+    let mut f6 = random_array::<6>(&mut rng);
+    let mut f10 = random_array::<10>(&mut rng);
+    let mut f17 = random_array::<17>(&mut rng);
+    let (mut o3, mut o4, mut o5, mut o6, mut o10, mut o17) = (f3, f4, f5, f6, f10, f17);
     for _ in 0..ops {
         let r = rng.next_u32();
         let arg = r >> 8;
-        match r % 8 {
+        match r % 12 {
             0 => assert_eq!(a.read_bool(), b.read_bool()),
             1 => assert_eq!(a.read_literal(arg % 33), b.read_literal(arg % 33)),
             2 => assert_eq!(a.read_ns(arg % 300), b.read_ns(arg % 300)),
+            8..=11 => match arg % 6 {
+                0 => read_cdf_pair(&mut a, &mut b, &mut f3, &mut o3),
+                1 => read_cdf_pair(&mut a, &mut b, &mut f4, &mut o4),
+                2 => read_cdf_pair(&mut a, &mut b, &mut f5, &mut o5),
+                3 => read_cdf_pair(&mut a, &mut b, &mut f6, &mut o6),
+                4 => read_cdf_pair(&mut a, &mut b, &mut f10, &mut o10),
+                _ => read_cdf_pair(&mut a, &mut b, &mut f17, &mut o17),
+            },
             _ => {
                 let i = arg as usize % cdfs.len();
                 assert_eq!(a.read_symbol(&mut cdfs[i]), b.read_symbol(&mut old_cdfs[i]));
@@ -524,6 +628,8 @@ pub(crate) fn check_against_oracle(
         assert_eq!(a.state(), b.state());
     }
     assert_eq!(cdfs, old_cdfs);
+    assert_eq!((f3, f4, f5), (o3, o4, o5));
+    assert_eq!((f6, f10, f17), (o6, o10, o17));
     assert_eq!(a.exit(), b.exit());
 }
 

@@ -424,9 +424,9 @@ fn read_levels<const CLASS: usize>(
 ) -> usize {
     // The brs of a level above NUM_BASE_LEVELS, from the neighbour sum `s3`.
     let mut read_br = |sd: &mut SymbolDecoder<'_>, s3, row, col, mut level: usize| {
-        let br_cdf: &mut [u16] = &mut br_cdfs[lc.br_ctx::<CLASS>(s3, row, col)];
+        let br_cdf = &mut br_cdfs[lc.br_ctx::<CLASS>(s3, row, col)];
         for _ in 0..COEFF_BASE_RANGE / (BR_CDF_SIZE - 1) {
-            let coeff_br = sd.read_symbol(br_cdf);
+            let coeff_br = sd.read_cdf(br_cdf);
             level += coeff_br;
             if coeff_br < BR_CDF_SIZE - 1 {
                 break;
@@ -440,7 +440,7 @@ fn read_levels<const CLASS: usize>(
         let pos = usize::from(scan[last]);
         let row = pos >> lc.bwl;
         let col = pos - (row << lc.bwl);
-        let mut level = sd.read_symbol(&mut eob_cdf[..]) + 1;
+        let mut level = sd.read_cdf(eob_cdf) + 1;
         if level > NUM_BASE_LEVELS {
             level = read_br(&mut *sd, lc.neighbours(levels, row, col).1, row, col, level);
         }
@@ -453,7 +453,7 @@ fn read_levels<const CLASS: usize>(
         let row = pos >> lc.bwl;
         let col = pos - (row << lc.bwl);
         let (s5, s3) = lc.neighbours(levels, row, col);
-        let mut level = sd.read_symbol(&mut base_cdfs[lc.base_ctx::<CLASS>(s5, row, col)]);
+        let mut level = sd.read_cdf(&mut base_cdfs[lc.base_ctx::<CLASS>(s5, row, col)]);
         if level > NUM_BASE_LEVELS {
             level = read_br(&mut *sd, s3, row, col, level);
         }
@@ -471,7 +471,7 @@ fn read_levels<const CLASS: usize>(
         } else {
             lc.base_ctx::<CLASS>(s5, 0, 0)
         };
-        let mut level = sd.read_symbol(&mut base_cdfs[ctx]);
+        let mut level = sd.read_cdf(&mut base_cdfs[ctx]);
         if level > NUM_BASE_LEVELS {
             level = read_br(&mut *sd, s3, 0, 0, level);
         }
@@ -1171,10 +1171,7 @@ impl TileDecoder<'_> {
         let (mut rows, mut cols) = (1, 1);
 
         let ctx = self.all_zero_ctx(plane, x4, y4, tx_sz);
-        let all_zero = self
-            .sd
-            .read_symbol(&mut self.cdf.txb_skip_cdf[tx_sz_ctx][ctx])
-            != 0;
+        let all_zero = self.sd.read_cdf(&mut self.cdf.txb_skip_cdf[tx_sz_ctx][ctx]) != 0;
         if all_zero {
             if plane == 0 && self.is_inter {
                 self.set_tx_types(x4, y4, tx_sz, DCT_DCT);
@@ -1216,7 +1213,7 @@ impl TileDecoder<'_> {
             if eob_pt >= 3 {
                 let eob_extra = self
                     .sd
-                    .read_symbol(&mut self.cdf.eob_extra_cdf[tx_sz_ctx][ptype][eob_pt - 3])
+                    .read_cdf(&mut self.cdf.eob_extra_cdf[tx_sz_ctx][ptype][eob_pt - 3])
                     != 0;
                 if eob_extra {
                     eob += 1 << (eob_pt - 3);
@@ -1264,9 +1261,7 @@ impl TileDecoder<'_> {
                 let row = pos >> lc.bwl;
                 levels[pos + row * TX_PAD] = 0;
                 let sign = if pos == 0 {
-                    self.sd
-                        .read_symbol(&mut self.cdf.dc_sign_cdf[ptype][dc_ctx])
-                        != 0
+                    self.sd.read_cdf(&mut self.cdf.dc_sign_cdf[ptype][dc_ctx]) != 0
                 } else {
                     self.sd.read_bool()
                 };
