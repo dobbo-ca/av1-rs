@@ -96,14 +96,16 @@ chromacmp() {
 
 # chrompos <ours.yuv> <libheif.yuv> <w> <h> <bytes per sample> <ours layout> <libheif layout> <bit depth> <rgb>:
 # av1-rs's chroma against libheif's by position, in the output geometry (rotation, mirror and crop
-# are already applied to both, so they need no mapping). Each av1-rs chroma sample covers the luma
-# positions of its cell (2x2 for 4:2:0, 2x1 for 4:2:2, one for 4:4:4); libheif's samples are mapped to
-# luma positions the same way. It passes when the sample is equal to every libheif sample of its
-# cell ("exact"), or within CHROMA_CAP (scaled to the bit depth) of the range of them: libheif's
-# bilinear 4:2:0 to 4:4:4 step puts blends of the neighbouring samples there, and a crop or mirror
-# of an odd side moves av1-rs's chroma by one luma sample. With <rgb> = rgb (libheif went through
-# RGB) the sample rescaled from studio to full range, round((v - 128) * 255 / 224 + 128), may be
-# used instead. Prints exact, or cap and the largest distance; status 1 above the cap.
+# are already applied to both, so they need no mapping). A chroma sample sits at the luma positions
+# of its cell (2x2 for 4:2:0, 2x1 for 4:2:2, one for 4:4:4). Every libheif sample, at its luma
+# position, must lie within CHROMA_CAP (scaled to the bit depth) of the range of the av1-rs samples
+# whose cells touch the 5x5 luma window around it: libheif's bilinear 4:2:0 and 4:2:2 to 4:4:4 step
+# (and, for 4:2:2 rotated by 90 or 270, the interpolation of the sample copied into two columns by
+# av1-rs) is a blend of neighbouring samples, and an odd crop or mirror moves av1-rs's chroma by one
+# luma sample. With <rgb> = rgb (libheif went through RGB) the av1-rs samples rescaled from studio
+# to full range, round((v - 128) * 255 / 224 + 128), may be used instead. Prints exact (every
+# libheif sample equals the av1-rs sample of its cell) or cap and the largest distance; status 1
+# above the cap.
 chrompos() {
   case $6 in 420) sx=2 sy=2 ;; 422) sx=2 sy=1 ;; *) sx=1 sy=1 ;; esac
   case $7 in 420) lsx=2 lsy=2 ;; 422) lsx=2 lsy=1 ;; *) lsx=1 lsy=1 ;; esac
@@ -111,22 +113,21 @@ chrompos() {
   lcw=$((($3 + lsx - 1) / lsx)) lch=$((($4 + lsy - 1) / lsy))
   tail -c +$(($3 * $4 * $5 + 1)) $1 | od -An -v -tu$5 -w$5 > $W/cp.a
   tail -c +$(($3 * $4 * $5 + 1)) $2 | od -An -v -tu$5 -w$5 > $W/cp.b
-  awk -v cw=$cw -v ch=$ch -v sx=$sx -v sy=$sy -v lcw=$lcw -v lch=$lch -v lsx=$lsx -v lsy=$lsy \
+  awk -v w=$3 -v h=$4 -v cw=$cw -v ch=$ch -v sx=$sx -v sy=$sy -v lcw=$lcw -v lch=$lch -v lsx=$lsx -v lsy=$lsy \
     -v cap=$((CHROMA_CAP << ($8 - 8))) -v rgb="$9" '
+    function rs(v,  t) { t = (v - 128) * 255 / 224 + 128.5; return t < 0 ? 0 : int(t) }
     NR == FNR { o[NR - 1] = $1; next }
-    { i = FNR - 1; n = lcw * lch; p = int(i / n); r = i - p * n; y = int(r / lcw); x = r - y * lcw
-      c = p * cw * ch + int(y * lsy / sy) * cw + int(x * lsx / sx)
-      if (!(c in mn)) { mn[c] = $1; mx[c] = $1 } else { if ($1 < mn[c]) mn[c] = $1; if ($1 > mx[c]) mx[c] = $1 }
-      if ($1 != o[c]) ne[c] = 1 }
-    function dist(v) { return v < mn[c] ? mn[c] - v : (v > mx[c] ? v - mx[c] : 0) }
-    END { worst = 0; allx = 1
-      for (c in o) {
-        if (!(c in mn)) { worst = cap + 1; continue }
-        d = dist(o[c]); if (ne[c]) allx = 0
-        if (rgb == "rgb") { t = (o[c] - 128) * 255 / 224 + 128.5; t = t < 0 ? 0 : int(t); e = dist(t); if (e < d) d = e }
-        if (d > worst) worst = d }
-      if (worst > cap) { print "over " worst; exit 1 }
-      if (allx) print "exact"; else print "cap " worst }' $W/cp.a $W/cp.b
+    { i = FNR - 1; n = lcw * lch; p = int(i / n); r = i - p * n; y = int(r / lcw) * lsy; x = (r - int(r / lcw) * lcw) * lsx
+      x0 = x < 2 ? 0 : x - 2; x1 = x + 2 > w - 1 ? w - 1 : x + 2; y0 = y < 2 ? 0 : y - 2; y1 = y + 2 > h - 1 ? h - 1 : y + 2
+      lo = 1e9; hi = -1
+      for (yy = int(y0 / sy); yy <= int(y1 / sy); yy++) for (xx = int(x0 / sx); xx <= int(x1 / sx); xx++) {
+        v = o[p * cw * ch + yy * cw + xx]; if (v < lo) lo = v; if (v > hi) hi = v }
+      d = $1 < lo ? lo - $1 : ($1 > hi ? $1 - hi : 0)
+      if (rgb == "rgb") { e = $1 < rs(lo) ? rs(lo) - $1 : ($1 > rs(hi) ? $1 - rs(hi) : 0); if (e < d) d = e }
+      if (d > worst) worst = d
+      if ($1 != o[p * cw * ch + int(y / sy) * cw + int(x / sx)]) ne = 1 }
+    END { if (worst > cap) { print "over " worst; exit 1 }
+      if (ne) print "cap " worst + 0; else print "exact" }' $W/cp.a $W/cp.b
 }
 
 full() {
