@@ -37,6 +37,18 @@ has no malloc hook there and only `-rss_limit_mb` (of the qemu process) holds. T
 cache (`fuzz-corpus-arm64-<target>`) starts from the x86_64 corpus of the same target; artifacts
 are `crashers-arm64-<target>` and `corpus-arm64-<target>`.
 
+`simd_threads` under qemu runs as processes of at most 1800 execs (`-runs=1800`, counting the
+corpus load), restarted on the same corpus until `max_total_time` is used up; the other targets
+run as one process. qemu-user 7.2 (bookworm's `qemu-user`, 7.2.22) keeps about 280 KB of RSS for
+every guest thread after the thread exits, and the target spawns three threads per exec (one
+scope of 2 threads, one of 3). Fuzz run 45490215220 hit `-rss_limit_mb=2048` after 2514 execs
+(about 0.84 MB per exec from the first exec on). Run 45519136759 on the same corpus, 3000 execs
+per mode: a target that only spawns the same 1 + 2 empty scoped threads (no av1 code) went from
+45 MB to 2363 MB, the wrapup with 1 thread only stayed at 64 MB, the real target went to 2315 MB;
+the x86_64 job (native) stays at about 440 MB over 5800 execs. So the growth is qemu's, not the
+crate's. 1800 execs end near 1.55 GB. If the arm64 corpus of this target grows past about 1500
+files, the corpus load alone fills a process: minimize the corpus (`-merge=1`) then.
+
 ## Runs on main
 
 | Date | Commit | max_total_time | Targets | Fuzz hours | Crashes | Runs (probe / decode / avif) |

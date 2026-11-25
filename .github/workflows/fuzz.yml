@@ -164,10 +164,14 @@ jobs:
           restore-keys: |
             fuzz-corpus-arm64-${{ matrix.target }}-
             fuzz-corpus-${{ matrix.target }}-
+      # qemu-user 7.2 keeps about 280 KB of RSS per guest thread after the thread exits, and
+      # simd_threads spawns three per exec, so that target runs as processes of at most 1800
+      # execs each (the corpus carries over), restarted until MAX_TOTAL_TIME is used up
+      # (docs/fuzzing.md). Every other target is one process, as before.
       - run: |
           mkdir -p corpus/${{ matrix.target }}
           docker create --name fuzz -e MAX_TOTAL_TIME -e TARGET=${{ matrix.target }} av1-fuzz-arm64:local \
-            sh -c 'mkdir -p tests/fuzz/artifacts/$TARGET && qemu-aarch64 -L /usr/aarch64-linux-gnu tests/fuzz/target/aarch64-unknown-linux-gnu/release/$TARGET -artifact_prefix=tests/fuzz/artifacts/$TARGET/ tests/fuzz/corpus/$TARGET -max_total_time=$MAX_TOTAL_TIME -timeout=60 -rss_limit_mb=2048 -malloc_limit_mb=512'
+            sh -c 'mkdir -p tests/fuzz/artifacts/$TARGET && end=$(($(date +%s) + MAX_TOTAL_TIME)) && runs=-1 && if [ $TARGET = simd_threads ]; then runs=1800; fi && while left=$((end - $(date +%s))); [ $left -gt 0 ]; do qemu-aarch64 -L /usr/aarch64-linux-gnu tests/fuzz/target/aarch64-unknown-linux-gnu/release/$TARGET -artifact_prefix=tests/fuzz/artifacts/$TARGET/ tests/fuzz/corpus/$TARGET -runs=$runs -max_total_time=$left -timeout=60 -rss_limit_mb=2048 -malloc_limit_mb=512 || exit 1; done'
           docker cp corpus fuzz:/src/tests/fuzz/
           docker start -a fuzz
       - if: failure() || cancelled()
