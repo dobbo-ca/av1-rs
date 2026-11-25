@@ -18,6 +18,9 @@ tools, never as crate dependencies (.github/ci/Dockerfile, stages `oracles`, `pa
 `N` is the number of frames av1-rs outputs: the leading intra frames of a stream (a stream with
 inter frames stops at the first one with `Error::InterFrame`, class `inter`). Any other error on
 a corpus stream fails the gate. The gate also compares `--threads 1` with the default threads.
+Job `parity` runs it on x86_64 (`ubuntu-24.04`); job `parity-arm64` runs the same gate natively
+on aarch64 (`ubuntu-24.04-arm`, the bookworm arm64 builds of the same oracles), with the NEON
+tier and with the scalar tier.
 
 `examples/oracle.rs` writes `<stem>.yuv` (frames concatenated, planes Y U V, visible size,
 8-bit as bytes and higher depths as little-endian u16; the dav1d `.yuv` layout), `<stem>.frames`
@@ -48,9 +51,10 @@ no Matroska input; dav1d-test-data has the same streams as IVF).
 
 ## Results
 
-Last green run on `main` (5b9cdd2, 2026-11-24): 679 inputs, 604 frames; 289 streams and 238 AVIF items bit-exact against dav1d, 518 inputs against aomdec, 236 libaom vectors against the published md5, 133 AVIF files against avifdec and 134 against avifdec-new; every gate green, `--threads 1` equal to the default threads, aarch64 equal to x86_64 on the subset.
+Last green run on `main` (5b9cdd2, 2026-11-24): 679 inputs, 604 frames; 289 streams and 238 AVIF items bit-exact against dav1d, 518 inputs against aomdec, 236 libaom vectors against the published md5, 133 AVIF files against avifdec and 134 against avifdec-new; every gate green, `--threads 1` equal to the default threads, aarch64 equal to x86_64 on the subset (the qemu-user
+check that parity-arm64 ran before the move to hosted runners).
 
-The `parity` job on `main` gates: 289 streams (240 libaom + 49 dav1d-test-data) against dav1d, and against aomdec and the published md5 where those apply, and 151 AVIF files against avifdec and avifdec-new (a file an avifdec cannot decode must be listed in `tests/parity/avifdec-known-failures.txt` or `tests/parity/avifdec-new-known-failures.txt`, and a listed file that decodes fails the gate as a stale entry) plus every coded item against dav1d and aomdec. The `tiers` gate decodes every input again with `AV1_SIMD=scalar` and `AV1_SIMD=avx2` and compares the output with the best tier byte for byte. `run.sh` fails the job if fewer than 289 streams or 151 AVIF files are present, or if fewer than 289 streams, 238 extracted AVIF items, 604 frames, 133 AVIF files against avifdec or 134 against avifdec-new were actually compared (items are counted apart from streams). The exact counts of compared frames, streams and files are the first lines of the job `summary.md`; the known differences are listed below. Pin the floors in `run.sh` from the latest green run.
+The `parity` job on `main` gates: 289 streams (240 libaom + 49 dav1d-test-data) against dav1d, and against aomdec and the published md5 where those apply, and 151 AVIF files against avifdec and avifdec-new (a file an avifdec cannot decode must be listed in `tests/parity/avifdec-known-failures.txt` or `tests/parity/avifdec-new-known-failures.txt`, and a listed file that decodes fails the gate as a stale entry) plus every coded item against dav1d and aomdec. The `tiers` gate decodes every input again with `AV1_SIMD=scalar` and `AV1_SIMD=avx2` (on aarch64 `AV1_SIMD=scalar` only) and compares the output with the best tier byte for byte. `run.sh` fails the job if fewer than 289 streams or 151 AVIF files are present, or if fewer than 289 streams, 238 extracted AVIF items, 604 frames, 133 AVIF files against avifdec or 134 against avifdec-new were actually compared (items are counted apart from streams). The exact counts of compared frames, streams and files are the first lines of the job `summary.md`; the known differences are listed below. Pin the floors in `run.sh` from the latest green run.
 
 ## Known oracle differences
 

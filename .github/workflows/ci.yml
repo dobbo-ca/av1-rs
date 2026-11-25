@@ -6,18 +6,24 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  # The checks run inside .github/ci/Dockerfile on the in-cluster BuildKit, so the Rust image and the
-  # build cache stay in the cluster. isobmff-rs is private: the dobbo-ca-ci-read GitHub App mints a
-  # read-only token for it, and it reaches the build only as a BuildKit secret.
-  # The layers are also saved to the Actions cache (one scope per job), so a restart of buildkitd does not throw them away.
-  # A PR needs only `test`; arm64, parity and parity-arm64 run on main and on workflow_dispatch.
+  # The checks run inside .github/ci/Dockerfile, built with BuildKit (setup-buildx, the default
+  # docker-container driver) on GitHub-hosted runners: ubuntu-24.04 for x86_64, ubuntu-24.04-arm
+  # for aarch64. The layers are saved to the Actions cache, one scope per job. isobmff-rs is not
+  # public: the dobbo-ca-ci-read GitHub App mints a read-only token for it, and it reaches the
+  # build only as a BuildKit secret.
+  # Fork PRs get no secrets, so no token: every job that needs isobmff-rs is skipped on a fork PR
+  # (the job-level `if`), and a skipped job is not a failure.
+  # A PR runs `test` (the required check) and `arm64`; parity and parity-arm64 run on main and on
+  # workflow_dispatch.
   test:
-    runs-on: github-arc-runner-set
-    timeout-minutes: 45
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { lfs: false }
-      - id: app
+      - name: Create isobmff-rs read token (dobbo-ca-ci-read app)
+        id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ vars.CI_READ_APP_ID }}
@@ -25,10 +31,12 @@ jobs:
           owner: dobbo-ca
           repositories: isobmff-rs
           permission-contents: read
+      - name: Free disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc && df -h /
+      # The SIMD tiers the tests reach depend on the CPU (AVX-512 or not).
+      - name: CPU
+        run: lscpu | grep -E '^(Model name|CPU\(s\))' || true; grep -ow 'avx512[a-z]*' /proc/cpuinfo | sort -u | tr '\n' ' ' || true; echo
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        with:
-          driver: remote
-          endpoint: tcp://buildkitd.github-arc.svc.cluster.local:1234
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -43,15 +51,16 @@ jobs:
           secrets: |
             gh_token=${{ steps.app.outputs.token }}
 
-  # The library tests (SIMD kernel, cross-tier and dispatch tests) on aarch64 under qemu-user, with the NEON tier and with the scalar tier.
+  # Native aarch64: clippy and the whole suite, with the NEON tier and with the scalar tier.
   arm64:
-    if: github.event_name != 'pull_request'
-    runs-on: github-arc-runner-set
-    timeout-minutes: 45
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { lfs: false }
-      - id: app
+      - name: Create isobmff-rs read token (dobbo-ca-ci-read app)
+        id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ vars.CI_READ_APP_ID }}
@@ -59,10 +68,9 @@ jobs:
           owner: dobbo-ca
           repositories: isobmff-rs
           permission-contents: read
+      - name: Free disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc && df -h /
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        with:
-          driver: remote
-          endpoint: tcp://buildkitd.github-arc.svc.cluster.local:1234
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -71,7 +79,7 @@ jobs:
           push: false
           outputs: type=cacheonly
           cache-from: type=gha,scope=av1-rs-arm64
-          cache-to: type=gha,mode=max,scope=av1-rs-arm64
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max,scope=av1-rs-arm64' || '' }}
           secrets: |
             gh_token=${{ steps.app.outputs.token }}
 
@@ -81,12 +89,13 @@ jobs:
   # status file.
   parity:
     if: github.event_name != 'pull_request'
-    runs-on: github-arc-runner-set
-    timeout-minutes: 120
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { lfs: false }
-      - id: app
+      - name: Create isobmff-rs read token (dobbo-ca-ci-read app)
+        id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ vars.CI_READ_APP_ID }}
@@ -94,10 +103,12 @@ jobs:
           owner: dobbo-ca
           repositories: isobmff-rs
           permission-contents: read
+      - name: Free disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc && df -h /
+      # The `tiers` gate reaches AVX-512 only on a CPU that has it.
+      - name: CPU
+        run: lscpu | grep -E '^(Model name|CPU\(s\))' || true; grep -ow 'avx512[a-z]*' /proc/cpuinfo | sort -u | tr '\n' ' ' || true; echo
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        with:
-          driver: remote
-          endpoint: tcp://buildkitd.github-arc.svc.cluster.local:1234
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -144,16 +155,17 @@ jobs:
       - if: always()
         run: exit "$(cat transform-out/status)"
 
-  # The oracle built for aarch64, run under qemu-user on a corpus subset, compared with the
-  # x86_64 output.
+  # The same parity gate (run.sh full) natively on aarch64: the NEON tier and the scalar tier
+  # against dav1d and aomdec built for arm64.
   parity-arm64:
     if: github.event_name != 'pull_request'
-    runs-on: github-arc-runner-set
-    timeout-minutes: 60
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { lfs: false }
-      - id: app
+      - name: Create isobmff-rs read token (dobbo-ca-ci-read app)
+        id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ vars.CI_READ_APP_ID }}
@@ -161,18 +173,27 @@ jobs:
           owner: dobbo-ca
           repositories: isobmff-rs
           permission-contents: read
+      - name: Free disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc && df -h /
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        with:
-          driver: remote
-          endpoint: tcp://buildkitd.github-arc.svc.cluster.local:1234
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: .github/ci/Dockerfile
-          target: parity-arm64
+          target: parity-report
           push: false
-          outputs: type=cacheonly
+          outputs: type=local,dest=parity-out
           cache-from: type=gha,scope=av1-rs-parity-arm64
           cache-to: type=gha,mode=max,scope=av1-rs-parity-arm64
           secrets: |
             gh_token=${{ steps.app.outputs.token }}
+      - if: always()
+        run: '[ ! -f parity-out/summary.md ] || cat parity-out/summary.md >> "$GITHUB_STEP_SUMMARY"'
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: parity-arm64
+          path: parity-out
+          if-no-files-found: ignore
+      - if: always()
+        run: exit "$(cat parity-out/status)"

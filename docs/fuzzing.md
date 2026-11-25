@@ -25,30 +25,19 @@ Each SIMD kernel family adds a cross-tier target `simd_<family>`: it calls
 inputs from the bytes, runs every available tier and asserts that each output equals the scalar
 output.
 
-`.github/workflows/fuzz.yml`: weekly (Thursday 12:23 UTC) and on dispatch, two jobs at a time,
-`-rss_limit_mb=2048 -malloc_limit_mb=512`, crashers uploaded as artifacts.
+`.github/workflows/fuzz.yml`: weekly (Thursday 12:23 UTC) and on dispatch, on GitHub-hosted
+runners, up to eight jobs at a time, `-rss_limit_mb=2048 -malloc_limit_mb=512`, crashers
+uploaded as artifacts.
 
-Job `fuzz-arm64` (same workflow, after the x86_64 matrix, two jobs at a time): the `simd_*`
-targets built for `aarch64-unknown-linux-gnu` (Dockerfile stage `fuzz-arm64`,
-`cargo +nightly fuzz build --target aarch64-unknown-linux-gnu -s none`, libFuzzer compiled with
-`aarch64-linux-gnu-g++`) and run with `qemu-aarch64 -L /usr/aarch64-linux-gnu`, so the NEON tier
-is compared with scalar. No sanitizer: ASan does not run under qemu-user, so `-malloc_limit_mb`
-has no malloc hook there and only `-rss_limit_mb` (of the qemu process) holds. The dispatch input
-`only` picks the target of both jobs; a target that is not `simd_*` skips `fuzz-arm64`. Its corpus
-cache (`fuzz-corpus-arm64-<target>`) starts from the x86_64 corpus of the same target; artifacts
+Every target runs on x86_64 (`ubuntu-24.04`), and each `simd_*` target runs again natively on
+aarch64 (`ubuntu-24.04-arm`; the same Dockerfile stage `fuzz`, ASan included), so the NEON tier
+is compared with scalar. The dispatch input `only` picks one target. The arm64 corpus cache
+(`fuzz-corpus-arm64-<target>`) starts from the x86_64 corpus of the same target; its artifacts
 are `crashers-arm64-<target>` and `corpus-arm64-<target>`.
 
-`simd_threads` under qemu runs as processes of at most 1800 execs (`-runs=1800`, counting the
-corpus load), restarted on the same corpus until `max_total_time` is used up; the other targets
-run as one process. qemu-user 7.2 (bookworm's `qemu-user`, 7.2.22) keeps about 280 KB of RSS for
-every guest thread after the thread exits, and the target spawns three threads per exec (one
-scope of 2 threads, one of 3). Fuzz run 45490215220 hit `-rss_limit_mb=2048` after 2514 execs
-(about 0.84 MB per exec from the first exec on). Run 45519136759 on the same corpus, 3000 execs
-per mode: a target that only spawns the same 1 + 2 empty scoped threads (no av1 code) went from
-45 MB to 2363 MB, the wrapup with 1 thread only stayed at 64 MB, the real target went to 2315 MB;
-the x86_64 job (native) stays at about 440 MB over 5800 execs. So the growth is qemu's, not the
-crate's. 1800 execs end near 1.55 GB. If the arm64 corpus of this target grows past about 1500
-files, the corpus load alone fills a process: minimize the corpus (`-merge=1`) then.
+Before the move to hosted runners the arm64 jobs ran under qemu-user, without a sanitizer, and
+`simd_threads` restarted every 1800 execs because qemu-user 7.2 kept about 280 KB of RSS per
+exited guest thread (fuzz runs 45490215220 and 45519136759). Native runs need neither.
 
 ## Runs on main
 
