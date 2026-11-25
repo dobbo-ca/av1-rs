@@ -190,6 +190,72 @@ per tile the mode-info arrays and tile decoder buffers of its tile-sized state (
 buffers and the tile states' planes come from the pool when it holds one of the size). So only a
 `max_threads = 1` call of the same shape as the previous one allocates nothing (`tests/alloc.rs`).
 
+## Tried and not kept: a rayon pool (2026-11-25)
+
+The owner decision of 2026-11-24 allows a thread-pool crate if a CI bench shows it measurably
+faster than `std::thread::scope`. PR 38 (closed unmerged, branch deleted, head ed71c7b) built both
+from one commit and the bench timed them side by side.
+
+What the trial was:
+
+- `rayon-core = "=1.13.0"` behind an optional feature `rayon`; one lazy `OnceLock` pool of
+  `available_parallelism - 1` threads (the calling thread works too); `ThreadPool::in_place_scope`
+  with at most `max_threads - 1` spawned jobs per call, so `max_threads = 1` never touches the
+  pool; a caller already on a rayon thread uses its own pool (`current_thread_index`).
+- The atomic-counter work loop of `run_parallel` was kept, so errors, cancel and the ledger behave
+  as before.
+- The frame decode did not use the team. Each stage was one `run_parallel`, and the loop filter
+  (vertical edges), CDEF, superres and loop restoration wrote straight into disjoint
+  `split_at_mut` row views of their output planes: no band copy, no copy back, no frame lock.
+  Only the horizontal loop filter edges kept their copy (a column strip is not contiguous).
+- A test with calls nested inside calls checked that the threads busy at once stay within
+  `max_threads` (1, 2, 3, 8), with and without the feature. The whole suite also passed with the
+  feature, with the best SIMD tier and with `AV1_SIMD=scalar`.
+
+The bench (`tests/parity/bench.sh`, table "pools") built the std and the rayon variant of the same
+commit, default and v4 builds, and timed them A, B, A, B on the same machine, keeping the
+minimum of two best-of-5 per side. The rule, fixed before the run: with default threads the "all"
+row of rayon must be at most 97% of std in both builds in both of two bench runs; no class slower
+than max(3%, 1 ms); the 1 thread table is an A/A control (that path never touches a pool) and must
+stay within max(3%, 1 ms).
+
+Result, `rayon / std` of the "all" row (16 threads on the ARC runner; the 1 thread control is
+within 1% in every run):
+
+| run | threads | default build | v4 build |
+|---|---|---|---|
+| bench 45576777672 | default | 302 vs 297 ms, 98% | 294 vs 290 ms, 98% |
+| bench 45577649764 | default | 304 vs 301 ms, 99% | 299 vs 289 ms, 96% |
+| bench 45576777672 | 1 (control) | 891 vs 884 ms, 99% | 860 vs 857 ms, 99% |
+| bench 45577649764 | 1 (control) | 891 vs 888 ms, 99% | 855 vs 858 ms, 100% |
+
+Default threads, per class (std ms / rayon ms, default build; run 1, run 2):
+
+| class | run 1 | run 2 |
+|---|---|---|
+| q8 | 15 / 14 | 15 / 15 |
+| q10 | 32 / 31 | 33 / 31 |
+| allintra | 53 / 53 | 53 / 54 |
+| size | 11 / 10 | 11 / 10 |
+| grain | 6 / 7 | 6 / 7 |
+| avif8 | 42 / 41 | 42 / 41 |
+| avifhi | 97 / 95 | 97 / 96 |
+| tiles8 | 24 / 24 | 24 / 24 |
+| tiles10 | 22 / 22 | 23 / 23 |
+| all | 302 / 297 | 304 / 301 |
+
+Why it loses: the rule needs 97% or less in all four default-thread cells, and only one cell
+(v4, run 2, 96%) gets there; the others are 98%, 98% and 99%. The total gain is 3 to 5 ms in 300.
+The 1 thread control, which runs identical code, differs by up to 1% (and one class cell by 10%
+at 1 ms resolution), so a gain of this size is within noise. The classes that spawn most per
+frame (`size`, `allintra`, `tiles8`, `tiles10`) do not move. That is an inference, not measured:
+since the frame-parallel batch ("Frames of a batch" above) the frames of a unit overlap, so the
+spawn cost per frame is already small, and the band copies the pool removes are small next to
+the filters. `grain` is 1 ms slower in every run (6 vs 7 ms), at the limit of the timer.
+
+So the crate stays on `std::thread::scope` and adds no dependency. Revisit it if the frame
+decode gets row pipelining, where a persistent pool matters more than one scope per stage.
+
 ## Tests
 
 - `parallel.rs`: the schedulers in isolation: peak live items and distinct threads for
