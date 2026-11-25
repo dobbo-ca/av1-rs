@@ -108,7 +108,7 @@ docs/transforms.md; 4:2:2 rotated by 90 or 270 is 4:4:4 in both, but the chroma 
 libheif). When the chroma format of either decoder differs from the raw one, only the luma plane is
 compared, and it must be equal, or for 8-bit samples when libheif went through RGB (its 4:2:0 to 4:4:4 step refuses some inputs, and the conversion moves the luma to another range and rounds it twice) within 2 of ours or of ours rescaled from studio to full range, `round((v - 16) * 255 / 219)`. Any other difference fails the gate. The summary lists the counts:
 files, compared, with transform properties, exact, luma only (format differs), luma through RGB, and
-not compared (both decoders fail, or libheif refuses and av1-rs decodes). Floors
+not compared (both decoders fail, libheif refuses and av1-rs decodes, or av1-rs stops at an inter frame of a layered Xiph item). Floors
 (`TRANSFORM_MIN_CORPUS`, `TRANSFORM_MIN_TRANSFORMED`, `TRANSFORM_MIN_GENERATED`) keep a broken tool
 from shrinking the gate.
 
