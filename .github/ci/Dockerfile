@@ -217,8 +217,8 @@ COPY . .
 RUN cargo +nightly fuzz build --fuzz-dir tests/fuzz --target aarch64-unknown-linux-gnu -s none
 
 # Benchmark (bench.yml) and profile (profile.yml) binaries: av1-oracle (the default release
-# build), av1-oracle-v4 (the release-binary flags: x86-64-v4 with the
-# false-deps features, fat LTO, panic=abort) and av1-avifx (extracts AVIF items for the classes).
+# build), av1-oracle-v4 (the release-binary flags: x86-64-v4,
+# fat LTO, panic=abort) and av1-avifx (extracts AVIF items for the classes).
 FROM oracles AS bench-bin
 COPY . .
 COPY --from=data /data.list /data.list
