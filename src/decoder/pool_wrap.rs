@@ -46,7 +46,6 @@ pub(super) fn decode_frame(
             lock(&merged).merge_tile(&local, sb_size);
             Ok(())
         });
-        drop(merged);
         r?;
     }
     let mut curr = std::mem::take(&mut fs.curr_frame);
