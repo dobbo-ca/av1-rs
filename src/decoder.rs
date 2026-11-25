@@ -26,6 +26,9 @@ use crate::{ColorInfo, Format, Frame, FrameInfo, Metadata, Options, Plane, Plane
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+#[cfg(feature = "rayon")]
+mod pool_wrap;
+
 /// A frame whose header was read and whose tile groups are still coming.
 #[derive(Debug)]
 struct Pending {
@@ -1244,6 +1247,29 @@ fn decode_frame(
         fs.frame_cdf = Some(frame_cdf);
         return Ok(fs);
     }
+    #[cfg(feature = "rayon")]
+    {
+        pool_wrap::decode_frame(fs, ledger, threads, h, seq, data, tiles, cancel, frame_cdf)
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        decode_frame_team(fs, ledger, threads, h, seq, data, tiles, cancel, frame_cdf)
+    }
+}
+
+/// The threaded part of [`decode_frame`] on one `std::thread::scope` team.
+#[cfg_attr(feature = "rayon", allow(dead_code))]
+fn decode_frame_team(
+    fs: FrameState,
+    ledger: &Arc<Ledger>,
+    threads: usize,
+    h: &FrameHeader,
+    seq: &SequenceHeader,
+    data: &[u8],
+    tiles: &[TileRange],
+    cancel: &AtomicBool,
+    frame_cdf: Box<CdfContext>,
+) -> Result<FrameState, Error> {
     let w = Wrap {
         h,
         seq,
@@ -1530,61 +1556,69 @@ impl Wrap<'_> {
     /// Horizontal edges of one column strip: each edge filters samples of its own columns only.
     fn lf_cols(&self, i: usize) -> Result<(), Error> {
         let fs = self.state()?;
-        let strips = self.strips(fs);
-        let (plane, s) = (i / strips, i % strips);
-        if plane >= fs.num_planes || !lf_plane_on(self.h, plane) {
-            return Ok(());
-        }
-        let (sx, _) = subsampling(fs, plane);
-        // Strip `s` has the mode info columns of units `units * s / strips` up to the next
-        // strip's, 16 columns a unit; the last strip runs to the plane end.
-        let units = fs.mi_cols.div_ceil(16);
-        let c0 = 16 * (s * units / strips);
-        let c1 = (16 * ((s + 1) * units / strips)).min(fs.mi_cols);
-        if c0 >= c1 {
-            return Ok(());
-        }
-        let (mut buf, x0, x1, height) = {
-            let curr = read_lock(&self.curr);
-            let p = curr.get(plane).ok_or(Error::Invalid("plane missing"))?;
-            let x0 = ((c0 * MI_SIZE) >> sx).min(p.stride);
-            let x1 = if s + 1 == strips {
-                p.stride
-            } else {
-                ((c1 * MI_SIZE) >> sx).clamp(x0, p.stride)
-            };
-            let src = p.px.get(x0..).unwrap_or_default();
-            let buf = WorkPlane::copy_of(src, p.stride, x1 - x0, p.height, self.ledger)?;
-            (buf, x0, x1, p.height)
-        };
-        let mut v = View {
-            stride: buf.stride,
-            px: buf.px.as_mut_slice(),
-            x0,
-            y0: 0,
-        };
-        loop_filter_rows(
-            fs,
-            self.h,
-            plane,
-            1,
-            0..fs.mi_rows,
-            c0..c1,
-            &mut v,
-            self.cancel,
-        )?;
-        let mut curr = write_lock(&self.curr);
-        let p = curr.get_mut(plane).ok_or(Error::Invalid("plane missing"))?;
-        let w = x1 - x0;
-        for y in 0..height {
-            let start = y * p.stride;
-            p.px.get_mut(start + x0..start + x1)
-                .ok_or(Error::Invalid("plane smaller than its size"))?
-                .copy_from_slice(&buf.px[y * w..(y + 1) * w]);
-        }
-        Ok(())
+        let (h, ledger, cancel) = (self.h, self.ledger, self.cancel);
+        lf_cols_strip(fs, h, ledger, cancel, &self.curr, self.strips(fs), i)
     }
+}
 
+/// Item `i` of the horizontal edges of `curr`: plane `i / strips`, column strip `i % strips`. The
+/// strip is copied out under the read lock and back under the write lock (a column strip is not
+/// contiguous memory).
+fn lf_cols_strip(
+    fs: &FrameState,
+    h: &FrameHeader,
+    ledger: &Arc<Ledger>,
+    cancel: &AtomicBool,
+    curr: &RwLock<Vec<WorkPlane>>,
+    strips: usize,
+    i: usize,
+) -> Result<(), Error> {
+    let (plane, s) = (i / strips, i % strips);
+    if plane >= fs.num_planes || !lf_plane_on(h, plane) {
+        return Ok(());
+    }
+    let (sx, _) = subsampling(fs, plane);
+    // Strip `s` has the mode info columns of units `units * s / strips` up to the next
+    // strip's, 16 columns a unit; the last strip runs to the plane end.
+    let units = fs.mi_cols.div_ceil(16);
+    let c0 = 16 * (s * units / strips);
+    let c1 = (16 * ((s + 1) * units / strips)).min(fs.mi_cols);
+    if c0 >= c1 {
+        return Ok(());
+    }
+    let (mut buf, x0, x1, height) = {
+        let curr = read_lock(curr);
+        let p = curr.get(plane).ok_or(Error::Invalid("plane missing"))?;
+        let x0 = ((c0 * MI_SIZE) >> sx).min(p.stride);
+        let x1 = if s + 1 == strips {
+            p.stride
+        } else {
+            ((c1 * MI_SIZE) >> sx).clamp(x0, p.stride)
+        };
+        let src = p.px.get(x0..).unwrap_or_default();
+        let buf = WorkPlane::copy_of(src, p.stride, x1 - x0, p.height, ledger)?;
+        (buf, x0, x1, p.height)
+    };
+    let mut v = View {
+        stride: buf.stride,
+        px: buf.px.as_mut_slice(),
+        x0,
+        y0: 0,
+    };
+    loop_filter_rows(fs, h, plane, 1, 0..fs.mi_rows, c0..c1, &mut v, cancel)?;
+    let mut curr = write_lock(curr);
+    let p = curr.get_mut(plane).ok_or(Error::Invalid("plane missing"))?;
+    let w = x1 - x0;
+    for y in 0..height {
+        let start = y * p.stride;
+        p.px.get_mut(start + x0..start + x1)
+            .ok_or(Error::Invalid("plane smaller than its size"))?
+            .copy_from_slice(&buf.px[y * w..(y + 1) * w]);
+    }
+    Ok(())
+}
+
+impl Wrap<'_> {
     /// CDEF of one row band of 8x8 blocks, every plane: reads `CurrFrame` (also outside the
     /// band), writes the band's rows of `CdefFrame`.
     fn cdef_band(&self, b: usize) -> Result<(), Error> {

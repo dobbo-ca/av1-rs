@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 isobmff = { git = "https://github.com/dobbo-ca/isobmff-rs", rev = "c4f748bbc4798bc6cc5eb56461851a28527be8c9" }
+rayon-core = { version = "=1.13.0", optional = true }
 
 # The tests decode whole frames, so they run optimised; this crate keeps its own overflow checks
 # and debug assertions in dev builds.
@@ -22,3 +23,6 @@ codegen-units = 1
 [features]
 # Exposes `av1::fuzzing` (cross-tier SIMD checks) to the fuzz crate in tests/fuzz. Not for users.
 fuzzing = []
+# The trial of docs/threading.md: run_parallel and the frame decode on a lazy shared rayon pool
+# instead of std::thread::scope. Kept only if the CI bench shows a gain.
+rayon = ["dep:rayon-core"]

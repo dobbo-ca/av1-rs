@@ -58,6 +58,30 @@ table() {
   echo "| all | | | $sd | $sa | $sr | $sv | $(ratio $sr $sd) | $(ratio $sv $sd) | $(ratio $sr $sa) |"
 }
 
+min2() { [ "$1" -le "$2" ] && echo "$1" || echo "$2"; }
+
+# pools <threads>: the same commit built with std::thread::scope (av1-oracle) and with the rayon
+# feature (av1-oracle-rayon), default and v4 builds. Each side is timed A, B, A, B (best of 5
+# each time, the minimum kept), so a slow period of the machine hits both. With one thread
+# neither build touches a pool: that table is the A/A control.
+pools() {
+  tn=$1
+  echo "| class | std ms | rayon ms | rayon / std | v4 std ms | v4 rayon ms | v4 rayon / std |"
+  echo "|---|---|---|---|---|---|---|"
+  ss=0 sr=0 vs=0 vr=0
+  for c in $CLASSES; do
+    s=$(best rs av1-oracle $tn $c); r=$(best rs av1-oracle-rayon $tn $c)
+    s2=$(best rs av1-oracle $tn $c); r2=$(best rs av1-oracle-rayon $tn $c)
+    s=$(min2 $s $s2); r=$(min2 $r $r2)
+    v=$(best rs av1-oracle-v4 $tn $c); w=$(best rs av1-oracle-v4-rayon $tn $c)
+    v2=$(best rs av1-oracle-v4 $tn $c); w2=$(best rs av1-oracle-v4-rayon $tn $c)
+    v=$(min2 $v $v2); w=$(min2 $w $w2)
+    ss=$((ss + s)) sr=$((sr + r)) vs=$((vs + v)) vr=$((vr + w))
+    echo "| $c | $s | $r | $(ratio $r $s) | $v | $w | $(ratio $w $v) |"
+  done
+  echo "| all | $ss | $sr | $(ratio $sr $ss) | $vs | $vr | $(ratio $vr $vs) |"
+}
+
 # tiers: av1-rs with each SIMD tier forced (AV1_SIMD), one thread; which tier wins per class.
 tiers() {
   echo "| class | scalar ms | avx2 ms | avx512 ms (best) | avx2 / scalar | avx512 / avx2 |"
@@ -82,6 +106,14 @@ tiers() {
   echo "### default threads ($NT)"
   echo
   table $NT 0 $NT
+  echo
+  echo "### pools: std::thread::scope vs rayon, 1 thread (A/A control: no pool is used)"
+  echo
+  pools 1
+  echo
+  echo "### pools: std::thread::scope vs rayon, default threads ($NT)"
+  echo
+  pools $NT
   echo
   echo "### SIMD tiers (av1-rs default build, 1 thread)"
   echo

@@ -3,6 +3,10 @@
 //! items (the AVIF grid, `avif.rs`); [`with_team`] keeps a team of threads for a sequence of
 //! stages, each a set of independent items (the tiles and the in-loop filters of a frame,
 //! `decoder.rs`).
+//!
+//! With the `rayon` feature the threads of [`run_parallel`] come from a shared rayon pool and the
+//! frame decode does not use [`with_team`] (`decoder/pool_wrap.rs`).
+#![cfg_attr(feature = "rayon", allow(dead_code))]
 
 use crate::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -46,13 +50,7 @@ pub(crate) fn run_parallel<T: Send>(
             }
         }
     };
-    std::thread::scope(|s| {
-        for _ in 1..workers {
-            // A thread that cannot start is not an error: the others take its items.
-            let _ = std::thread::Builder::new().spawn_scoped(s, work);
-        }
-        work();
-    });
+    spread(workers - 1, &work);
     let mut out = Vec::with_capacity(n);
     for slot in slots {
         match slot.into_inner().unwrap_or_else(|e| e.into_inner()) {
@@ -62,6 +60,61 @@ pub(crate) fn run_parallel<T: Send>(
         }
     }
     Ok(out)
+}
+
+/// Runs `work` on the calling thread and on up to `extra` more, and returns when all are done.
+/// With the `rayon` feature the others are jobs of a pool: the caller's own when the call is
+/// already on a rayon thread (so a caller's pool wins, and so does ours when calls nest), else
+/// the lazy shared pool. A job that never starts is not an error: `work` takes items from a
+/// shared counter, so the others take its items. A call never holds a lock across this.
+fn spread(extra: usize, work: &(impl Fn() + Sync)) {
+    #[cfg(feature = "rayon")]
+    {
+        if rayon_core::current_thread_index().is_some() {
+            let extra = extra.min(rayon_core::current_num_threads());
+            rayon_core::in_place_scope(|s| {
+                for _ in 0..extra {
+                    s.spawn(move |_| work());
+                }
+                work();
+            });
+            return;
+        }
+        if let Some(pool) = pool() {
+            let extra = extra.min(pool.current_num_threads());
+            pool.in_place_scope(|s| {
+                for _ in 0..extra {
+                    s.spawn(move |_| work());
+                }
+                work();
+            });
+            return;
+        }
+    }
+    std::thread::scope(|s| {
+        for _ in 0..extra {
+            // A thread that cannot start is not an error: the others take its items.
+            let _ = std::thread::Builder::new().spawn_scoped(s, work);
+        }
+        work();
+    });
+}
+
+/// The lazy shared pool: `available_parallelism` - 1 threads (the calling thread works too),
+/// made on first use and never grown. `None` when it cannot be built; the caller then spawns
+/// scoped threads.
+#[cfg(feature = "rayon")]
+fn pool() -> Option<&'static rayon_core::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon_core::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = std::thread::available_parallelism().map_or(1, |n| n.get());
+        rayon_core::ThreadPoolBuilder::new()
+            .num_threads(n.saturating_sub(1).max(1))
+            .thread_name(|i| format!("av1-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
 }
 
 /// The threads of one call, shared by its stages (docs/threading.md): made by [`with_team`],
@@ -250,7 +303,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::thread::ThreadId;
     use std::time::Duration;
 
@@ -303,6 +356,46 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// A call inside a call, as the AVIF grid and the frames of a batch do: the outer call gives
+    /// each inner one `k / workers` threads, and the threads busy at any moment stay within `k`
+    /// (with a pool, a thread waiting in the inner call may run a job of another, so count the
+    /// threads that run a leaf, not the ones that exist).
+    #[test]
+    fn nested_calls_peak_within_max_threads() {
+        for k in [1, 2, 3, 8] {
+            let live: Mutex<HashMap<ThreadId, usize>> = Mutex::new(HashMap::new());
+            let peak = AtomicUsize::new(0);
+            let me = std::thread::current().id();
+            let outer = k.min(2);
+            run_parallel(2, k, |_| {
+                run_parallel(6, (k / outer).max(1), |_| {
+                    let id = std::thread::current().id();
+                    if k == 1 {
+                        assert_eq!(id, me);
+                        #[cfg(feature = "rayon")]
+                        assert!(rayon_core::current_thread_index().is_none());
+                    }
+                    {
+                        let mut m = live.lock().unwrap();
+                        *m.entry(id).or_insert(0) += 1;
+                        peak.fetch_max(m.len(), Ordering::SeqCst);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    let mut m = live.lock().unwrap();
+                    if let Some(c) = m.get_mut(&id) {
+                        *c -= 1;
+                        if *c == 0 {
+                            m.remove(&id);
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .unwrap();
+            assert!(peak.load(Ordering::SeqCst) <= k, "k {k}");
+        }
     }
 
     #[test]

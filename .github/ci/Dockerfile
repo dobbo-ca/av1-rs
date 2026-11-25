@@ -34,7 +34,8 @@ RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + && cargo fmt --check
 RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --all-targets -- -D warnings \
-    && cargo clippy --locked --lib --features fuzzing -- -D warnings
+    && cargo clippy --locked --lib --features fuzzing -- -D warnings \
+    && cargo clippy --locked --all-targets --features rayon -- -D warnings
 # The fuzz targets (their own workspace, built for fuzzing only by fuzz.yml) must still compile.
 RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + \
@@ -48,6 +49,11 @@ RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
 RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + \
     && AV1_SIMD=scalar cargo test --locked --no-fail-fast && AV1_SIMD=avx2 cargo test --locked --no-fail-fast
+# The rayon pool build (docs/threading.md), with the best tier and with scalar.
+RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
+    find src examples tests -name '*.rs' -exec touch {} + \
+    && cargo test --locked --no-fail-fast --features rayon \
+    && AV1_SIMD=scalar cargo test --locked --no-fail-fast --features rayon
 # The examples are built too, so the cross linker runs (a lib alone is not linked).
 RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + && cargo build --locked --release --target aarch64-unknown-linux-gnu --examples
@@ -229,7 +235,13 @@ RUN --mount=type=cache,id=av1-rs-target-bench,sharing=locked,target=/src/target 
     && RUSTFLAGS="-C target-cpu=x86-64-v4" \
        CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_PANIC=abort \
        cargo build --locked --release --example oracle --target-dir target/v4 \
-    && cp target/v4/release/examples/oracle /usr/local/bin/av1-oracle-v4
+    && cp target/v4/release/examples/oracle /usr/local/bin/av1-oracle-v4 \
+    && cargo build --locked --release --example oracle --features rayon --target-dir target/rayon \
+    && cp target/rayon/release/examples/oracle /usr/local/bin/av1-oracle-rayon \
+    && RUSTFLAGS="-C target-cpu=x86-64-v4" \
+       CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_PANIC=abort \
+       cargo build --locked --release --example oracle --features rayon --target-dir target/v4-rayon \
+    && cp target/v4-rayon/release/examples/oracle /usr/local/bin/av1-oracle-v4-rayon
 
 # Benchmark: dav1d, aomdec and av1-rs on the bench classes, in one container, so the ratio
 # compares the same machine. Information only (no speed bar). BENCH_RUN changes per run, so a
