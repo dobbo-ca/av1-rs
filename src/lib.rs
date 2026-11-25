@@ -281,22 +281,15 @@ pub fn decode(
     cancel: &AtomicBool,
 ) -> Result<Vec<Frame>, Error> {
     let mut decoder = Decoder::new(options.clone(), *limits);
-    let mut frames = Vec::new();
-    // Framing is checked up front (without allocating), so a broken stream decodes nothing.
+    // Framing is checked up front, so a broken stream decodes nothing.
+    let mut units = Vec::new();
     for unit in TemporalUnits::new(data, format) {
-        unit?;
+        units.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+        units.push(unit?);
     }
-    for unit in TemporalUnits::new(data, format) {
-        let unit = unit?;
-        let out = decoder.decode_temporal_unit(unit, format, cancel)?;
-        // Every frame collected so far stays booked: the output of the call counts too.
-        decoder.hold_output(&out)?;
-        frames
-            .try_reserve(out.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        frames.extend(out);
-    }
-    Ok(frames)
+    // Every frame collected so far stays booked, so the output of the call counts too; with
+    // `max_threads` above 1 the frames of several units decode at once.
+    decoder.decode_temporal_units(&units, format, cancel)
 }
 
 /// Parses every OBU header, sequence header and frame header of a stream without decoding any

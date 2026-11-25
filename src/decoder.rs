@@ -18,12 +18,12 @@ use crate::lf::{lf_on, lf_plane_on, loop_filter_frame, loop_filter_rows};
 use crate::limits::Limits;
 use crate::lr::{lr_frame, lr_plane, lr_stripe};
 use crate::obu::{Obu, ObuIter, parse_metadata};
-use crate::parallel::{Team, with_team};
+use crate::parallel::{Team, run_parallel, with_team};
 use crate::seq::SequenceHeader;
 use crate::superres::{upscale, upscale_rows};
 use crate::tile::TileDecoder;
 use crate::{ColorInfo, Format, Frame, FrameInfo, Metadata, Options, Plane, PlaneData};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// A frame whose header was read and whose tile groups are still coming.
@@ -34,6 +34,53 @@ struct Pending {
     tiles: Vec<TileRange>,
     /// `TileNum` the next tile group must start at.
     next_tile: usize,
+}
+
+/// A frame of a batch ([`Decoder::decode_temporal_units`]) whose header is parsed and whose
+/// reference update (the header half) is done; its pixels are decoded at the next flush.
+#[derive(Debug)]
+struct Job {
+    header: FrameHeader,
+    seq: SequenceHeader,
+    /// Index of its temporal unit in the batch; `tiles` point into that unit.
+    unit: usize,
+    tiles: Vec<TileRange>,
+    /// The reference state after this frame's header was parsed and before its update: what a
+    /// failed decode leaves behind.
+    refs: RefState,
+    /// The metadata an output frame takes (empty for a hidden frame).
+    metadata: Vec<Metadata>,
+    metadata_bytes: usize,
+}
+
+/// What one [`Decoder::decode_temporal_units`] call has collected so far.
+#[derive(Default)]
+struct Batch {
+    /// The output frames of the finished units, in order.
+    out: Vec<Frame>,
+    /// Ledger bytes held by `out` until the call returns.
+    held: usize,
+    /// The unit whose frames are in `Decoder::ready`.
+    commit_unit: usize,
+    /// The unit of the frame that failed to decode.
+    stop_unit: Option<usize>,
+}
+
+/// Frames in flight and threads each for a flush of `queued` frames, with `left` bytes of
+/// `max_alloc` free and `est` bytes at most per frame: `w * t <= max_threads`, and `w` is 1 when
+/// the budget fits one frame only.
+fn plan(max_threads: usize, queued: usize, left: usize, est: usize) -> (usize, usize) {
+    let max_threads = max_threads.max(1);
+    let w = max_threads.min(queued).min(left / est.max(1)).max(1);
+    (w, (max_threads / w).max(1))
+}
+
+/// An upper estimate of the working memory of one frame decode: three sets of 16-bit planes
+/// (`CurrFrame`, `CdefFrame`, `LrFrame`) of three times the luma area, with a margin.
+fn frame_estimate(h: &FrameHeader) -> usize {
+    let w = (h.frame_width.max(h.upscaled_width) as usize + 127) & !127;
+    let rows = (h.frame_height as usize + 127) & !127;
+    w.saturating_mul(rows).saturating_mul(18)
 }
 
 /// Most plane lists of recycled frames a decoder keeps.
@@ -146,6 +193,18 @@ pub struct Decoder {
     spare_planes: Vec<Vec<Plane>>,
     /// False only for the `fuzzing` oracle: no frame state is reused.
     pub(crate) reuse: bool,
+    /// True while [`Decoder::decode_temporal_units`] runs frames in parallel: a finished frame
+    /// is queued in `jobs` instead of decoded.
+    batching: bool,
+    /// The frames queued since the last flush, in stream order.
+    jobs: Vec<Job>,
+    /// The batch unit being parsed.
+    parse_unit: usize,
+    /// The frames of the finished units of a batch that failed, for [`Decoder::take_frames`].
+    batch_done: Vec<Frame>,
+    /// The most frames a flush had decoding at once.
+    #[cfg(test)]
+    jobs_peak: usize,
 }
 
 impl Decoder {
@@ -193,6 +252,12 @@ impl Decoder {
             tile_buf: Vec::new(),
             spare_planes: Vec::new(),
             reuse: true,
+            batching: false,
+            jobs: Vec::new(),
+            parse_unit: 0,
+            batch_done: Vec::new(),
+            #[cfg(test)]
+            jobs_peak: 0,
         }
     }
 
@@ -223,6 +288,7 @@ impl Decoder {
         self.ready.clear();
         self.release_ready();
         self.clear_metadata();
+        self.batch_done.clear();
         for obu in ObuIter::new(data, format) {
             if cancel.load(Ordering::Relaxed) {
                 return Err(Error::Cancelled);
@@ -234,6 +300,382 @@ impl Decoder {
             }
         }
         Ok(self.select_output())
+    }
+
+    /// Decodes `units`, consecutive temporal units of one stream, and returns their output
+    /// frames in order: the frames of one [`Decoder::decode_temporal_unit`] call per unit.
+    /// With `Limits::max_threads` 1 that is exactly a loop of those calls.
+    ///
+    /// With more threads the headers are parsed and the reference slots updated in stream order
+    /// on the calling thread, while the pixels of up to `W` frames decode at once, each with
+    /// `max_threads / W` threads (`W * threads <= max_threads`, and `W` is lowered while the
+    /// frames in flight would not fit in `max_alloc`). A frame never reads another frame's
+    /// pixels (every frame is intra with default CDFs), so the output is the same for every
+    /// thread count. A `show_existing_frame` and a sequence header that changes the sequence
+    /// wait for the frames before them. Frames are decoded in groups of at most `max_threads`.
+    ///
+    /// The output frames stay charged against `Limits::max_alloc` until the call returns, so
+    /// pass a few units at a time to stream a long file.
+    ///
+    /// # Errors
+    /// The error the first failing unit would give in a loop of
+    /// [`Decoder::decode_temporal_unit`] calls (the lowest stream position wins, whatever the
+    /// timing). The frames output before it, those of the earlier units included, are returned by
+    /// [`Decoder::take_frames`], and the reference slots are as that loop leaves them.
+    pub fn decode_temporal_units(
+        &mut self,
+        units: &[&[u8]],
+        format: Format,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<Frame>, Error> {
+        self.pending = None;
+        self.ready.clear();
+        self.release_ready();
+        self.clear_metadata();
+        self.batch_done.clear();
+        let mut b = Batch::default();
+        let r = if self.limits.max_threads <= 1 || self.probe_only || self.charge_metadata {
+            self.units_in_turn(units, format, cancel, &mut b)
+        } else {
+            self.batching = true;
+            let r = self.units_batched(units, format, cancel, &mut b);
+            self.batching = false;
+            self.jobs.clear();
+            r
+        };
+        self.ledger.release(b.held);
+        match r {
+            Ok(()) => Ok(b.out),
+            Err(e) => {
+                self.batch_done = b.out;
+                Err(e)
+            }
+        }
+    }
+
+    /// [`Decoder::decode_temporal_units`] as a loop of [`Decoder::decode_temporal_unit`].
+    fn units_in_turn(
+        &mut self,
+        units: &[&[u8]],
+        format: Format,
+        cancel: &AtomicBool,
+        b: &mut Batch,
+    ) -> Result<(), Error> {
+        for unit in units {
+            match self.decode_temporal_unit(unit, format, cancel) {
+                Ok(frames) => self.hold(b, frames)?,
+                Err(e) => {
+                    let partial = self.select_output();
+                    if b.out.try_reserve(partial.len()).is_ok() {
+                        b.out.extend(partial);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds the output frames of a finished unit to the batch and books them on the ledger until
+    /// the call returns.
+    fn hold(&self, b: &mut Batch, frames: Vec<Frame>) -> Result<(), Error> {
+        for f in &frames {
+            let n = crate::avif::frame_bytes(f).saturating_add(frame_overhead(f.planes.capacity()));
+            self.ledger.reserve(n)?;
+            b.held += n;
+        }
+        b.out
+            .try_reserve(frames.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        b.out.extend(frames);
+        Ok(())
+    }
+
+    /// Finishes the units before `to`: their frames, all committed by now, get the layer
+    /// selection (with the sequence header they were decoded under) and go to the batch.
+    fn advance_unit(&mut self, b: &mut Batch, to: usize) -> Result<(), Error> {
+        while b.commit_unit < to {
+            let frames = self.select_output();
+            b.commit_unit += 1;
+            self.hold(b, frames)?;
+        }
+        Ok(())
+    }
+
+    /// The parallel half of [`Decoder::decode_temporal_units`]: parses every OBU in order and
+    /// queues the frames, flushing the queue when it holds `max_threads` frames and before
+    /// anything that reads a decoded frame.
+    fn units_batched(
+        &mut self,
+        units: &[&[u8]],
+        format: Format,
+        cancel: &AtomicBool,
+        b: &mut Batch,
+    ) -> Result<(), Error> {
+        for (u, &unit) in units.iter().enumerate() {
+            self.parse_unit = u;
+            self.pending = None;
+            self.clear_metadata();
+            for obu in ObuIter::new(unit, format) {
+                let r = if cancel.load(Ordering::Relaxed) {
+                    Err(Error::Cancelled)
+                } else {
+                    obu.and_then(|o| self.batch_obu(units, unit, o, cancel, b))
+                };
+                if let Err(e) = r {
+                    return self.batch_failed(units, cancel, b, u, e);
+                }
+            }
+        }
+        if let Err(e) = self.flush(units, cancel, b) {
+            return self.batch_failed(units, cancel, b, units.len().saturating_sub(1), e);
+        }
+        self.advance_unit(b, units.len())
+    }
+
+    /// One OBU of [`Decoder::units_batched`].
+    fn batch_obu(
+        &mut self,
+        units: &[&[u8]],
+        unit: &[u8],
+        obu: Obu<'_>,
+        cancel: &AtomicBool,
+        b: &mut Batch,
+    ) -> Result<(), Error> {
+        if self.is_barrier(&obu) {
+            self.flush(units, cancel, b)?;
+            self.advance_unit(b, self.parse_unit)?;
+        }
+        self.handle_obu(unit, obu, cancel)?;
+        if self.jobs.len() >= self.limits.max_threads {
+            self.flush(units, cancel, b)?;
+        }
+        Ok(())
+    }
+
+    /// True for an OBU that needs the decoded frames before it: a sequence header that starts a
+    /// new coded video sequence (it empties the slots), and a frame header that may be a
+    /// `show_existing_frame` (it reads a slot's planes). A false alarm only flushes early.
+    fn is_barrier(&self, obu: &Obu<'_>) -> bool {
+        match obu.header.obu_type {
+            OBU_SEQUENCE_HEADER => SequenceHeader::parse(obu.payload, self.options.operating_point)
+                .is_ok_and(|new| {
+                    self.seq
+                        .as_ref()
+                        .is_some_and(|old| !same_sequence(old, &new))
+                }),
+            OBU_FRAME_HEADER => {
+                self.seq
+                    .as_ref()
+                    .is_some_and(|s| !s.reduced_still_picture_header)
+                    && obu.payload.first().is_some_and(|byte| byte & 0x80 != 0)
+            }
+            _ => false,
+        }
+    }
+
+    /// An error stopped the batch while parsing unit `u`: decodes the frames queued before it (a
+    /// frame that fails there is the lower stream position, so its error wins), keeps the frames
+    /// of the units before the failing one and its own partial output, and returns the error.
+    fn batch_failed(
+        &mut self,
+        units: &[&[u8]],
+        cancel: &AtomicBool,
+        b: &mut Batch,
+        u: usize,
+        e: Error,
+    ) -> Result<(), Error> {
+        self.spare = None;
+        let e = match self.flush(units, cancel, b) {
+            Err(first) => first,
+            Ok(()) => e,
+        };
+        let last = b.stop_unit.unwrap_or(u);
+        self.advance_unit(b, last)?;
+        let partial = self.select_output();
+        if b.out.try_reserve(partial.len()).is_ok() {
+            b.out.extend(partial);
+        }
+        Err(e)
+    }
+
+    /// Queues a frame whose tiles are all in: the header half of the reference update (7.20)
+    /// happens now, in stream order, the pixels at the next flush.
+    fn queue_frame(
+        &mut self,
+        header: FrameHeader,
+        seq: SequenceHeader,
+        tiles: Vec<TileRange>,
+    ) -> Result<(), Error> {
+        self.jobs.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+        let refs = self.refs.clone();
+        self.refs.update(&header, &seq);
+        // A shown frame takes the metadata before it; a hidden one leaves it for the next.
+        let (metadata, metadata_bytes) = if header.show_frame {
+            (
+                std::mem::take(&mut self.metadata),
+                std::mem::take(&mut self.metadata_bytes),
+            )
+        } else {
+            (Vec::new(), 0)
+        };
+        self.jobs.push(Job {
+            header,
+            seq,
+            unit: self.parse_unit,
+            tiles,
+            refs,
+            metadata,
+            metadata_bytes,
+        });
+        Ok(())
+    }
+
+    /// Decodes the queued frames and commits them in stream order: the slots, the output frames
+    /// and the spare state, as [`Decoder::finish_frame`] does one by one.
+    ///
+    /// The pixels of up to `W` frames decode at once ([`plan`]). When a buffer does not fit in
+    /// `max_alloc` the results are dropped and the frames decode one at a time, each with all the
+    /// threads, so a refusal is the one a loop of single decodes gives. At the first frame that
+    /// fails (the lowest in stream order) the reference state is the one a loop leaves, and the
+    /// frames after it are dropped.
+    fn flush(&mut self, units: &[&[u8]], cancel: &AtomicBool, b: &mut Batch) -> Result<(), Error> {
+        if self.jobs.is_empty() {
+            return Ok(());
+        }
+        let jobs = std::mem::take(&mut self.jobs);
+        let threads = self.limits.max_threads.max(1);
+        let est = jobs
+            .iter()
+            .map(|j| frame_estimate(&j.header))
+            .max()
+            .unwrap_or(1);
+        let (w, t) = plan(threads, jobs.len(), self.ledger.left(), est);
+        let mut done: Vec<Option<Result<FrameState, Error>>> = Vec::new();
+        if w > 1 {
+            let spare = Mutex::new(self.spare.take().filter(|_| self.reuse));
+            let (live, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let ledger = &self.ledger;
+            let results = run_parallel(jobs.len(), w, |i| {
+                let Some(job) = jobs.get(i) else {
+                    return Err(Error::Invalid("batch job out of range"));
+                };
+                peak.fetch_max(live.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+                let data = units.get(job.unit).copied().unwrap_or_default();
+                let spare = spare.lock().unwrap_or_else(|e| e.into_inner()).take();
+                let r = decode_job(ledger, t, job, data, spare, cancel);
+                live.fetch_sub(1, Ordering::Relaxed);
+                Ok(r)
+            })?;
+            #[cfg(test)]
+            {
+                self.jobs_peak = self.jobs_peak.max(peak.load(Ordering::Relaxed));
+            }
+            let refused = results
+                .iter()
+                .any(|r| matches!(r, Err(Error::AllocLimit | Error::OutOfMemory)));
+            if !refused {
+                done = results.into_iter().map(Some).collect();
+            }
+        }
+        let mut done = done.into_iter();
+        for mut job in jobs {
+            // The slots this frame refreshes are emptied first, as in `finish_frame`.
+            let spare_arc = self.empty_slots(&job.header);
+            let fs = match done.next().flatten() {
+                Some(r) => r,
+                None => {
+                    let data = units.get(job.unit).copied().unwrap_or_default();
+                    let spare = self.spare.take().filter(|_| self.reuse);
+                    decode_job(&self.ledger, threads, &job, data, spare, cancel)
+                }
+            };
+            let mut state = match fs {
+                Ok(s) if s.lr_frame.len() == usize::from(job.seq.num_planes) => s,
+                Ok(_) => {
+                    let e = Error::Invalid("frame decode produced no output planes");
+                    return Err(self.job_failed(&job, e, false, b));
+                }
+                Err(e) => return Err(self.job_failed(&job, e, false, b)),
+            };
+            let planes = std::mem::take(&mut state.lr_frame);
+            let stored = match spare_arc {
+                Some(mut a) => match Arc::get_mut(&mut a) {
+                    Some(v) => {
+                        *v = planes;
+                        a
+                    }
+                    None => Arc::new(planes),
+                },
+                None => Arc::new(planes),
+            };
+            state.curr_frame.clear();
+            self.spare = Some(state);
+            let mut tiles = std::mem::take(&mut job.tiles);
+            tiles.clear();
+            self.tile_buf = tiles;
+            for (i, slot) in self.store.iter_mut().enumerate() {
+                if (job.header.refresh_frame_flags >> i) & 1 != 0 {
+                    *slot = Some(stored.clone());
+                }
+            }
+            if job.header.show_frame
+                && let Err(e) = self.commit_output(&mut job, &stored, cancel, b)
+            {
+                return Err(self.job_failed(&job, e, true, b));
+            }
+        }
+        Ok(())
+    }
+
+    /// The output frame of a committed job: its unit's earlier frames are finished first.
+    fn commit_output(
+        &mut self,
+        job: &mut Job,
+        planes: &[WorkPlane],
+        cancel: &AtomicBool,
+        b: &mut Batch,
+    ) -> Result<(), Error> {
+        self.advance_unit(b, job.unit)?;
+        // `make_frame` takes the metadata of the frame, not the live one of the parse position.
+        let live = (
+            std::mem::replace(&mut self.metadata, std::mem::take(&mut job.metadata)),
+            std::mem::replace(&mut self.metadata_bytes, job.metadata_bytes),
+        );
+        let s = Shown::of_header(&job.header, &job.seq);
+        let r = self.make_frame(&s, &job.header, planes, cancel);
+        (self.metadata, self.metadata_bytes) = live;
+        self.ready.push(r?);
+        Ok(())
+    }
+
+    /// A frame failed in a flush: the references are as a loop of single decodes leaves them
+    /// (`updated` once the frame went into the slots), and nothing after it runs.
+    fn job_failed(&mut self, job: &Job, e: Error, updated: bool, b: &mut Batch) -> Error {
+        self.refs = job.refs.clone();
+        if updated {
+            self.refs.update(&job.header, &job.seq);
+        }
+        b.stop_unit = Some(job.unit);
+        self.spare = None;
+        e
+    }
+
+    /// Empties the slots a frame with `h` refreshes (a frame that fails leaves them empty, as in
+    /// dav1d), so the planes no slot keeps any more are free for it. Returns the allocation of
+    /// the last one nobody else holds, for the new frame's planes.
+    fn empty_slots(&mut self, h: &FrameHeader) -> Option<Arc<Vec<WorkPlane>>> {
+        let mut spare_arc = None;
+        for (i, slot) in self.store.iter_mut().enumerate() {
+            if (h.refresh_frame_flags >> i) & 1 != 0
+                && let Some(mut a) = slot.take()
+                && let Some(v) = Arc::get_mut(&mut a)
+            {
+                self.ledger.put_planes(std::mem::take(v));
+                spare_arc = Some(a);
+            }
+        }
+        spare_arc
     }
 
     /// Hands frames returned by this decoder back for reuse: their sample buffers, the plane
@@ -275,22 +717,19 @@ impl Decoder {
         self.ledger.release(std::mem::take(&mut self.ready_bytes));
     }
 
-    /// Books the heap of `frames` (returned by this decoder) on its ledger until the decoder
-    /// drops: the capacity of their sample buffers plus [`frame_overhead`]. [`crate::decode`]
-    /// keeps every frame of the call, so they count against `max_alloc`.
-    pub(crate) fn hold_output(&self, frames: &[Frame]) -> Result<(), Error> {
-        for f in frames {
-            self.ledger.reserve(
-                crate::avif::frame_bytes(f).saturating_add(frame_overhead(f.planes.capacity())),
-            )?;
-        }
-        Ok(())
-    }
-
-    /// The frames of the current temporal unit that were output before an error stopped it.
-    /// After a successful [`Decoder::decode_temporal_unit`] there are none left.
+    /// The frames of the current temporal unit that were output before an error stopped it,
+    /// after those of the earlier units of a failed [`Decoder::decode_temporal_units`]. After a
+    /// successful call there are none left.
     pub fn take_frames(&mut self) -> Vec<Frame> {
-        self.select_output()
+        let mut frames = std::mem::take(&mut self.batch_done);
+        if frames.is_empty() {
+            return self.select_output();
+        }
+        let partial = self.select_output();
+        if frames.try_reserve(partial.len()).is_ok() {
+            frames.extend(partial);
+        }
+        frames
     }
 
     /// The frame facts collected in probe mode.
@@ -497,6 +936,9 @@ impl Decoder {
             .seq
             .clone()
             .ok_or(Error::Invalid("frame without a sequence header"))?;
+        if self.batching {
+            return self.queue_frame(p.header, seq, p.tiles);
+        }
         let h = p.header;
         let mut tiles = p.tiles;
         let mut stored = None;
@@ -504,16 +946,7 @@ impl Decoder {
             // The slots this frame refreshes are emptied first, as dav1d does (a frame that fails
             // leaves them empty), so the planes of a frame no slot keeps any more are free for this
             // one, and its `Arc` holds the new frame.
-            let mut spare_arc = None;
-            for (i, slot) in self.store.iter_mut().enumerate() {
-                if (h.refresh_frame_flags >> i) & 1 != 0
-                    && let Some(mut a) = slot.take()
-                    && let Some(v) = Arc::get_mut(&mut a)
-                {
-                    self.ledger.put_planes(std::mem::take(v));
-                    spare_arc = Some(a);
-                }
-            }
+            let mut spare_arc = self.empty_slots(&h);
             let spare = self.spare.take().filter(|_| self.reuse);
             self.state = Some(FrameState::reuse(spare, &h, &seq, &self.ledger)?);
             let decoded = self.decode_frame_tiles(&h, &seq, data, &tiles, cancel);
@@ -2048,6 +2481,142 @@ mod tests {
             let stop = AtomicBool::new(true);
             let r = decode_frame(fs, &ledger, threads, &h, &seq, &data, &tiles, &stop);
             assert_eq!(r.err(), Some(Error::Cancelled));
+        }
+    }
+
+    /// A temporal unit with one key frame of random tile data (valid syntax or a syntax error),
+    /// and the sequence header when `with_seq`.
+    fn frame_unit(seed: u64, with_seq: bool) -> Vec<u8> {
+        let mut w = BitWriter::default();
+        still_frame_header(&mut w);
+        w.align();
+        let mut payload = w.bytes;
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        for _ in 0..120 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            payload.push((x >> 24) as u8);
+        }
+        let mut v = obu(OBU_TEMPORAL_DELIMITER, &[]);
+        if with_seq {
+            v.extend(obu(OBU_SEQUENCE_HEADER, &still_sequence_header()));
+        }
+        v.extend(obu(OBU_FRAME, &payload));
+        v
+    }
+
+    fn units_of(n: u64) -> Vec<Vec<u8>> {
+        (0..n).map(|i| frame_unit(i + 1, i % 3 == 0)).collect()
+    }
+
+    /// `decode_temporal_units` with `threads` threads: the frames (the ones before an error
+    /// too), the error and the decoder.
+    fn run_batch(
+        units: &[Vec<u8>],
+        threads: usize,
+        max_alloc: usize,
+    ) -> (Vec<Frame>, Option<Error>, Decoder) {
+        let limits = Limits {
+            max_threads: threads,
+            max_alloc,
+            ..Limits::default()
+        };
+        let mut d = Decoder::new(Options::default(), limits);
+        let units: Vec<&[u8]> = units.iter().map(Vec::as_slice).collect();
+        match d.decode_temporal_units(&units, Format::Section5, &cancel()) {
+            Ok(f) => (f, None, d),
+            Err(e) => {
+                let f = d.take_frames();
+                (f, Some(e), d)
+            }
+        }
+    }
+
+    /// The reference: one `decode_temporal_unit` call per unit, one thread.
+    fn run_loop(units: &[Vec<u8>]) -> (Vec<Frame>, Option<Error>, Decoder) {
+        let limits = Limits {
+            max_threads: 1,
+            ..Limits::default()
+        };
+        let mut d = Decoder::new(Options::default(), limits);
+        let mut frames = Vec::new();
+        for u in units {
+            match d.decode_temporal_unit(u, Format::Section5, &cancel()) {
+                Ok(f) => frames.extend(f),
+                Err(e) => {
+                    frames.extend(d.take_frames());
+                    return (frames, Some(e), d);
+                }
+            }
+        }
+        (frames, None, d)
+    }
+
+    #[test]
+    fn batch_is_the_same_as_a_loop_of_units_for_every_thread_count() {
+        let ok = units_of(10);
+        let mut truncated = ok.clone();
+        truncated[6] = [obu(OBU_TEMPORAL_DELIMITER, &[]), obu(OBU_FRAME, &[0x00])].concat();
+        let mut no_frame = ok.clone();
+        no_frame[4] = obu(OBU_TEMPORAL_DELIMITER, &[]);
+        let (mut frames, mut errors) = (0, 0);
+        for units in [&ok, &truncated, &no_frame] {
+            let (want, want_err, want_d) = run_loop(units);
+            frames += want.len();
+            errors += usize::from(want_err.is_some());
+            for threads in [0, 1, 2, 3, 8] {
+                let (got, err, d) = run_batch(units, threads, 64 << 20);
+                assert_eq!(got, want, "{threads} threads");
+                assert_eq!(err, want_err, "{threads} threads");
+                assert_eq!(d.refs, want_d.refs, "{threads} threads");
+                let held = |d: &Decoder| d.store.each_ref().map(|s| s.is_some());
+                assert_eq!(held(&d), held(&want_d), "{threads} threads");
+            }
+        }
+        // The streams decode some frames and the broken one fails: the test compares something.
+        assert!(frames > 0);
+        assert!(errors > 0);
+    }
+
+    #[test]
+    fn plan_stays_within_max_threads() {
+        for max_threads in 0..=17 {
+            for queued in 0..=20 {
+                for left in [0, 1 << 10, 5 << 20, usize::MAX] {
+                    let (w, t) = plan(max_threads, queued, left, 2 << 20);
+                    assert!(w >= 1 && t >= 1);
+                    assert!(w * t <= max_threads.max(1));
+                    assert!(w <= queued.max(1));
+                }
+            }
+        }
+        assert_eq!(plan(16, 16, usize::MAX, 1), (16, 1));
+        assert_eq!(plan(16, 8, usize::MAX, 1), (8, 2));
+        assert_eq!(plan(16, 16, 3 << 20, 2 << 20), (1, 16));
+        assert_eq!(plan(1, 16, usize::MAX, 1), (1, 1));
+    }
+
+    #[test]
+    fn batch_frames_in_flight_stay_within_max_threads_and_max_alloc() {
+        let units = units_of(8);
+        for threads in [2, 3, 8] {
+            let (_, _, d) = run_batch(&units, threads, 64 << 20);
+            assert!(d.jobs_peak <= threads, "{threads} threads");
+        }
+        // W frames in flight hold W frame states: the peak is above one frame's at a time.
+        let (_, one_err, one) = run_batch(&units, 1, 64 << 20);
+        let (_, eight_err, eight) = run_batch(&units, 8, 64 << 20);
+        if one_err.is_none() && eight_err.is_none() {
+            assert!(eight.ledger.peak() > one.ledger.peak());
+        }
+        // Whatever the limit, the peak stays within it, and a refusal is `AllocLimit`.
+        for max_alloc in [2 << 10, 64 << 10, 256 << 10, 1 << 20, 4 << 20] {
+            for threads in [2, 8] {
+                let (_, e, d) = run_batch(&units, threads, max_alloc);
+                assert!(d.ledger.peak() <= max_alloc as u64, "{max_alloc} {threads}");
+                assert_ne!(e, Some(Error::OutOfMemory));
+            }
         }
     }
 }

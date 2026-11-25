@@ -30,8 +30,35 @@ crate denies `unsafe` outside `src/simd` (docs/safety.md).
   `every_tier_and_thread_count_matches_the_reference` checks 1, 2, 3 threads against the
   whole-frame noise image of the spec.
 
-Not parallel: the OBU parse, output. Frames of a stream decode one after another (a
-later frame may reference an earlier one). The stages of a frame run one after another: a stage
+- **Frames of a batch** (`decoder.rs`, `Decoder::decode_temporal_units`, used by `decode` and the
+  oracle). Every frame this crate decodes is intra with `primary_ref_frame` NONE: its CDFs are the
+  defaults for `base_q_idx`, the loop filter deltas and segmentation start from the defaults (no
+  segment map or feature data is loaded from a slot), film grain parameters are always updated
+  (never loaded), and intra block copy reads only its own frame. So the pixels of a frame are a
+  function of the sequence header, its own header and its tile bytes. Only header state crosses
+  frames (`RefState`: valid flags, order hints, frame ids, the sizes `show_existing_frame` reads).
+  The batch parses OBUs in stream order on the calling thread, runs the header half of the
+  reference update right after each frame header (`queue_frame`), and queues the frame. When
+  `max_threads` frames are queued (or a barrier comes, or the batch ends) `flush` decodes them:
+  `W = min(max_threads, queued, free max_alloc / estimate of one frame)` frames at a time
+  (`plan`), each with `max(1, max_threads / W)` threads, so `W x threads <= max_threads`
+  (`run_parallel`, with every frame's result kept so the frames below a failure still commit).
+  Results are then committed in stream order: slots, output frame (film grain, the `u8`
+  conversion), the layer selection per unit. Barriers flush first: a `show_existing_frame` (it
+  reads a slot's planes) and a sequence header that changes the sequence (it empties the slots).
+  The frame that fails first in stream order wins: its error is returned, the `RefState` is the
+  copy taken right after its header was parsed (what a loop of `decode_temporal_unit` calls
+  leaves), the slots it refreshes are empty, and the frames after it are dropped; the frames
+  before it, those of earlier units included, are in `take_frames`. When any frame of a flush
+  hits `AllocLimit` or `OutOfMemory`, the results are dropped and the flush decodes its frames
+  one at a time with all the threads, which is exactly the single decode path, so a refusal is
+  the one a loop gives. With `max_threads = 1` the batch is a loop of `decode_temporal_unit`.
+  Differences from the loop that are not visible in the output: the slots a frame refreshes are
+  emptied when the frame is committed, not before its tiles decode, so the old planes are held a
+  little longer; and `W` frame states are alive at once (docs/limits.md).
+
+Not parallel: the OBU parse, the commit of the output. Frames decode one after another in
+`decode_temporal_unit` (only `decode_temporal_units` overlaps frames). The stages of a frame run one after another: a stage
 starts when every item of the one before has finished (no row pipelining between stages).
 
 ## The schedulers
@@ -181,8 +208,16 @@ buffers and the tile states' planes come from the pool when it holds one of the 
   `wrapup_threads_stay_within_max_alloc` checks the ledger peak for `max_alloc` from 1 KiB up and
   1, 2, 3, 8 threads, and that every byte is released; `team_size_stays_within_max_threads`;
   `wrapup_threads_honour_the_cancel_flag`.
-- The fuzz target `simd_threads` (docs/fuzzing.md) runs `wrapup_frame` on any input with 1, 2
-  and 3 threads and asserts the same output.
+- `decoder.rs`, batches: `batch_is_the_same_as_a_loop_of_units_for_every_thread_count` decodes
+  streams of key frames (valid, with a truncated unit, with an empty unit) with
+  `decode_temporal_units` at 0, 1, 2, 3 and 8 threads and compares the frames, the error, the
+  `RefState` and which slots hold a frame with a loop of `decode_temporal_unit`;
+  `plan_stays_within_max_threads` (`W x threads <= max_threads`);
+  `batch_frames_in_flight_stay_within_max_threads_and_max_alloc` (frames decoding at once, the
+  ledger peak above one frame's with 8 threads and within `max_alloc` for several limits).
+- The fuzz targets `simd_threads` and `frames_threads` (docs/fuzzing.md): `simd_threads` runs
+  `wrapup_frame` on any input with 1, 2 and 3 threads and asserts the same output;
+  `frames_threads` runs the batch at 1, 2, 3 and 8 threads against a loop of units.
 - There is no tile corpus in the unit tests (no fixtures in `tests/`). The corpus check is the parity
   gate (docs/parity.md): it compares `--threads 1` with the default threads on every stream,
   including the non-uniform tiling ones, against dav1d.
