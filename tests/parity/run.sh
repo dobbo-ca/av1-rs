@@ -4,16 +4,16 @@
 # the corpus in /data (/data.list).
 #   run.sh full <report-dir>   av1-rs vs dav1d (every stream), aomdec and the published per-frame
 #                              md5 (libaom vectors), the AVIF files vs avifdec and avifdec-new,
-#                              --threads 1 vs default threads, and the scalar and AVX2 SIMD
-#                              tiers vs the best tier (AV1_SIMD)
-#   run.sh ref <out-dir>       av1-oracle, one thread, on the arm64 subset
-#   run.sh arm <ref-dir>       av1-oracle-arm64 under qemu on the same subset vs <ref-dir>
+#                              --threads 1 vs default threads, and the lower SIMD tiers vs the
+#                              best tier (AV1_SIMD; scalar and AVX2 on x86_64, scalar on
+#                              aarch64, where the best tier is NEON)
 #   run.sh seeds <dst>         the corpus as fuzz seeds, one option byte (0x00) appended
 # PARITY_MODE (default: the word in tests/parity/mode): `info` (headers only: frame sizes and counts against dav1d's y4m) or `pixels`
 # (every output plane byte-exact). Exit status 0 only when every gate passes.
 set -u
 W=/work
 MODE=${PARITY_MODE:-$(cat tests/parity/mode)}
+TIERS="scalar avx2"; [ "$(uname -m)" = aarch64 ] && TIERS=scalar
 
 # inputs <dst> [pattern]: link the corpus files into <dst>, flattened (/ -> __). A file whose
 # name says annexb gets the .annexb extension, so the oracle reads it as Annex B.
@@ -110,7 +110,7 @@ full() {
   av1-oracle $flag --threads 1 $W/in $W/r1 || bad=1
   av1-oracle $flag $W/in $W/rn || bad=1
   # Every lower SIMD tier (src/simd) must give the output of the best tier (r1), byte for byte.
-  for t in scalar avx2; do
+  for t in $TIERS; do
     AV1_SIMD=$t av1-oracle $flag --threads 1 $W/in $W/t-$t || bad=1
   done
   : > $W/d-dav1d; : > $W/d-aom; : > $W/d-md5; : > $W/d-err; : > $W/d-avif
@@ -216,7 +216,7 @@ full() {
   [ "$frames" -ge 604 ] || echo "only $frames frames compared against dav1d, want at least 604" >> $W/d-err
   diff -r $W/r1 $W/rn > $W/d-threads
   : > $W/d-tiers
-  for t in scalar avx2; do diff -r $W/r1 $W/t-$t >> $W/d-tiers; done
+  for t in $TIERS; do diff -r $W/r1 $W/t-$t >> $W/d-tiers; done
   {
     echo "## av1-rs parity ($MODE)"
     echo
@@ -236,27 +236,6 @@ full() {
   echo "Stop classes (av1-rs .err, one thread): $(for e in $W/r1/*.err; do [ -f "$e" ] && printf '%s\n' "$(cat "$e")"; done | sort | uniq -c | tr -s ' \n' ' ')" >> "$REP/summary.md"
   cat "$REP/summary.md"
   return $bad
-}
-
-SUBSET='size-(16x16|66x66|196x196|226x226)|quantizer-(00|31|63)|monochrome|film_grain-50|allintra|features__(annexb|section5)|fox\.profile2\.12bpc\.yuv(422\.odd-width\.odd-height|444)\.avif|fox\.profile1\.10bpc\.yuv444\.odd-width|422_oddwidth'
-
-ref() {
-  rm -rf $W; mkdir -p $W/in "$1"
-  inputs $W/in "$SUBSET"
-  flag=; [ "$MODE" = info ] && flag=--info
-  av1-oracle $flag --threads 1 $W/in "$1"
-}
-
-arm() {
-  rm -rf $W; mkdir -p $W/in $W/arm
-  inputs $W/in "$SUBSET"
-  flag=; [ "$MODE" = info ] && flag=--info
-  qemu-aarch64 -L /usr/aarch64-linux-gnu "$(command -v av1-oracle-arm64)" $flag --threads 1 $W/in $W/arm || exit 1
-  # The scalar tier on aarch64 too (the NEON tier is the default run above).
-  AV1_SIMD=scalar qemu-aarch64 -L /usr/aarch64-linux-gnu "$(command -v av1-oracle-arm64)" $flag --threads 1 $W/in $W/arm-scalar || exit 1
-  diff -r "$1" $W/arm-scalar || exit 1
-  [ "$(ls $W/in | wc -l)" -ge 55 ] || { echo "arm64 subset has only $(ls $W/in | wc -l) streams, want at least 55" >&2; exit 1; }
-  diff -r "$1" $W/arm && echo "arm64 matches x86_64 on $(ls $W/in | wc -l) streams"
 }
 
 seeds() {
@@ -279,8 +258,6 @@ seeds() {
 
 case ${1:-} in
   full) full "$2" ;;
-  ref) ref "$2" ;;
-  arm) arm "$2" ;;
   seeds) seeds "$2" ;;
-  *) echo "usage: run.sh full|ref|arm|seeds <dir>" >&2; exit 2 ;;
+  *) echo "usage: run.sh full|seeds <dir>" >&2; exit 2 ;;
 esac

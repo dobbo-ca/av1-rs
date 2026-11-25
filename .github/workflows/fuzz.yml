@@ -1,6 +1,6 @@
 name: fuzz
 on:
-  # The 14 standard slots are full; new crates take day x 12:23 UTC (png-rs Wed, exif-rs Sun, av1-rs Thu).
+  # Weekly, Thursday 12:23 UTC.
   schedule: [{ cron: '23 12 * * 4' }]
   workflow_dispatch:
     inputs:
@@ -8,7 +8,7 @@ on:
         description: Seconds per target
         default: '600'
       only:
-        description: Run only this target (empty = all; a simd_* target runs in fuzz-arm64 too)
+        description: Run only this target (empty = all; a simd_* target runs on arm64 too)
         default: ''
 permissions:
   contents: read
@@ -17,11 +17,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 jobs:
+  # One matrix entry per target on x86_64 (ubuntu-24.04), and one more per cross-tier target
+  # (simd_*) on aarch64 (ubuntu-24.04-arm), so the NEON tier is compared with scalar. p is the
+  # name prefix of the arm64 corpus cache and artifacts.
   plan:
-    runs-on: github-arc-runner-set
+    runs-on: ubuntu-24.04
     outputs:
-      targets: ${{ steps.p.outputs.targets }}
-      simd: ${{ steps.p.outputs.simd }}
+      matrix: ${{ steps.p.outputs.matrix }}
     steps:
       - id: p
         env:
@@ -32,26 +34,28 @@ jobs:
             '') list=$all ;;
             *) case " $all " in *" $ONLY "*) list=$ONLY ;; *) echo "unknown target $ONLY" >&2; exit 1 ;; esac ;;
           esac
-          json() { echo "[$(echo $* | sed 's/[a-z_][a-z_]*/"&"/g; s/" "/","/g')]"; }
-          echo "targets=$(json $list)" >> "$GITHUB_OUTPUT"
-          # The cross-tier targets, for fuzz-arm64.
-          echo "simd=$(json $(for t in $list; do case $t in (simd_*) echo $t ;; esac; done))" >> "$GITHUB_OUTPUT"
+          inc=
+          for t in $list; do
+            inc="$inc{\"target\":\"$t\",\"arch\":\"x86_64\",\"os\":\"ubuntu-24.04\",\"p\":\"\"},"
+            case $t in simd_*) inc="$inc{\"target\":\"$t\",\"arch\":\"arm64\",\"os\":\"ubuntu-24.04-arm\",\"p\":\"arm64-\"}," ;; esac
+          done
+          echo "matrix={\"include\":[${inc%,}]}" >> "$GITHUB_OUTPUT"
   fuzz:
     needs: plan
-    runs-on: github-arc-runner-set
+    name: fuzz ${{ matrix.arch }} ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      # The ARC runners are shared (kleio CI too): two fuzz jobs at a time, at most.
-      max-parallel: 2
-      matrix:
-        target: ${{ fromJSON(needs.plan.outputs.targets) }}
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     timeout-minutes: 60
     env:
       MAX_TOTAL_TIME: ${{ inputs.max_total_time || '600' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { lfs: false }
-      - id: app
+      - name: Create isobmff-rs read token (dobbo-ca-ci-read app)
+        id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ vars.CI_READ_APP_ID }}
@@ -59,10 +63,11 @@ jobs:
           owner: dobbo-ca
           repositories: isobmff-rs
           permission-contents: read
+      - name: Free disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc && df -h /
+      # ASan cannot map its shadow memory with the 32-bit mmap randomisation of recent kernels.
+      - run: sudo sysctl -w vm.mmap_rnd_bits=28 || true
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        with:
-          driver: remote
-          endpoint: tcp://buildkitd.github-arc.svc.cluster.local:1234
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -71,17 +76,20 @@ jobs:
           load: true
           push: false
           tags: av1-fuzz:local
-          cache-from: type=gha,scope=av1-rs-fuzz
-          cache-to: type=gha,mode=max,scope=av1-rs-fuzz
+          cache-from: type=gha,scope=av1-rs-fuzz-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=av1-rs-fuzz-${{ matrix.arch }}
           secrets: |
             gh_token=${{ steps.app.outputs.token }}
       # The corpus is kept between runs: restored here, copied into the container, copied back
-      # out and saved, so a run goes on from where the last one stopped. One cache per target.
+      # out and saved, so a run goes on from where the last one stopped. One cache per target
+      # and architecture; a first arm64 run starts from the x86_64 corpus of the same target.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: corpus
-          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
-          restore-keys: fuzz-corpus-${{ matrix.target }}-
+          key: fuzz-corpus-${{ matrix.p }}${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.p }}${{ matrix.target }}-
+            fuzz-corpus-${{ matrix.target }}-
       # docker create + start, not a RUN layer: a BuildKit cache hit would skip the fuzzing.
       # Seeds: the parity corpus (tests/fuzz/seeds, copied in the image build) and the
       # fuzz-grown files; new inputs go to the first corpus dir.
@@ -96,7 +104,7 @@ jobs:
       - if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: crashers-${{ matrix.target }}
+          name: crashers-${{ matrix.p }}${{ matrix.target }}
           path: crashers
       - if: always()
         run: docker cp fuzz:/src/tests/fuzz/corpus/${{ matrix.target }}/. corpus/${{ matrix.target }}/ || true
@@ -104,94 +112,11 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: corpus
-          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          key: fuzz-corpus-${{ matrix.p }}${{ matrix.target }}-${{ github.run_id }}
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: corpus-${{ matrix.target }}
-          path: corpus/${{ matrix.target }}
-          retention-days: 14
-          if-no-files-found: ignore
-
-  # The cross-tier targets (simd_*) built for aarch64 and run under qemu-user (Dockerfile stage
-  # fuzz-arm64), so the NEON tier is compared with scalar. No sanitizer (ASan does not run under
-  # qemu-user), so -malloc_limit_mb has no malloc hook here; -rss_limit_mb still holds. It runs
-  # after the x86_64 matrix (crash or not), so the shared runners see two fuzz jobs at most.
-  fuzz-arm64:
-    needs: [plan, fuzz]
-    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.simd != '[]' }}
-    runs-on: github-arc-runner-set
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        target: ${{ fromJSON(needs.plan.outputs.simd) }}
-    timeout-minutes: 60
-    env:
-      MAX_TOTAL_TIME: ${{ inputs.max_total_time || '600' }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with: { lfs: false }
-      - id: app
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          app-id: ${{ vars.CI_READ_APP_ID }}
-          private-key: ${{ secrets.CI_READ_APP_KEY }}
-          owner: dobbo-ca
-          repositories: isobmff-rs
-          permission-contents: read
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        with:
-          driver: remote
-          endpoint: tcp://buildkitd.github-arc.svc.cluster.local:1234
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: .github/ci/Dockerfile
-          target: fuzz-arm64
-          load: true
-          push: false
-          tags: av1-fuzz-arm64:local
-          cache-from: type=gha,scope=av1-rs-fuzz-arm64
-          cache-to: type=gha,mode=max,scope=av1-rs-fuzz-arm64
-          secrets: |
-            gh_token=${{ steps.app.outputs.token }}
-      # Own corpus cache; a first run starts from the x86_64 corpus of the same target.
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: corpus
-          key: fuzz-corpus-arm64-${{ matrix.target }}-${{ github.run_id }}
-          restore-keys: |
-            fuzz-corpus-arm64-${{ matrix.target }}-
-            fuzz-corpus-${{ matrix.target }}-
-      # qemu-user 7.2 keeps about 280 KB of RSS per guest thread after the thread exits, and
-      # simd_threads spawns three per exec, so that target runs as processes of at most 1800
-      # execs each (the corpus carries over), restarted until MAX_TOTAL_TIME is used up
-      # (docs/fuzzing.md). Every other target is one process, as before.
-      - run: |
-          mkdir -p corpus/${{ matrix.target }}
-          docker create --name fuzz -e MAX_TOTAL_TIME -e TARGET=${{ matrix.target }} av1-fuzz-arm64:local \
-            sh -c 'mkdir -p tests/fuzz/artifacts/$TARGET && end=$(($(date +%s) + MAX_TOTAL_TIME)) && runs=-1 && if [ $TARGET = simd_threads ]; then runs=1800; fi && while left=$((end - $(date +%s))); [ $left -gt 0 ]; do qemu-aarch64 -L /usr/aarch64-linux-gnu tests/fuzz/target/aarch64-unknown-linux-gnu/release/$TARGET -artifact_prefix=tests/fuzz/artifacts/$TARGET/ tests/fuzz/corpus/$TARGET -runs=$runs -max_total_time=$left -timeout=60 -rss_limit_mb=2048 -malloc_limit_mb=512 || exit 1; done'
-          docker cp corpus fuzz:/src/tests/fuzz/
-          docker start -a fuzz
-      - if: failure() || cancelled()
-        run: docker cp fuzz:/src/tests/fuzz/artifacts/${{ matrix.target }} ./crashers
-      - if: failure() || cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: crashers-arm64-${{ matrix.target }}
-          path: crashers
-      - if: always()
-        run: docker cp fuzz:/src/tests/fuzz/corpus/${{ matrix.target }}/. corpus/${{ matrix.target }}/ || true
-      - if: always()
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: corpus
-          key: fuzz-corpus-arm64-${{ matrix.target }}-${{ github.run_id }}
-      - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: corpus-arm64-${{ matrix.target }}
+          name: corpus-${{ matrix.p }}${{ matrix.target }}
           path: corpus/${{ matrix.target }}
           retention-days: 14
           if-no-files-found: ignore

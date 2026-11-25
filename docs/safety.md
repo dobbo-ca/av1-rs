@@ -31,10 +31,12 @@ bit for bit. CI checks this four ways:
 - Unit tests per kernel family compare every available tier with scalar on many
   pseudo-random inputs (own xorshift) and on the edge sizes and values.
 - `cargo test` runs three times in `test` (best tier, `AV1_SIMD=scalar`, `AV1_SIMD=avx2`) and
-  twice under qemu in `arm64` (NEON, scalar).
+  twice natively on an arm64 runner in `arm64` (NEON, scalar). The hosted x86_64 runners do not
+  all have AVX-512: the best tier there is AVX-512 or AVX2, whichever the CPU has (the job log
+  prints it), so the AVX-512 tier is exercised only on a runner that has it.
 - The parity gate decodes the corpus with the best tier against dav1d and aomdec, and with the
-  scalar and AVX2 tiers against the best tier (gate `tiers`); parity-arm64 compares NEON and
-  scalar on aarch64 with x86_64.
+  scalar and AVX2 tiers against the best tier (gate `tiers`); parity-arm64 runs the same gate
+  natively on aarch64 (NEON against dav1d and aomdec, scalar against NEON).
 - A cross-tier fuzz target per kernel family (docs/fuzzing.md).
 
 ### Layout of a kernel family

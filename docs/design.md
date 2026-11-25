@@ -28,7 +28,7 @@ code kept as the oracle.
 lib.rs        public API: decode(), Decoder, Frame, Plane, Options, Format; crate docs
 error.rs      Error (one enum; limit errors are distinct variants)
 limits.rs     Limits { max_alloc, max_threads, max_width, max_height, max_pixels, ... }
-ledger.rs     max_alloc ledger (charge on allocate, release on drop), as png-rs
+ledger.rs     max_alloc ledger (charge on allocate, release on drop)
 consts.rs     spec constants (section 3) and enum values
 bits.rs       BitReader: f(n), uvlc, le(n), leb128, su(n), ns(n), byte alignment (spec 4.10, 8.1)
 obu.rs        OBU framing: low-overhead (section 5) and Annex B; OBU header, extension,

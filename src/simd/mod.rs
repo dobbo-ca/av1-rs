@@ -114,17 +114,29 @@ pub(crate) fn best() -> Simd {
 mod tests {
     use super::*;
 
-    /// The CI runners have AVX-512 (x86_64) and NEON (aarch64 under qemu); a lost detection
-    /// would silently test only the scalar code.
+    /// The CI runners have AVX2 (x86_64; AVX-512 only on some of them) and NEON (aarch64); a
+    /// lost detection would silently test only the scalar code. Where /proc/cpuinfo exists, the
+    /// AVX-512 tier must be there exactly when it lists the five features.
     #[test]
     fn simd_is_detected() {
         let a: Vec<Tier> = available().iter().map(|s| s.tier()).collect();
         assert_eq!(a[0], Tier::Scalar);
         #[cfg(target_arch = "x86_64")]
-        assert!(
-            a.contains(&Tier::Avx2) && a.contains(&Tier::Avx512),
-            "{a:?}"
-        );
+        {
+            assert!(a.contains(&Tier::Avx2), "{a:?}");
+            if let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") {
+                let flags: Vec<&str> = info
+                    .lines()
+                    .find(|l| l.starts_with("flags"))
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .collect();
+                let avx512 = ["avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512cd"]
+                    .iter()
+                    .all(|f| flags.contains(f));
+                assert_eq!(a.contains(&Tier::Avx512), avx512, "{a:?}");
+            }
+        }
         #[cfg(target_arch = "aarch64")]
         assert!(a.contains(&Tier::Neon), "{a:?}");
     }

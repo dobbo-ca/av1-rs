@@ -2,6 +2,20 @@
 
 `Limits` (src/limits.rs) caps one call; every public entry point takes it.
 
+In short (moved from the README): `max_alloc` is the enforced peak working memory of one decoder
+or one `decode_avif` call, all threads included: frame buffers, film grain buffers and the output
+frames of a temporal unit (and every frame `decode` collects) are charged before allocation and
+released on drop. Not counted: frames already returned by `Decoder` (buffers handed back with
+`Decoder::recycle` are charged again while the decoder keeps them, and dropped when they do not
+fit), the item bytes inside `isobmff` (an eighth of `max_alloc` for the parse and one for the
+reads), and the stacks of the up to `max_threads - 1` threads a call spawns (std default size);
+`max_metadata` is on top. `max_threads = 1` spawns no thread; otherwise the tiles and in-loop
+filters of a frame (one scope of threads per frame, no pool kept between calls) and the tiles of
+an AVIF grid decode on up to `max_threads` threads, and film grain runs in bands of 32 rows on up
+to `max_threads` threads, with the same output. `decode` and `Decoder::decode_temporal_units`
+decode the frames of several temporal units at once (up to `max_threads` frames, each with
+`max_threads` divided by that many threads), and charge their output until they return.
+
 - `max_width`, `max_height`, `max_pixels`: checked on the frame size of each frame header (and
   the sequence header maximums) before any frame buffer is allocated.
 - `max_alloc`: a ledger (src/ledger.rs) charges every buffer that scales with the input (frame

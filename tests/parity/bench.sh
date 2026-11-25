@@ -3,10 +3,18 @@
 # x86-64-v4 build) decode the same frames of each bench class (tests/parity/bench-lib.sh), with
 # one thread and with the default threads, in one container. Information only: there is no speed
 # bar (docs/benchmarks.md). Wall time of the whole class, best of 5. No decoder writes samples.
+# On aarch64: dav1d (with its NEON asm and with --cpumask none) and av1-rs with AV1_SIMD=scalar
+# and with NEON, no aomdec and no v4 build.
 set -u
 W=/work
 REP=$1
 NT=$(nproc)
+ARCH=$(uname -m)
+CPU=$(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -n 1)
+# The v4 build and the avx512 tier need AVX-512 (F, BW, VL, DQ, CD); not every hosted x86_64
+# runner has it.
+AVX512=yes
+for f in avx512f avx512bw avx512vl avx512dq avx512cd; do grep -qw "$f" /proc/cpuinfo || AVX512=; done
 . tests/parity/bench-lib.sh
 rm -rf $W; mkdir -p "$REP" $W
 : > "$REP/failures.txt"
@@ -40,9 +48,11 @@ each() {
   done
 }
 dav() { dav1d -q --threads "$1" --limit "$3" -i "$2" -o /dev/null --muxer null; }
+davc() { dav1d -q --cpumask none --threads "$1" --limit "$3" -i "$2" -o /dev/null --muxer null; }
 aom() { aomdec --rawvideo --threads="$1" --limit="$3" -o /dev/null "$2"; }
 rs() { "$1" --null --threads "$2" "$W/c/$3" $W/o; }
-ratio() { [ "${2:-0}" -gt 0 ] && echo "$(($1 * 100 / $2))%" || echo "-"; }
+num() { case ${1:-} in '' | *[!0-9]*) return 1 ;; esac; }
+ratio() { num "$1" && num "$2" && [ "$2" -gt 0 ] && echo "$(($1 * 100 / $2))%" || echo "-"; }
 
 table() {
   tn=$1 dt=$2 at=$3
@@ -51,10 +61,12 @@ table() {
   sd=0 sa=0 sr=0 sv=0
   for c in $CLASSES; do
     d=$(best each $c dav $dt); a=$(best each $c aom $at)
-    r=$(best rs av1-oracle $tn $c); v=$(best rs av1-oracle-v4 $tn $c)
-    sd=$((sd + d)) sa=$((sa + a)) sr=$((sr + r)) sv=$((sv + v))
+    r=$(best rs av1-oracle $tn $c)
+    v=-; [ -n "$AVX512" ] && v=$(best rs av1-oracle-v4 $tn $c) && sv=$((sv + v))
+    sd=$((sd + d)) sa=$((sa + a)) sr=$((sr + r))
     echo "| $c | $(ls $W/c/$c | wc -l) | $(cat $W/f/$c/*.frames 2>/dev/null | wc -l) | $d | $a | $r | $v | $(ratio $r $d) | $(ratio $v $d) | $(ratio $r $a) |"
   done
+  [ -n "$AVX512" ] || sv=-
   echo "| all | | | $sd | $sa | $sr | $sv | $(ratio $sr $sd) | $(ratio $sv $sd) | $(ratio $sr $sa) |"
 }
 
@@ -65,27 +77,58 @@ tiers() {
   for c in $CLASSES; do
     export AV1_SIMD=scalar; s=$(best rs av1-oracle 1 $c)
     export AV1_SIMD=avx2; x=$(best rs av1-oracle 1 $c)
-    unset AV1_SIMD; z=$(best rs av1-oracle 1 $c)
+    unset AV1_SIMD; z=-; [ -n "$AVX512" ] && z=$(best rs av1-oracle 1 $c)
     echo "| $c | $s | $x | $z | $(ratio $x $s) | $(ratio $z $x) |"
   done
+}
+
+# neon <av1-rs threads> <dav1d threads>: aarch64, dav1d with and without its asm, av1-rs scalar
+# and NEON (the best tier).
+neon() {
+  tn=$1 dt=$2
+  echo "| class | streams | frames | dav1d ms | dav1d C ms | av1-rs scalar ms | av1-rs neon ms | neon / scalar | neon / dav1d | dav1d / dav1d C |"
+  echo "|---|---|---|---|---|---|---|---|---|---|"
+  sd=0 sc=0 ss=0 sn=0
+  for c in $CLASSES; do
+    d=$(best each $c dav $dt); dc=$(best each $c davc $dt)
+    export AV1_SIMD=scalar; s=$(best rs av1-oracle $tn $c)
+    unset AV1_SIMD; n=$(best rs av1-oracle $tn $c)
+    sd=$((sd + d)) sc=$((sc + dc)) ss=$((ss + s)) sn=$((sn + n))
+    echo "| $c | $(ls $W/c/$c | wc -l) | $(cat $W/f/$c/*.frames 2>/dev/null | wc -l) | $d | $dc | $s | $n | $(ratio $n $s) | $(ratio $n $d) | $(ratio $d $dc) |"
+  done
+  echo "| all | | | $sd | $sc | $ss | $sn | $(ratio $sn $ss) | $(ratio $sn $sd) | $(ratio $sd $sc) |"
 }
 
 {
   echo "## av1-rs bench (information only)"
   echo
-  echo "Classes: tests/parity/bench-lib.sh. Best of 5 wall times; no decoder writes samples. av1-rs v4: built with -C target-cpu=x86-64-v4, fat LTO and panic=abort."
+  echo "$ARCH, ${CPU:-unknown CPU}, $NT threads (nproc). Classes: tests/parity/bench-lib.sh. Best of 5 wall times; no decoder writes samples."
   echo
-  echo "### 1 thread"
-  echo
-  table 1 1 1
-  echo
-  echo "### default threads ($NT)"
-  echo
-  table $NT 0 $NT
-  echo
-  echo "### SIMD tiers (av1-rs default build, 1 thread)"
-  echo
-  tiers
+  if [ "$ARCH" = aarch64 ]; then
+    echo "dav1d C: dav1d --cpumask none (its C code, no NEON asm). av1-rs scalar: AV1_SIMD=scalar."
+    echo
+    echo "### 1 thread"
+    echo
+    neon 1 1
+    echo
+    echo "### default threads ($NT)"
+    echo
+    neon $NT 0
+  else
+    echo "av1-rs v4: built with -C target-cpu=x86-64-v4, fat LTO and panic=abort.$([ -n "$AVX512" ] || echo " This CPU has no AVX-512: no v4 times and no avx512 tier.")"
+    echo
+    echo "### 1 thread"
+    echo
+    table 1 1 1
+    echo
+    echo "### default threads ($NT)"
+    echo
+    table $NT 0 $NT
+    echo
+    echo "### SIMD tiers (av1-rs default build, 1 thread)"
+    echo
+    tiers
+  fi
 } > "$REP/summary.md"
 [ -s "$REP/failures.txt" ] && { echo; echo "WARNING: a command failed, its times are not meaningful:"; sed 's/^/    /' "$REP/failures.txt"; } >> "$REP/summary.md"
 cat "$REP/summary.md"
