@@ -4,7 +4,7 @@
 #   run:  where av1-oracle-prof (debug line tables, frame pointers) spends its time with one
 #         thread, per class and over all classes: perf when the container may use it, else
 #         callgrind. Reports: <class>.srcfile.txt (self time by source file),
-#         <class>.symbol.txt, all.srcline.txt, summary.md.
+#         <class>.symbol.txt, all.srcline.txt, all.memcallers.txt (callers of mem*), summary.md.
 set -u
 W=/work
 B=/bench
@@ -38,6 +38,10 @@ for c in all $CLASSES; do
     grep -q '%' "$top" || top=$REP/$c.symbol.txt
     if [ $c = all ]; then
       $PERF report -i $W/$c.data --stdio --no-children --sort srcline --percent-limit 0.1 -g none > "$REP/all.srcline.txt" 2> "$REP/all.srcline.err"
+      # Who calls memmove/memset: one DWARF call-graph record (the glibc mem* kernels are leaf
+      # functions without a frame pointer, so frame-pointer unwinding skips their caller).
+      $PERF record -q --all-user -F 1999 --call-graph dwarf,65528 -o $W/cg.data -- av1-oracle-prof --null --threads 1 $d $W/o >/dev/null 2>&1
+      $PERF report -i $W/cg.data --stdio --no-children -S __memmove_avx512_unaligned_erms,__memset_avx512_unaligned_erms -g graph,0.5,callee,function --percent-limit 0.5 > "$REP/all.memcallers.txt" 2> "$REP/all.memcallers.err"
       # The same run with LLVM inlining off (av1-oracle-noinline): the time of each function
       # on its own, instead of folded into its caller (the absolute times are higher).
       $PERF record -q --all-user -F 1999 -o $W/noinline.data -- sh -c "for i in 1 2 3; do av1-oracle-noinline --null --threads 1 $d $W/o; done" >/dev/null 2>&1
