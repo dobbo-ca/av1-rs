@@ -64,3 +64,7 @@ profile on a workstation: CI only.
 2026-11-23, main 49f2864 (old bench, 24 streams, 100 frames, `.yuv` written by av1-rs only):
 dav1d 200 ms / av1-rs 1005 ms with one thread (5.0x); dav1d 115 ms / av1-rs 1134 ms with
 default threads (9.9x; these streams have one tile).
+
+The push benches of the #32 merge (3686fe1, run 45534769417) and the #33 merge (ab67402, run
+45544772498) were cancelled. 10c1f47 (run 45550778331) is the first clean post-merge record after
+both.

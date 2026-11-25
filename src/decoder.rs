@@ -227,6 +227,11 @@ impl Decoder {
         Self::build(Options::default(), limits, true)
     }
 
+    /// Books `bytes` of the caller's own buffers on the ledger for the life of the decoder.
+    pub(crate) fn book(&self, bytes: usize) -> Result<(), Error> {
+        self.ledger.reserve(bytes)
+    }
+
     fn build(options: Options, limits: Limits, probe_only: bool) -> Decoder {
         let ledger = Arc::new(Ledger::default());
         // A `max_alloc` below the small-allocation allowance only means that every later charge
@@ -621,7 +626,7 @@ impl Decoder {
                 }
             }
             if job.header.show_frame
-                && let Err(e) = self.commit_output(&mut job, &stored, cancel, b)
+                && let Err(e) = self.commit_output(&mut job, &stored, cancel, b, &mut done)
             {
                 return Err(self.job_failed(&job, e, true, b));
             }
@@ -630,24 +635,53 @@ impl Decoder {
     }
 
     /// The output frame of a committed job: its unit's earlier frames are finished first.
+    ///
+    /// A buffer that does not fit may only be short of room because `in_flight` (the decoded
+    /// states of the frames after this one) still holds memory. A loop of single decodes does not
+    /// have those, so they are dropped (those frames then decode one at a time) and the frame is
+    /// made again; the error of the batch is then the one of the loop.
     fn commit_output(
         &mut self,
         job: &mut QueuedFrame,
         planes: &[WorkPlane],
         cancel: &AtomicBool,
         b: &mut Batch,
+        in_flight: &mut std::vec::IntoIter<Option<Result<FrameState, Error>>>,
     ) -> Result<(), Error> {
         self.advance_unit(b, job.unit)?;
+        let mut r = self.make_shown(job, planes, cancel);
+        if matches!(r, Err(Error::AllocLimit | Error::OutOfMemory)) && in_flight.len() > 0 {
+            *in_flight = Vec::new().into_iter();
+            r = self.make_shown(job, planes, cancel);
+        }
+        self.ready.push(r?);
+        Ok(())
+    }
+
+    /// `make_frame` for a queued job. On an error the job keeps its metadata and the ledger bytes
+    /// the failed attempt booked for the unit's output are given back, so it can run again.
+    fn make_shown(
+        &mut self,
+        job: &mut QueuedFrame,
+        planes: &[WorkPlane],
+        cancel: &AtomicBool,
+    ) -> Result<Frame, Error> {
         // `make_frame` takes the metadata of the frame, not the live one of the parse position.
         let live = (
             std::mem::replace(&mut self.metadata, std::mem::take(&mut job.metadata)),
             std::mem::replace(&mut self.metadata_bytes, job.metadata_bytes),
         );
+        let booked = self.ready_bytes;
         let s = Shown::of_header(&job.header, &job.seq);
         let r = self.make_frame(&s, &job.header, planes, cancel);
+        if r.is_err() {
+            job.metadata = std::mem::take(&mut self.metadata);
+            job.metadata_bytes = self.metadata_bytes;
+            self.ledger.release(self.ready_bytes - booked);
+            self.ready_bytes = booked;
+        }
         (self.metadata, self.metadata_bytes) = live;
-        self.ready.push(r?);
-        Ok(())
+        r
     }
 
     /// A frame failed in a flush: the references are as a loop of single decodes leaves them
@@ -2621,9 +2655,10 @@ mod tests {
     }
 
     /// The reference: one `decode_temporal_unit` call per unit, one thread.
-    fn run_loop(units: &[Vec<u8>]) -> (Vec<Frame>, Option<Error>, Decoder) {
+    fn run_loop(units: &[Vec<u8>], max_alloc: usize) -> (Vec<Frame>, Option<Error>, Decoder) {
         let limits = Limits {
             max_threads: 1,
+            max_alloc,
             ..Limits::default()
         };
         let mut d = Decoder::new(Options::default(), limits);
@@ -2649,7 +2684,7 @@ mod tests {
         no_frame[4] = obu(OBU_TEMPORAL_DELIMITER, &[]);
         let (mut frames, mut errors) = (0, 0);
         for units in [&ok, &truncated, &no_frame] {
-            let (want, want_err, want_d) = run_loop(units);
+            let (want, want_err, want_d) = run_loop(units, 64 << 20);
             frames += want.len();
             errors += usize::from(want_err.is_some());
             for threads in [0, 1, 2, 3, 8] {
@@ -2664,6 +2699,46 @@ mod tests {
         // The streams decode some frames and the broken one fails: the test compares something.
         assert!(frames > 0);
         assert!(errors > 0);
+    }
+
+    /// The fuzz seed of `frames_threads`: a full (not reduced) sequence header with a hidden
+    /// showable key frame in the first unit, and an `OBU_REDUNDANT_FRAME_HEADER` with
+    /// `show_existing_frame` of its slot in the second.
+    fn show_existing_units() -> Vec<Vec<u8>> {
+        let seed = include_bytes!("../tests/fuzz/seeds/regress-show-existing-redundant-header.bin");
+        let stream = &seed[..seed.len() - 1]; // without the fuzz option byte
+        let units = crate::split_temporal_units(stream, Format::Section5, &Limits::default());
+        units.unwrap().into_iter().map(<[u8]>::to_vec).collect()
+    }
+
+    #[test]
+    fn a_hidden_frame_shown_by_a_redundant_header_is_the_same_for_every_thread_count() {
+        let units = show_existing_units();
+        assert_eq!(units.len(), 2);
+        let (want, want_err, _) = run_loop(&units, 64 << 20);
+        assert_eq!((want.len(), want_err), (1, None));
+        for threads in [2, 3, 8] {
+            let (got, err, _) = run_batch(&units, threads, 64 << 20);
+            assert_eq!(err, None, "{threads} threads");
+            assert_eq!(got, want, "{threads} threads");
+        }
+    }
+
+    #[test]
+    fn batch_refusals_are_the_ones_of_a_loop_at_every_max_alloc() {
+        let units = units_of(8);
+        let mut refused = 0;
+        for max_alloc in (1 << 10..(1 << 10) + (80 << 10)).step_by(512) {
+            let (want, want_err, _) = run_loop(&units, max_alloc);
+            refused += usize::from(want_err == Some(Error::AllocLimit));
+            for threads in [2, 3, 8] {
+                let (got, err, _) = run_batch(&units, threads, max_alloc);
+                assert_eq!(err, want_err, "{threads} threads at {max_alloc}");
+                assert_eq!(got, want, "{threads} threads at {max_alloc}");
+            }
+        }
+        // The sweep covers refusals: it compares something.
+        assert!(refused > 0);
     }
 
     #[test]

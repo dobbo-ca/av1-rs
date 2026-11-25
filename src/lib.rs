@@ -265,8 +265,9 @@ pub struct Probe {
 ///
 /// Decoding stops at the first inter frame with [`Error::InterFrame`] and the frames before it
 /// are not returned: use [`Decoder`] to keep them.
-/// The frames it collects stay charged against `max_alloc` until it returns, so a stream whose
-/// output is larger than `max_alloc` is `AllocLimit`: use [`Decoder`] to stream it.
+/// The frames it collects and the list of temporal units (16 bytes each) stay charged against
+/// `max_alloc` until it returns, so a stream whose output is larger than `max_alloc` is
+/// `AllocLimit`: use [`Decoder`] to stream it.
 ///
 /// # Errors
 /// `Truncated` or `Invalid` for a broken stream, `Unsupported` for a feature this decoder does
@@ -282,8 +283,21 @@ pub fn decode(
 ) -> Result<Vec<Frame>, Error> {
     let mut decoder = Decoder::new(options.clone(), *limits);
     // Framing is checked up front, so a broken stream decodes nothing.
-    // The list of units is charged against `max_alloc` (every Annex B zero byte is a unit).
-    let units = split_temporal_units(data, format, limits)?;
+    // The list of units is booked on the decoder's ledger for the whole call (every Annex B zero
+    // byte is a unit). It is counted first and reserved exactly, so the capacity is the booking.
+    let mut count = 0usize;
+    for unit in TemporalUnits::new(data, format) {
+        unit?;
+        count += 1;
+    }
+    decoder.book(count.saturating_mul(size_of::<&[u8]>()))?;
+    let mut units = Vec::new();
+    units
+        .try_reserve_exact(count)
+        .map_err(|_| Error::OutOfMemory)?;
+    for unit in TemporalUnits::new(data, format) {
+        units.push(unit?);
+    }
     // Every frame collected so far stays booked, so the output of the call counts too; with
     // `max_threads` above 1 the frames of several units decode at once.
     decoder.decode_temporal_units(&units, format, cancel)

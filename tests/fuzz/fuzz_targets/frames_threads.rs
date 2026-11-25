@@ -65,8 +65,9 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     }
-    // A memory limit is the one error that may differ with the number of frames in flight.
-    let limit = |e: &Option<Error>| matches!(e, Some(Error::AllocLimit | Error::OutOfMemory));
+    // A failed system allocation is the one error that may differ with the number of frames in
+    // flight; `AllocLimit` is the same at every thread count.
+    let limit = |e: &Option<Error>| matches!(e, Some(Error::OutOfMemory));
     if limit(&want_err) {
         return;
     }
