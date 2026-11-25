@@ -2507,19 +2507,23 @@ mod tests {
         }
     }
 
-    /// A temporal unit with one key frame of random tile data (valid syntax or a syntax error),
-    /// and the sequence header when `with_seq`.
+    /// A temporal unit with one key frame (odd seeds: tile data known to decode; even seeds:
+    /// random data, valid syntax or a syntax error) and the sequence header when `with_seq`.
     fn frame_unit(seed: u64, with_seq: bool) -> Vec<u8> {
         let mut w = BitWriter::default();
         still_frame_header(&mut w);
         w.align();
         let mut payload = w.bytes;
-        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-        for _ in 0..120 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            payload.push((x >> 24) as u8);
+        if seed % 2 == 1 {
+            payload.extend_from_slice(&[1, 2, 3, 4]); // tile data known to decode (still_obus)
+        } else {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            for _ in 0..120 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                payload.push((x >> 24) as u8);
+            }
         }
         let mut v = obu(OBU_TEMPORAL_DELIMITER, &[]);
         if with_seq {
