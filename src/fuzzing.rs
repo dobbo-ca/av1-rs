@@ -265,6 +265,11 @@ pub fn itx(data: &[u8]) {
 /// done from `data` (format, bit depth, superres, size, filter parameters, mode info and
 /// samples) and runs the threaded wrapup (loop filter, CDEF, superres, loop restoration) with
 /// 2 and 3 threads: the samples or the error must equal those of 1 thread.
+/// DEBUG (temporary).
+pub fn threads_dbg_serial(data: &[u8]) {
+    crate::decoder::check_threads(data, &[1, 1]);
+}
+
 pub fn threads(data: &[u8]) {
     crate::decoder::check_threads(data, &[2, 3]);
 }

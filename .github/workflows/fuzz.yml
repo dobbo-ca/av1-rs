@@ -167,7 +167,7 @@ jobs:
       - run: |
           mkdir -p corpus/${{ matrix.target }}
           docker create --name fuzz -e MAX_TOTAL_TIME -e TARGET=${{ matrix.target }} av1-fuzz-arm64:local \
-            sh -c 'mkdir -p tests/fuzz/artifacts/$TARGET && qemu-aarch64 -L /usr/aarch64-linux-gnu tests/fuzz/target/aarch64-unknown-linux-gnu/release/$TARGET -artifact_prefix=tests/fuzz/artifacts/$TARGET/ tests/fuzz/corpus/$TARGET -max_total_time=$MAX_TOTAL_TIME -timeout=60 -rss_limit_mb=2048 -malloc_limit_mb=512'
+            sh -c 'mkdir -p tests/fuzz/artifacts/$TARGET && qemu-aarch64 --version && B=tests/fuzz/target/aarch64-unknown-linux-gnu/release/$TARGET && for m in spawn serial normal; do mkdir -p /tmp/c-$m && cp tests/fuzz/corpus/$TARGET/* /tmp/c-$m/ 2>/dev/null; echo "=== DBG phase $m"; AV1_DBG=$m qemu-aarch64 -L /usr/aarch64-linux-gnu $B -artifact_prefix=tests/fuzz/artifacts/$TARGET/ /tmp/c-$m -runs=3000 -max_total_time=420 -timeout=60 -rss_limit_mb=6000 2>&1 | grep -E "DBG|Done|rss_limit|out-of-memory|INITED"; done; echo "=== DBG phase crasher"; qemu-aarch64 -L /usr/aarch64-linux-gnu $B -runs=2000 -rss_limit_mb=6000 tests/fuzz/dbg/crash 2>&1 | grep -E "DBG|Done|out-of-memory" | tail -12; true'
           docker cp corpus fuzz:/src/tests/fuzz/
           docker start -a fuzz
       - if: failure() || cancelled()
