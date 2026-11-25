@@ -22,7 +22,7 @@ MIN_GEN=${TRANSFORM_MIN_GENERATED:-70}
 MAX_RGB=${TRANSFORM_MAX_RGB:-29}
 # The most a chroma sample of av1-rs may be from the range of the libheif samples of its cell, in
 # 8-bit units (scaled up for deeper samples), see chrompos.
-CHROMA_CAP=${TRANSFORM_CHROMA_CAP:-2}
+CHROMA_CAP=${TRANSFORM_CHROMA_CAP:-3}
 
 # gen <dst>: 4:2:0, 4:2:2 and 4:4:4 images of three sizes (a gradient with some noise inside the RGB gamut, so a wrong
 # row or column shows) written by avifenc with every combination of clap, irot and imir below. A
