@@ -423,8 +423,27 @@ pub(crate) fn fill_rows<T: Copy>(
     for y in 0..rows {
         let start = (r + y) * mi_cols + c;
         if let Some(s) = v.get_mut(start..start + cols) {
-            s.fill(val);
+            fill_cols(s, val);
         }
+    }
+}
+
+/// `s.fill(val)` where the usual lengths (block widths in 4x4 units) are fixed-size stores
+/// instead of a call to `memset`.
+#[inline(always)]
+pub(crate) fn fill_cols<T: Copy>(s: &mut [T], val: T) {
+    fn fixed<T: Copy, const N: usize>(s: &mut [T], val: T) {
+        if let Some(a) = s.first_chunk_mut::<N>() {
+            *a = [val; N];
+        }
+    }
+    match s.len() {
+        1 => fixed::<T, 1>(s, val),
+        2 => fixed::<T, 2>(s, val),
+        4 => fixed::<T, 4>(s, val),
+        8 => fixed::<T, 8>(s, val),
+        16 => fixed::<T, 16>(s, val),
+        _ => s.fill(val),
     }
 }
 
@@ -2027,5 +2046,14 @@ mod tests {
         assert_eq!(v, [1, 1, 0, 0]);
         clear_range(&mut v, 7, 9);
         assert_eq!(v, [1, 1, 0, 0]);
+    }
+
+    #[test]
+    fn fill_cols_matches_fill() {
+        for n in 0..40 {
+            let mut v = vec![1u8; n];
+            fill_cols(&mut v, 7);
+            assert!(v.iter().all(|&b| b == 7), "len {n}");
+        }
     }
 }

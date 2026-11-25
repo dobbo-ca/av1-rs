@@ -144,12 +144,13 @@ pub(crate) fn filter(
     damping: i32,
     dir: usize,
 ) {
-    let prep = if simd.tier() == Tier::Scalar {
-        None
-    } else {
-        prepare(ctx, src, dst, plane, sub, r, c, strengths, damping, dir)
-    };
-    let Some((tmp, f, x0, y0)) = prep else {
+    if simd.tier() == Tier::Scalar {
+        return cdef_filter(ctx, src, dst, plane, sub, r, c, strengths, damping, dir);
+    }
+    let mut tmp = [SENTINEL; TMP];
+    let Some((f, x0, y0)) = prepare(
+        ctx, src, dst, plane, sub, r, c, strengths, damping, dir, &mut tmp,
+    ) else {
         return cdef_filter(ctx, src, dst, plane, sub, r, c, strengths, damping, dir);
     };
     let mut out = [0u16; 64];
@@ -171,13 +172,31 @@ pub(crate) fn filter(
     for (i, row) in out.chunks_exact(f.w).take(f.h).enumerate() {
         let a = (y0 - dst.y0 + i) * dst.stride + x0;
         if let Some(d) = dst.px.get_mut(a..a + f.w) {
-            d.copy_from_slice(row);
+            copy_row(d, row);
         }
     }
 }
 
-/// The padded block and the kernel parameters, with the block's sample position (`x0`, `y0`);
-/// `None` when a premise of the kernels does not hold (the caller then runs the oracle).
+/// `d.copy_from_slice(s)` (same lengths) where the usual row lengths (a block row of 4 or 8
+/// samples, or with the 2 + 2 samples around it) are fixed-size copies instead of a `memmove`.
+#[inline(always)]
+fn copy_row(d: &mut [u16], s: &[u16]) {
+    fn fixed<const N: usize>(d: &mut [u16], s: &[u16]) {
+        if let (Some(d), Some(s)) = (d.first_chunk_mut::<N>(), s.first_chunk::<N>()) {
+            *d = *s;
+        }
+    }
+    match s.len() {
+        4 => fixed::<4>(d, s),
+        8 => fixed::<8>(d, s),
+        12 => fixed::<12>(d, s),
+        _ => d.copy_from_slice(s),
+    }
+}
+
+/// Fills `tmp` (all `SENTINEL` on entry) with the padded block and returns the kernel
+/// parameters, with the block's sample position (`x0`, `y0`); `None` when a premise of the
+/// kernels does not hold (the caller then runs the oracle).
 fn prepare(
     ctx: &FilterCtx,
     src: &Plane,
@@ -189,7 +208,8 @@ fn prepare(
     strengths: (i32, i32),
     damping: i32,
     dir: usize,
-) -> Option<([u16; TMP], Filt, usize, usize)> {
+    tmp: &mut [u16; TMP],
+) -> Option<(Filt, usize, usize)> {
     let (pri_str, sec_str) = strengths;
     let (sub_x, sub_y) = if plane > 0 { sub } else { (0, 0) };
     if sub_x > 1 || sub_y > 1 || ctx.coeff_shift > 4 {
@@ -226,7 +246,6 @@ fn prepare(
     }
     let tap_set = ((pri_str >> ctx.coeff_shift) & 1) as usize;
     // The padded block.
-    let mut tmp = [SENTINEL; TMP];
     let mut or = 0u16;
     let xa = x0.saturating_sub(2);
     let xb = (x0 + w + 2).min(cols);
@@ -240,7 +259,7 @@ fn prepare(
         let a = y * src.stride;
         let row = src.px.get(a + xa..a + xb)?;
         let d = yy * TS + xa + 2 - x0;
-        tmp.get_mut(d..d + row.len())?.copy_from_slice(row);
+        copy_row(tmp.get_mut(d..d + row.len())?, row);
         or |= row.iter().fold(0, |o, &v| o | v);
     }
     if or >= 4096 {
@@ -278,7 +297,7 @@ fn prepare(
         pri_shift,
         sec_shift,
     };
-    Some((tmp, f, x0, y0))
+    Some((f, x0, y0))
 }
 
 #[cfg(test)]
