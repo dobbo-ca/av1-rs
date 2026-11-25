@@ -94,7 +94,7 @@ fn source_window(
     y: usize,
     w: usize,
     h: usize,
-    win: &mut [i32; WIN],
+    win: &mut [i32],
 ) {
     let ww = w + 6;
     // Window column `c` is plane column `first + c`, clamped to `0..=PlaneEndX`: columns
