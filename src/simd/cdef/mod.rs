@@ -16,6 +16,8 @@
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;
+#[cfg(target_arch = "x86_64")]
+mod avx512;
 #[cfg(target_arch = "aarch64")]
 mod neon;
 
@@ -155,6 +157,13 @@ pub(crate) fn filter(
     };
     let mut out = [0u16; 64];
     match simd.tier() {
+        // A 4x4 block fills only half of a 512-bit vector.
+        #[cfg(target_arch = "x86_64")]
+        Tier::Avx512 if f.w * f.h >= 32 => {
+            // SAFETY: `simd` is a detected tier (only `simd::available`/`best` make one), and
+            // the AVX-512 tier includes AVX2 and AVX-512 BW (the kernel's features).
+            unsafe { avx512::filter(&tmp, &mut out, &f) }
+        }
         #[cfg(target_arch = "x86_64")]
         Tier::Avx2 | Tier::Avx512 => {
             // SAFETY: `simd` is a detected tier (only `simd::available`/`best` make one), and
