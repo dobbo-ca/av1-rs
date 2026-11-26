@@ -52,10 +52,12 @@ ledger per `decode_avif` call covers every item decoder, the grid canvas, the it
 decoded tile until it is pasted, the transforms (output and scratch, booked before they run) and
 the primary image (docs/threading.md); it gets three quarters of `max_alloc`, and the `isobmff`
 parse and item reads an eighth each, so the three sum to `max_alloc`, not twice it
-(`tests/avif_alloc.rs` counts the heap of every thread for small items and grids and for items
-and a grid with transforms far larger than the uncharged slack, at many `max_alloc` and
-`max_threads` values, and checks the peak against `max_alloc` plus the uncharged fixed buffers
-of each decoder; it does the same for `Decoder::decode_temporal_units` at 2 and 4 threads).
+(`tests/avif_alloc.rs` counts the heap of every thread for small items and grids, a grid of
+two-extent tiles, and an item and a grid with transforms larger than the uncharged slack, at
+many `max_alloc` and `max_threads` values, and checks the peak against the ledger's share plus
+what the parse and the item copies held and the uncharged fixed buffers of each decoder; it
+checks `Decoder::decode_temporal_units` at 2 and 4 threads against `max_alloc` plus those
+buffers).
 
 Not charged, because their size does not depend on the input: per tile decoder, the colour map
 buffers and the 16 KiB reconstruction scratch (`recon::ItxScratch`). The loop restoration source

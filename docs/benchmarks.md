@@ -27,8 +27,10 @@ NEON, with one thread and with the default threads. No aomdec and no v4 build th
 ## Baseline on hosted runners
 
 Bench run 45705147876 (dispatch, commit d86861a, the branch that moved CI to hosted runners).
-`bench`: AMD EPYC 7763, 4 vCPU, no AVX-512, so this run has no v4 times and no avx512 tier; the
-first run on an AVX-512 runner fills them in. `bench-arm64`: Neoverse-N2, 4 vCPU.
+`bench`: AMD EPYC 7763, 4 vCPU, no AVX-512, so this run has no v4 times and no avx512 tier.
+Bench run 45709141819 (push to `main`, 523df8b) landed on an Intel Xeon 6975P-C with AVX-512
+and has the v4 and avx512 figures in its job summary; they are not copied here.
+`bench-arm64`: Neoverse-N2, 4 vCPU.
 
 x86_64, 1 thread:
 
@@ -124,8 +126,9 @@ and `-expand`); `false-deps-lzcnt-tzcnt` is not one. rustc does not know them, s
 "unknown and unstable feature specified for `-Ctarget-feature`" and passes them to LLVM, which
 accepts them. They work: with them, tzcnt and blsr in a loop get an `xor` of the destination
 first (the same as `-C target-cpu=znver5`; `znver4` and plain v4 have none). On this decoder
-they changed nothing measurable (v4 column of the 1 thread and default threads tables, same
-to within 1 to 2 ms per class and the same 894/898 ms total), so the build dropped them and has no
+they changed nothing measurable (v4 builds with and without them on the self-hosted runner used
+before the move to hosted runners: the same to within 1 to 2 ms per class and the same 894/898 ms
+totals), so the build dropped them and has no
 warning. `tests/parity/v4-diag.sh` (workflow `v4-diag`, dispatch only) prints the toolchain's
 list and the asm, to recheck on a new rustc.
 

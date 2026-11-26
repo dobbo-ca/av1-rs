@@ -288,6 +288,18 @@ impl Decoder {
         format: Format,
         cancel: &AtomicBool,
     ) -> Result<Vec<Frame>, Error> {
+        self.decode_obus(data, format, cancel)?;
+        Ok(self.select_output())
+    }
+
+    /// [`Decoder::decode_temporal_unit`] up to the layer selection: the output frames are left in
+    /// `ready`, still booked.
+    fn decode_obus(
+        &mut self,
+        data: &[u8],
+        format: Format,
+        cancel: &AtomicBool,
+    ) -> Result<(), Error> {
         // Tile ranges are offsets into one call's `data`: a frame cannot continue in the next call.
         self.pending = None;
         self.ready.clear();
@@ -304,12 +316,37 @@ impl Decoder {
                 return Err(e);
             }
         }
-        Ok(self.select_output())
+        Ok(())
+    }
+
+    /// [`Decoder::decode_temporal_unit`] for a caller that books the output itself (an AVIF
+    /// item): the ledger bytes the output frames hold (their planes, plane lists and, on a shared
+    /// ledger, their metadata) are not given back but returned with them, so the frames are never
+    /// live without a booking. After an error nothing of the unit stays booked.
+    pub(crate) fn decode_unit_booked(
+        &mut self,
+        data: &[u8],
+        format: Format,
+        cancel: &AtomicBool,
+    ) -> Result<(Vec<Frame>, usize), Error> {
+        if let Err(e) = self.decode_obus(data, format, cancel) {
+            self.ready.clear();
+            self.release_ready();
+            self.clear_metadata();
+            return Err(e);
+        }
+        let booked = std::mem::take(&mut self.ready_bytes);
+        let frames = self.select_output();
+        // Metadata after the last shown frame belongs to no frame: the next unit would drop it,
+        // and an item's decoder sees no next unit, so it is given back now.
+        self.clear_metadata();
+        Ok((frames, booked))
     }
 
     /// Decodes `units`, consecutive temporal units of one stream, and returns their output
     /// frames in order: the frames of one [`Decoder::decode_temporal_unit`] call per unit.
-    /// With `Limits::max_threads` 1 that is exactly a loop of those calls.
+    /// With `Limits::max_threads` 1 that is a loop of those calls, apart from the frames it keeps
+    /// booked until it returns (see Errors).
     ///
     /// With more threads the headers are parsed and the reference slots updated in stream order
     /// on the calling thread, while the pixels of up to `W` frames decode at once, each with
@@ -325,7 +362,10 @@ impl Decoder {
     /// # Errors
     /// The error the first failing unit would give in a loop of
     /// [`Decoder::decode_temporal_unit`] calls (the lowest stream position wins, whatever the
-    /// timing). The frames output before it, those of the earlier units included, are returned by
+    /// timing), except for [`Error::AllocLimit`]: the batch keeps every unit's frames booked until
+    /// it returns and decodes with more threads, so it can be refused at an earlier unit than the
+    /// loop, or where the loop is not refused at all. The frames output before the error, those
+    /// of the earlier units included, are returned by
     /// [`Decoder::take_frames`], and the reference slots are as that loop leaves them.
     pub fn decode_temporal_units(
         &mut self,
@@ -542,7 +582,8 @@ impl Decoder {
     ///
     /// The pixels of up to `W` frames decode at once ([`plan`]). When a buffer does not fit in
     /// `max_alloc` the results are dropped and the frames decode one at a time, each with all the
-    /// threads, so a refusal is the one a loop of single decodes gives. At the first frame that
+    /// threads, so a refusal is not caused by the frames that decoded beside it (the batch still
+    /// holds the earlier units' frames, which a loop has handed back). At the first frame that
     /// fails (the lowest in stream order) the reference state is the one a loop leaves, and the
     /// frames after it are dropped.
     fn flush(&mut self, units: &[&[u8]], cancel: &AtomicBool, b: &mut Batch) -> Result<(), Error> {
@@ -1185,8 +1226,11 @@ impl Decoder {
                 out.push(self.public_plane(p, p.width, p.height, s.bit_depth)?);
             }
         }
-        // The frame owns the metadata now; a shared ledger keeps it booked for the rest of the call.
+        // The frame owns the metadata now; a shared ledger keeps it booked with the frame's planes.
         let metadata = std::mem::take(&mut self.metadata);
+        if self.charge_metadata {
+            self.ready_bytes += self.metadata_bytes;
+        }
         self.metadata_bytes = 0;
         Ok(Frame {
             width: s.width,
@@ -2390,6 +2434,22 @@ mod tests {
         // The next unit drops the kept metadata and gives its bytes back.
         d.decode_temporal_unit(&[], Format::Section5, &cancel())
             .unwrap();
+        assert_eq!(ledger.left(), 1 << 20);
+    }
+
+    // An AVIF item's decoder is dropped after its one unit: metadata after the last shown frame
+    // belongs to no frame, so `decode_unit_booked` gives its booking back.
+    #[test]
+    fn booked_unit_keeps_no_trailing_metadata_booked() {
+        let m = obu(OBU_METADATA, &[1, 0x03, 0xe8, 0x01, 0x90, 0x80]);
+        let ledger = Arc::new(Ledger::default());
+        ledger.reset(crate::ledger::SMALL + (1 << 20), 0).unwrap();
+        let mut d = Decoder::with_ledger(Options::default(), Limits::default(), ledger.clone());
+        let (frames, booked) = d
+            .decode_unit_booked(&m, Format::Section5, &cancel())
+            .unwrap();
+        assert!(frames.is_empty());
+        ledger.release(booked);
         assert_eq!(ledger.left(), 1 << 20);
     }
 

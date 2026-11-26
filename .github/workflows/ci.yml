@@ -11,15 +11,19 @@ jobs:
   # for aarch64. The layers are saved to the Actions cache, one scope per job. isobmff-rs is not
   # public: the dobbo-ca-ci-read GitHub App mints a read-only token for it, and it reaches the
   # build only as a BuildKit secret.
-  # Fork PRs get no secrets, so no token: every job that needs isobmff-rs is skipped on a fork PR
-  # (the job-level `if`), and a skipped job is not a failure.
+  # Fork PRs get no secrets, so no token: `arm64` is skipped on a fork PR (the job-level `if`).
+  # `test` is not skipped there, because GitHub counts a skipped required check as passed: on a
+  # fork PR it fails at its first step, so the PR cannot merge until its commits are pushed to a
+  # branch of this repo and the checks run there.
   # A PR runs `test` (the required check) and `arm64`; parity and parity-arm64 run on main and on
   # workflow_dispatch.
   test:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
+      - name: Fork PRs cannot run the checks
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: echo "::error::A fork PR gets no isobmff-rs token, so the checks cannot run. Push the commits to a branch of this repo." && exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { lfs: false }
       - name: Create isobmff-rs read token (dobbo-ca-ci-read app)
@@ -35,7 +39,9 @@ jobs:
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc && df -h /
       # The SIMD tiers the tests reach depend on the CPU (AVX-512 or not).
       - name: CPU
-        run: lscpu | grep -E '^(Model name|CPU\(s\))' || true; grep -ow 'avx512[a-z]*' /proc/cpuinfo | sort -u | tr '\n' ' ' || true; echo
+        run: |
+          lscpu | grep -E '^(Model name|CPU\(s\))' || true; grep -ow 'avx512[a-z]*' /proc/cpuinfo | sort -u | tr '\n' ' ' || true; echo
+          grep -qw avx512f /proc/cpuinfo || echo '::warning title=No AVX-512::This runner has no AVX-512, so this job did not run the AVX-512 tier.'
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -107,7 +113,9 @@ jobs:
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc && df -h /
       # The `tiers` gate reaches AVX-512 only on a CPU that has it.
       - name: CPU
-        run: lscpu | grep -E '^(Model name|CPU\(s\))' || true; grep -ow 'avx512[a-z]*' /proc/cpuinfo | sort -u | tr '\n' ' ' || true; echo
+        run: |
+          lscpu | grep -E '^(Model name|CPU\(s\))' || true; grep -ow 'avx512[a-z]*' /proc/cpuinfo | sort -u | tr '\n' ' ' || true; echo
+          grep -qw avx512f /proc/cpuinfo || echo '::warning title=No AVX-512::This runner has no AVX-512, so this job did not run the AVX-512 tier.'
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:

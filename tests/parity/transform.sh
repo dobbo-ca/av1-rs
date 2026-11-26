@@ -185,12 +185,13 @@ full() {
             { echo "$f: av1-rs chroma differs from its raw decode (raw $rlay, ${ow}x$oh, $obd-bit, $ntr transforms)" >> $W/transform.diff; continue; }
         fi
         # The chroma by position against libheif's 4:4:4 (or other) chroma, after any rotate, mirror or crop.
-        cp=exact
+        # No chroma to compare by position when either side is 4:0:0.
+        cp=none
         if [ "$olay" != 400 ] && [ "$llay" != 400 ]; then
           cp=$(chrompos $W/ours/$s.yuv $W/lh/$s.yuv $ow $oh $b "$olay" "$llay" "$obd" "$how") ||
             { echo "$f: av1-rs chroma differs from libheif by position ($cp, cap $CHROMA_CAP; raw $rlay, av1-rs $olay, libheif $llay, ${ow}x$oh, $obd-bit, $ntr transforms)" >> $W/transform.diff; continue; }
         fi
-        case $cp in exact) eval "${k}_cx=\$((${k}_cx + 1))" ;; *) eval "${k}_cc=\$((${k}_cc + 1))" ;; esac
+        case $cp in none) ;; exact) eval "${k}_cx=\$((${k}_cx + 1))" ;; *) eval "${k}_cc=\$((${k}_cc + 1))" ;; esac
         case $how in
           exact) eval "${k}_doc=\$((${k}_doc + 1))" ;;
           *) eval "${k}_rgb=\$((${k}_rgb + 1))" ;;

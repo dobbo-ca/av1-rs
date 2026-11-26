@@ -91,6 +91,14 @@ fuzz_target!(|data: &[u8]| {
         // So when either side is refused by the ledger, the frames output up to there agree and
         // nothing else is required; any other difference is a bug.
         let refused = |e: &Option<Error>| matches!(e, Some(Error::AllocLimit));
+        // Another batch error can only come where the loop got to: one before the loop's refusal
+        // is a batch-only decode error.
+        if refused(&want_err) && got_err.is_some() && !refused(&got_err) {
+            assert!(
+                got.len() >= want.len(),
+                "{threads} threads: {got_err:?} before the loop's refusal"
+            );
+        }
         if refused(&got_err) || refused(&want_err) {
             let n = got.len().min(want.len());
             assert!(

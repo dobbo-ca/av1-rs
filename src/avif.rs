@@ -1,6 +1,6 @@
 //! The AVIF layer: the item graph comes from `isobmff`, the pixels from [`Decoder`].
 //!
-//! Coded items are decoded with their own decoder, grid tiles on up to `max_threads` threads; tiles are pasted into
+//! Coded items are decoded with their own decoder, grid tiles (after tile 0) on up to `max_threads` threads; tiles are pasted into
 //! the output as they are decoded. Colour and the alpha plane are passed through raw. Transforms
 //! are returned raw too, unless `Options::apply_transforms` is on: then `isobmff::apply_transforms`
 //! runs on each grid tile and identity input, on the derived result and on the alpha image.
@@ -11,7 +11,7 @@ use crate::{Decoder, Error, Format, Frame, Limits, Options, Plane, PlaneData};
 use isobmff::{
     Av1c, Chroma, Codec, CodecConfig, Grid, Heif, Image, ImageKind, PlaneSamples, Transform,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// A decoded AVIF still.
@@ -67,6 +67,7 @@ struct Ctx<'a> {
 /// # Errors
 /// [`Error::Container`] (the class of the `isobmff` error) for a broken file, otherwise the
 /// errors of [`Decoder::decode_temporal_unit`], and `Invalid` for tiles that do not fit together.
+/// Item bytes that do not fit their eighth of `max_alloc` are [`Error::AllocLimit`].
 pub fn decode_avif(
     file: &[u8],
     options: &Options,
@@ -160,20 +161,9 @@ pub fn decode_avif_item(
 }
 
 impl Ctx<'_> {
-    /// [`transform_frame`] for a frame the ledger holds (a decoded image): its bytes are given
-    /// back for the transform, and the result is booked for the rest of the call.
+    /// [`transform_frame`] for a frame the ledger holds (a decoded image); the result is booked
+    /// in its place.
     fn transformed_booked(&self, ts: &[Transform], frame: Frame) -> Result<Frame, Error> {
-        if !self.options.apply_transforms || ts.is_empty() {
-            return Ok(frame);
-        }
-        self.ledger.release(frame_bytes(&frame));
-        let frame = self.transformed(ts, frame)?;
-        self.ledger.reserve(frame_bytes(&frame))?;
-        Ok(frame)
-    }
-
-    /// [`transform_frame`] for a frame the ledger does not hold; the result is not held either.
-    fn transformed(&self, ts: &[Transform], frame: Frame) -> Result<Frame, Error> {
         transform_frame(
             self.options,
             self.limits,
@@ -186,20 +176,78 @@ impl Ctx<'_> {
 }
 
 /// Applies `ts` to `frame` with `isobmff::apply_transforms` when `options.apply_transforms` is
-/// on. The input is booked in `ledger` while it runs, and the new buffers are charged against
-/// what is left of `max_alloc`; the output is not booked. The frame size limits apply to the
-/// result.
+/// on. `frame` comes booked in `ledger` for [`held_bytes`] and the result goes back booked for
+/// its own; on an error the input is freed and its whole booking, the metadata included, given
+/// back. What the transforms may allocate ([`transform_budget`]) is booked before they run and
+/// passed to `isobmff` as its `max_alloc`, so the grid tiles that transform at once stay within
+/// the ledger together. The frame size limits apply to the result.
 fn transform_frame(
     options: &Options,
     limits: &Limits,
     ledger: &Ledger,
     cancel: &AtomicBool,
     ts: &[Transform],
-    mut frame: Frame,
+    frame: Frame,
 ) -> Result<Frame, Error> {
     if !options.apply_transforms || ts.is_empty() {
         return Ok(frame);
     }
+    // The metadata moves to the result unchanged and stays booked apart from the samples.
+    let metadata = metadata_bytes(&frame);
+    let mut booked = frame_bytes(&frame);
+    let r = match apply(limits, ledger, cancel, ts, frame, &mut booked) {
+        Ok(f) => rebook(ledger, booked, frame_bytes(&f)).map(|()| f),
+        Err(e) => {
+            ledger.release(booked);
+            Err(e)
+        }
+    };
+    if r.is_err() {
+        ledger.release(metadata);
+    }
+    r
+}
+
+/// What `isobmff::apply_transforms` may allocate for `ts` on `planes` planes of `bytes` sample
+/// bytes: each crop and quarter rotation makes a new set of planes no larger than the input (one
+/// and a half times it when a 4:2:2 rotation makes 4:4:4) and its plane list, and the set before
+/// it is freed only once the next is made, so at most two sets are live. Mirrors and 180 degree
+/// rotations work in place.
+fn transform_budget(bytes: usize, planes: usize, chroma: Chroma, ts: &[Transform]) -> usize {
+    let fresh = ts
+        .iter()
+        .filter(|t| matches!(t, Transform::Rotate(90 | 270) | Transform::Clap(_)))
+        .count();
+    let quarter = ts.iter().any(|t| matches!(t, Transform::Rotate(90 | 270)));
+    let set = if chroma == Chroma::Yuv422 && quarter {
+        bytes.saturating_add(bytes / 2 + 1)
+    } else {
+        bytes
+    };
+    set.saturating_add(planes.saturating_mul(size_of::<isobmff::Plane>()))
+        .saturating_mul(fresh.min(2))
+}
+
+/// Turns a booking of `have` bytes into one of `want`; on an error nothing stays booked.
+fn rebook(ledger: &Ledger, have: usize, want: usize) -> Result<(), Error> {
+    if have >= want {
+        ledger.release(have - want);
+        return Ok(());
+    }
+    ledger
+        .reserve(want - have)
+        .inspect_err(|_| ledger.release(have))
+}
+
+/// The work of [`transform_frame`]; `booked` grows by the transform budget once it is booked.
+fn apply(
+    limits: &Limits,
+    ledger: &Ledger,
+    cancel: &AtomicBool,
+    ts: &[Transform],
+    mut frame: Frame,
+    booked: &mut usize,
+) -> Result<Frame, Error> {
     let chroma = match (frame.mono_chrome, frame.subsampling_x, frame.subsampling_y) {
         (true, _, _) => Chroma::Mono,
         (false, true, true) => Chroma::Yuv420,
@@ -214,17 +262,19 @@ fn transform_frame(
         ..isobmff::Limits::default()
     };
     let (w, h) = isobmff::transformed_size(frame.width, frame.height, ts, &ilimits)
-        .map_err(transform_error)?;
+        .map_err(isobmff_error)?;
     if w > limits.max_width {
         return Err(Error::WidthLimit);
     }
     if h > limits.max_height {
         return Err(Error::HeightLimit);
     }
-    // The input is booked while the output is made.
-    let _input = ledger.charge(frame_bytes(&frame))?;
+    // The input stays booked while the output is made; the transforms get exactly their budget.
+    let budget = transform_budget(*booked, frame.planes.len(), chroma, ts);
+    ledger.reserve(budget)?;
+    *booked += budget;
     let ilimits = isobmff::Limits {
-        max_alloc: ledger.left(),
+        max_alloc: budget,
         ..ilimits
     };
     let planes = std::mem::take(&mut frame.planes)
@@ -244,7 +294,7 @@ fn transform_frame(
         chroma,
         planes,
     };
-    let out = isobmff::apply_transforms(planes, ts, &ilimits, cancel).map_err(transform_error)?;
+    let out = isobmff::apply_transforms(planes, ts, &ilimits, cancel).map_err(isobmff_error)?;
     (frame.width, frame.height) = (out.width, out.height);
     (frame.render_width, frame.render_height) = (out.width, out.height);
     (frame.subsampling_x, frame.subsampling_y) = match out.chroma {
@@ -268,7 +318,7 @@ fn transform_frame(
     Ok(frame)
 }
 
-fn transform_error(e: isobmff::Error) -> Error {
+fn isobmff_error(e: isobmff::Error) -> Error {
     match e {
         isobmff::Error::LimitExceeded(isobmff::Limit::Alloc) => Error::AllocLimit,
         isobmff::Error::LimitExceeded(isobmff::Limit::Pixels) => Error::PixelLimit,
@@ -299,13 +349,13 @@ fn decode_image(ctx: &Ctx<'_>, image: &Image, nested: bool) -> Result<Frame, Err
 /// frame is the image.
 fn decode_coded(ctx: &Ctx<'_>, image: &Image) -> Result<Frame, Error> {
     let decoder = Decoder::with_ledger(ctx.options.clone(), *ctx.limits, Arc::clone(&ctx.ledger));
-    let frame = decode_item(ctx, image, decoder)?;
     // The frame stays booked for the rest of the call (the alpha item decodes while it is held).
-    ctx.ledger.reserve(frame_bytes(&frame))?;
-    Ok(frame)
+    decode_item(ctx, image, decoder)
 }
 
-/// [`decode_coded`] with the decoder given (a grid tile shares its ledger with the others).
+/// [`decode_coded`] with the decoder given (a grid tile shares its ledger with the others). The
+/// frame is booked for [`held_bytes`] from the moment the decoder makes it; the caller gives
+/// that back when it frees the frame.
 fn decode_item(ctx: &Ctx<'_>, image: &Image, mut decoder: Decoder) -> Result<Frame, Error> {
     let ImageKind::Coded {
         codec: Codec::Av1,
@@ -315,19 +365,26 @@ fn decode_item(ctx: &Ctx<'_>, image: &Image, mut decoder: Decoder) -> Result<Fra
         return Err(Error::Unsupported("avif codec"));
     };
     let (unit, _held) = temporal_unit(ctx, image.id, av1c)?;
-    decoder
-        .decode_temporal_unit(&unit, Format::Section5, ctx.cancel)?
-        .pop()
-        .ok_or(Error::Invalid("avif item has no shown frame"))
+    let (mut frames, booked) = decoder.decode_unit_booked(&unit, Format::Section5, ctx.cancel)?;
+    let frame = frames.pop();
+    drop(frames);
+    let Some(frame) = frame else {
+        ctx.ledger.release(booked);
+        return Err(Error::Invalid("avif item has no shown frame"));
+    };
+    rebook(&ctx.ledger, booked, held_bytes(&frame))?;
+    Ok(frame)
 }
 
 /// The Section 5 stream of one item: the `av1C` configOBUs, then the item data.
 fn temporal_unit<'a>(ctx: &'a Ctx<'_>, id: u32, av1c: &Av1c) -> Result<(Vec<u8>, Held<'a>), Error> {
     let config = Heif::slice(ctx.file, av1c.config_obus).ok_or(Error::Truncated)?;
+    // A copy over the item-read share is refused as an allocation (`AllocLimit`), so a grid
+    // retries it like any other refusal.
     let data = ctx
         .heif
         .item_bytes(ctx.file, id, ctx.ilimits, ctx.cancel)
-        .map_err(container)?;
+        .map_err(isobmff_error)?;
     let total = config
         .len()
         .checked_add(data.len())
@@ -353,14 +410,14 @@ fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
     let max_threads = ctx.limits.max_threads.max(1);
     let workers = max_threads.min(grid.tiles.len());
     // Every worker's `item_bytes` call has its own budget, and a multi-extent item is copied
-    // outside the ledger: the eighth of `max_alloc` given to the reads (by `decode_avif` and
-    // `decode_avif_item`) is split between the workers, so the copies that are live at once stay
-    // within it.
+    // outside the ledger: in the parallel phase the eighth of `max_alloc` given to the reads (by
+    // `decode_avif` and `decode_avif_item`) is split between the workers, so the copies that are
+    // live at once stay within it. Tile 0 and the serial retry read alone, with the whole eighth.
     let ilimits = isobmff::Limits {
         max_alloc: ctx.ilimits.max_alloc / workers,
         ..*ctx.ilimits
     };
-    let ctx = &Ctx {
+    let split = &Ctx {
         heif: ctx.heif,
         file: ctx.file,
         options: ctx.options,
@@ -374,7 +431,10 @@ fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
         ..*ctx.limits
     };
     let canvas: Mutex<Option<Canvas>> = Mutex::new(None);
-    run_parallel(grid.tiles.len(), max_threads, |i| {
+    // Decodes tile `i`, pastes it and frees it. The frame is booked from when its decoder makes
+    // it, through its transforms (`transform_frame`), until it is pasted and freed. Tile 0 makes
+    // the canvas.
+    let put = |ctx: &Ctx<'_>, i: usize| -> Result<(), Error> {
         if ctx.cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
@@ -386,27 +446,44 @@ fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
         let decoder = Decoder::with_ledger(ctx.options.clone(), inner, Arc::clone(&ctx.ledger));
         let frame = decode_item(ctx, &tile, decoder)?;
         // Each tile gets its own transforms before it is pasted at its new size.
-        let frame = ctx.transformed(&tile.transforms, frame)?;
-        // The tile's samples are booked until it is pasted; its metadata stays booked by the
-        // decoder.
-        let _held = ctx.ledger.charge(frame_bytes(&frame))?;
-        let i = u32::try_from(i).map_err(|_| Error::Invalid("avif grid tile count"))?;
+        let frame = ctx.transformed_booked(&tile.transforms, frame)?;
         let mut guard = canvas.lock().unwrap_or_else(|e| e.into_inner());
-        // The canvas is sized by whichever tile finishes first; tile 0 then sets the properties
-        // of the output frame, as in a serial decode.
-        if guard.is_none() {
-            let mut c = Canvas::new(&frame, grid, ctx.limits, &ctx.ledger)?;
-            c.first = i;
-            *guard = Some(c);
+        let r = paste(&mut guard, &frame, i, grid, ctx);
+        drop(guard);
+        let n = held_bytes(&frame);
+        drop(frame);
+        ctx.ledger.release(n);
+        r
+    };
+    // Tile 0 decodes first, alone: it sizes the canvas and gives the output frame its
+    // properties, and every other tile then decodes with the canvas booked, as in a serial
+    // decode.
+    put(ctx, 0)?;
+    let rest = grid.tiles.len() - 1;
+    let refused = AtomicUsize::new(usize::MAX);
+    let r = run_parallel(rest, max_threads, |k| {
+        let r = put(split, k + 1);
+        if matches!(r, Err(Error::AllocLimit | Error::OutOfMemory)) {
+            refused.fetch_min(k + 1, Ordering::Relaxed);
         }
-        let Some(c) = guard.as_mut() else {
-            return Err(Error::Invalid("avif grid tile count"));
-        };
-        if i == 0 && c.first != 0 {
-            c.take_properties(&frame, &ctx.ledger)?;
+        r
+    });
+    match r {
+        // A tile refused while others decoded beside it may fit alone. As `decode` does for a
+        // batch, the tiles from the lowest refused one decode again one at a time, each with only
+        // the canvas booked beside it and the whole item-read share, as in a serial decode (a
+        // tile that was pasted already is pasted again with the same samples), so the result is
+        // the serial one. The error of `run_parallel` is the one of its lowest failing tile: a
+        // refusal there is `refused`.
+        Err(Error::AllocLimit | Error::OutOfMemory) if max_threads.min(rest) > 1 => {
+            for i in refused.load(Ordering::Relaxed)..grid.tiles.len() {
+                put(ctx, i)?;
+            }
         }
-        c.paste(&frame, i % grid.columns, i / grid.columns)
-    })?;
+        r => {
+            r?;
+        }
+    }
     canvas
         .into_inner()
         .unwrap_or_else(|e| e.into_inner())
@@ -414,13 +491,36 @@ fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
         .ok_or(Error::Invalid("avif grid tile count"))
 }
 
+/// Pastes `frame`, tile `i` of `grid`, into the canvas; tile 0 makes it.
+fn paste(
+    canvas: &mut Option<Canvas>,
+    frame: &Frame,
+    i: usize,
+    grid: &Grid,
+    ctx: &Ctx<'_>,
+) -> Result<(), Error> {
+    if canvas.is_none() {
+        *canvas = Some(Canvas::new(frame, grid, ctx.limits, &ctx.ledger)?);
+    }
+    let Some(c) = canvas.as_mut() else {
+        return Err(Error::Invalid("avif grid tile count"));
+    };
+    let i = u32::try_from(i).map_err(|_| Error::Invalid("avif grid tile count"))?;
+    c.paste(frame, i % grid.columns, i / grid.columns)
+}
+
 /// The output frame of a grid and the tile size it was sized for.
 struct Canvas {
     frame: Frame,
     tile_w: u32,
     tile_h: u32,
-    /// Index of the tile the canvas was sized from (0 in a serial decode).
-    first: u32,
+}
+
+/// The ledger bytes an item frame is booked for while the call holds it: its sample buffers
+/// and the metadata its decoder booked. Its plane list (three `Plane` headers) is not booked; it
+/// is part of the uncharged slack of each decoder.
+fn held_bytes(f: &Frame) -> usize {
+    frame_bytes(f).saturating_add(metadata_bytes(f))
 }
 
 /// The heap bytes of a frame's sample buffers: their capacity, as an output plane taken from
@@ -539,24 +639,7 @@ impl Canvas {
             },
             tile_w: tw,
             tile_h: th,
-            first: 0,
         })
-    }
-
-    /// Takes the output frame's properties (everything but the size, format and samples) from
-    /// `tile`, tile 0 of the grid.
-    fn take_properties(&mut self, tile: &Frame, ledger: &Ledger) -> Result<(), Error> {
-        let f = &mut self.frame;
-        // The metadata copy is booked (the old one is given back) before it is made.
-        ledger.reserve(metadata_bytes(tile))?;
-        ledger.release(metadata_bytes(f));
-        f.color = tile.color;
-        f.metadata = tile.metadata.clone();
-        f.film_grain_applied = tile.film_grain_applied;
-        f.frame_type = tile.frame_type;
-        f.temporal_id = tile.temporal_id;
-        f.spatial_id = tile.spatial_id;
-        Ok(())
     }
 
     /// Copies `tile` to tile position (`col`, `row`), clipped to the output.
@@ -767,7 +850,57 @@ mod tests {
         ts: &[Transform],
     ) -> Result<Frame, Error> {
         let cancel = AtomicBool::new(cancel);
-        transform_frame(options, limits, &led(limits), &cancel, ts, numbered())
+        let ledger = led(limits);
+        let f = numbered();
+        ledger.reserve(frame_bytes(&f))?;
+        transform_frame(options, limits, &ledger, &cancel, ts, f)
+    }
+
+    #[test]
+    fn transform_books_its_budget_and_then_only_its_output() {
+        let p = size_of::<isobmff::Plane>();
+        let quarter = [Transform::Rotate(90), Transform::Rotate(270)];
+        assert_eq!(
+            transform_budget(100, 3, Chroma::Yuv422, &quarter),
+            2 * (151 + 3 * p)
+        );
+        let mirror = [Transform::Mirror(isobmff::Axis::LeftRight)];
+        assert_eq!(transform_budget(100, 3, Chroma::Yuv420, &mirror), 0);
+        let rot = [Transform::Rotate(90)];
+        let input = frame_bytes(&numbered());
+        let budget = transform_budget(input, 3, Chroma::Yuv420, &rot);
+        assert_eq!(budget, input + 3 * p);
+        let cancel = AtomicBool::new(false);
+        for (room, ok) in [(input + budget, true), (input + budget - 1, false)] {
+            let ledger = Ledger::default();
+            ledger.reset(crate::ledger::SMALL + room, 0).unwrap();
+            ledger.reserve(input).unwrap();
+            let r = transform_frame(&ON, &Limits::default(), &ledger, &cancel, &rot, numbered());
+            assert_eq!(r.is_ok(), ok, "room {room}");
+            // The output stays booked in place of the input; a refusal gives the input back.
+            let held = r.as_ref().map_or(0, frame_bytes);
+            assert_eq!(ledger.left(), room - held, "room {room}");
+        }
+    }
+
+    // A grid tile comes booked with its metadata: a refused transform gives all of it back, so a
+    // refused tile leaves nothing booked for the serial retry.
+    #[test]
+    fn refused_transform_gives_back_the_metadata_booking() {
+        let mut f = numbered();
+        f.metadata.push(crate::Metadata {
+            metadata_type: 4,
+            payload: vec![0; 100],
+        });
+        let held = held_bytes(&f);
+        let ledger = Ledger::default();
+        ledger.reset(crate::ledger::SMALL + held, 0).unwrap();
+        ledger.reserve(held).unwrap();
+        let cancel = AtomicBool::new(false);
+        let rot = [Transform::Rotate(90)];
+        let r = transform_frame(&ON, &Limits::default(), &ledger, &cancel, &rot, f);
+        assert_eq!(r, Err(Error::AllocLimit));
+        assert_eq!(ledger.left(), held);
     }
 
     const ON: Options = Options {

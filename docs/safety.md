@@ -33,7 +33,10 @@ bit for bit. CI checks this four ways:
 - `cargo test` runs three times in `test` (best tier, `AV1_SIMD=scalar`, `AV1_SIMD=avx2`) and
   twice natively on an arm64 runner in `arm64` (NEON, scalar). The hosted x86_64 runners do not
   all have AVX-512: the best tier there is AVX-512 or AVX2, whichever the CPU has (the job log
-  prints it), so the AVX-512 tier is exercised only on a runner that has it.
+  prints it), so the AVX-512 tier is exercised only on a runner that has it. A job on a runner
+  without it gets a "No AVX-512" warning annotation: such a run of the required check, and of
+  the `tiers` gate, passes without the AVX-512 kernels having run, so a change to them needs a
+  run that landed on an AVX-512 runner (rerun until one does).
 - The parity gate decodes the corpus with the best tier against dav1d and aomdec, and with the
   scalar and AVX2 tiers against the best tier (gate `tiers`); parity-arm64 runs the same gate
   natively on aarch64 (NEON against dav1d and aomdec, scalar against NEON).
