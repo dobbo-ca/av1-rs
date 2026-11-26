@@ -115,11 +115,16 @@ impl Ledger {
     }
 
     /// An empty `Vec` with room for `n` elements and the bytes charged for it: a pooled buffer
-    /// (the smallest that is large enough) or a new one, charged first.
+    /// charged exactly `n` elements, or a new one, charged first.
+    ///
+    /// A larger pooled buffer is freed instead of reused: it would keep its larger charge, so
+    /// whether later charges fit would depend on what the pool holds, and a decode on one
+    /// thread could be refused where the same decode from an emptied pool fits.
     pub(crate) fn take<T: Pooled>(&self, n: usize) -> Result<(Vec<T>, usize), Error> {
         if n == 0 {
             return Ok((Vec::new(), 0));
         }
+        let bytes = n.checked_mul(size_of::<T>()).ok_or(Error::AllocLimit)?;
         let found = {
             let mut p = self.lock();
             let bin = T::bin(&mut p);
@@ -133,10 +138,13 @@ impl Ledger {
             found
         };
         if let Some((mut v, charged)) = found {
-            v.clear();
-            return Ok((v, charged));
+            if charged == bytes {
+                v.clear();
+                return Ok((v, charged));
+            }
+            drop(v);
+            self.release(charged);
         }
-        let bytes = n.checked_mul(size_of::<T>()).ok_or(Error::AllocLimit)?;
         self.reserve(bytes)?;
         let mut v = Vec::new();
         if v.try_reserve_exact(n).is_err() {
@@ -339,9 +347,16 @@ mod tests {
         // Pooled bytes are still booked, but count as free.
         assert_eq!(l.left(), 100);
         assert_eq!(l.peak(), SMALL as u64 + 40);
-        // A smaller request reuses the buffer and its charge.
-        let (v, c) = l.take::<u16>(10).unwrap();
+        // A request of the same size reuses the buffer and its charge.
+        let (v, c) = l.take::<u16>(20).unwrap();
         assert!(v.capacity() >= 20 && v.is_empty() && c == 40);
+        l.give(v, c);
+        // A smaller one frees it and is charged its own size, so what fits next does not
+        // depend on the pool: 80 bytes are left, as from an empty pool.
+        let (v, c) = l.take::<u16>(10).unwrap();
+        assert!(v.capacity() >= 10 && v.is_empty() && c == 20);
+        assert_eq!(l.left(), 80);
+        assert!(l.lock().u16s.is_empty());
         let z = l.zeros::<u16>(5).unwrap();
         assert_eq!(*z, [0u16; 5]);
         drop(z);
