@@ -962,9 +962,14 @@ mod tests {
         p.point_cr_value[0] = 128;
         p.point_cr_scaling[0] = 64;
         let go = AtomicBool::new(false);
-        let run = |max_alloc: usize, threads: usize| {
+        // `seed` elements are pooled first (when they fit), as a buffer a filter before grain
+        // left behind.
+        let run = |max_alloc: usize, threads: usize, seed: usize| {
             let ledger = Ledger::default();
             ledger.reset(max_alloc, 0).unwrap();
+            if seed > 0 {
+                drop(ledger.zeros::<i32>(seed));
+            }
             let mut got = [vec![0; y.len()], vec![0; u.len()], vec![0; v.len()]];
             let [g0, g1, g2] = &mut got;
             let r = apply_film_grain(
@@ -980,19 +985,39 @@ mod tests {
         };
         let (mut fitted, mut refused) = (0, 0);
         for max_alloc in (crate::ledger::SMALL..400 << 10).step_by(4 << 10) {
-            let want = run(max_alloc, 1);
+            let want = run(max_alloc, 1, 0);
             fitted += usize::from(want.is_ok());
             refused += usize::from(want.is_err());
             for _ in 0..4 {
                 for threads in [2, 4] {
                     assert!(
-                        run(max_alloc, threads) == want,
+                        run(max_alloc, threads, 0) == want,
                         "max_alloc {max_alloc}: {threads} threads differ from 1"
                     );
                 }
             }
         }
         // Both sides of the limit were checked.
+        assert!(
+            fitted > 0 && refused > 0,
+            "{fitted} fitted, {refused} refused"
+        );
+        // A pooled buffer larger than a stripe (a 70 x 70 loop restoration window; a stripe is
+        // 34 * 130 elements here) changes nothing either, in 1 KiB steps so a gap of the 1920
+        // bytes between the two sizes is not stepped over.
+        let (mut fitted, mut refused) = (0, 0);
+        for max_alloc in (crate::ledger::SMALL..400 << 10).step_by(1 << 10) {
+            let want = run(max_alloc, 1, 70 * 70);
+            assert!(want == run(max_alloc, 1, 0), "max_alloc {max_alloc}: pool");
+            fitted += usize::from(want.is_ok());
+            refused += usize::from(want.is_err());
+            for threads in [2, 4] {
+                assert!(
+                    run(max_alloc, threads, 70 * 70) == want,
+                    "max_alloc {max_alloc}: {threads} threads differ from 1, pool seeded"
+                );
+            }
+        }
         assert!(
             fitted > 0 && refused > 0,
             "{fitted} fitted, {refused} refused"
