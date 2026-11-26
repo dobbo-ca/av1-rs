@@ -1297,7 +1297,9 @@ impl Decoder {
 /// frame decodes them in order on the calling thread, since intra block copy reads other
 /// tiles), then each filter in row bands, column strips or stripes. Every stage writes disjoint
 /// samples and keeps the spec order where it matters, so the result is the same for every
-/// `max_threads` (docs/threading.md).
+/// `max_threads` (docs/threading.md). A threaded decode refused by the ledger decodes again on
+/// one thread from a state that [`FrameState::reuse`] clears, so `fs` must be as `reuse` or
+/// `new` made it (every caller but the `wrapup_frame` test frames passes one).
 fn decode_frame(
     mut fs: FrameState,
     ledger: &Arc<Ledger>,
@@ -1341,7 +1343,27 @@ fn decode_frame(
         out: Mutex::new(Vec::new()),
     };
     let item: &(dyn Fn(Job, usize) -> Result<(), Error> + Sync) = &|job, i| w.item(job, i);
-    let planes = with_team(threads, item, |team| w.lead(team))?;
+    let planes = match with_team(threads, item, |team| w.lead(team)) {
+        Ok(p) => p,
+        Err(Error::AllocLimit | Error::OutOfMemory) => {
+            // Whether a refused booking of a band or a tile state comes depends on how many items
+            // ran at once, so the frame decodes again on one thread, which books none of them:
+            // the result is the one of `max_threads = 1`. Every buffer of the team goes back and
+            // the pool is emptied first, so no buffer the threads left (pooled at a larger
+            // charge) is reused. The serial path never comes back here, so its refusal is final.
+            // Cost: a refused frame decodes its tiles twice (the filters changed CurrFrame in
+            // place); that costs time only near the limit.
+            drop((w.curr, w.cdef, w.up_cdef, w.up_curr, w.out));
+            let spare =
+                w.fs.into_inner()
+                    .or_else(|| w.tiles_fs.into_inner().unwrap_or_else(|e| e.into_inner()));
+            ledger.evict();
+            let mut fs = FrameState::reuse(spare, h, seq, ledger)?;
+            fs.frame_cdf = Some(w.frame_cdf);
+            return decode_frame(fs, ledger, 1, h, seq, data, tiles, cancel);
+        }
+        Err(e) => return Err(e),
+    };
     let mut fs =
         w.fs.into_inner()
             .ok_or(Error::Invalid("frame decode left no state"))?;
@@ -2584,6 +2606,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// At every `max_alloc` from too small for the frame to enough, 2, 3 and 6 threads give what
+    /// 1 thread gives (the same state, or the same error), every time: a refusal that depends on
+    /// how many tile states or bands were booked at once is retried on one thread.
+    #[test]
+    fn every_max_alloc_gives_the_one_thread_result() {
+        let (mut fitted, mut refused) = (0, 0);
+        for max_alloc in (crate::ledger::SMALL..1 << 20).step_by(8 << 10) {
+            let (want, _) = run_tiles(1, 1, max_alloc);
+            let no = matches!(want, Err(Error::AllocLimit));
+            fitted += usize::from(!no);
+            refused += usize::from(no);
+            for _ in 0..3 {
+                for threads in [2, 3, 6] {
+                    let (got, ledger) = run_tiles(1, threads, max_alloc);
+                    assert!(ledger.peak() <= max_alloc as u64);
+                    match (&want, &got) {
+                        (Ok(a), Ok(b)) => assert_same_state(a, b),
+                        (Err(a), Err(b)) => assert_eq!(a, b, "max_alloc {max_alloc}"),
+                        _ => panic!(
+                            "max_alloc {max_alloc}: {threads} threads give {:?}, 1 thread {:?}",
+                            got.as_ref().err(),
+                            want.as_ref().err()
+                        ),
+                    }
+                }
+            }
+        }
+        // Both sides of the limit were checked.
+        assert!(
+            fitted > 0 && refused > 0,
+            "{fitted} fitted, {refused} refused"
+        );
     }
 
     #[test]
