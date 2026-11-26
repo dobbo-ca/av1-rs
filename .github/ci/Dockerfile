@@ -1,7 +1,7 @@
 # CI image: the checks, oracles, benches and fuzzing run in this image, built with BuildKit on
 # GitHub-hosted runners (ubuntu-24.04 for x86_64, ubuntu-24.04-arm for aarch64; every stage builds
 # natively for the runner's architecture). The one git dependency, isobmff-rs, is fetched in
-# `toolchain` with the App token (below); every later stage builds offline. The fuzz crate's
+# `toolchain`; every later stage builds offline. The fuzz crate's
 # dependency (libfuzzer-sys from crates.io) is fetched in `toolchain`, before the source is copied.
 FROM rust:1.99.1-bookworm AS toolchain
 RUN rustup component add rustfmt clippy
@@ -10,13 +10,8 @@ COPY tests/fuzz/Cargo.toml tests/fuzz/Cargo.lock tests/fuzz/
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src tests/fuzz/fuzz_targets && touch src/lib.rs \
     && for t in probe decode frames_threads avif simd_lf simd_grain simd_lr simd_cdef simd_ipred simd_itx simd_threads simd_entropy simd_alloc; do touch tests/fuzz/fuzz_targets/$t.rs; done
-# isobmff-rs is not public: the dobbo-ca-ci-read App token reaches this one RUN as
-# the BuildKit secret gh_token, and the insteadOf rewrite is removed in the same command.
-RUN --mount=type=secret,id=gh_token \
-    git config --global url."https://x-access-token:$(cat /run/secrets/gh_token)@github.com/".insteadOf "https://github.com/" \
-    && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo fetch --locked \
+RUN CARGO_NET_GIT_FETCH_WITH_CLI=true cargo fetch --locked \
     && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo fetch --locked --manifest-path tests/fuzz/Cargo.toml \
-    && git config --global --unset-all url."https://x-access-token:$(cat /run/secrets/gh_token)@github.com/".insteadOf \
     && rm -rf src tests/fuzz/fuzz_targets
 
 FROM toolchain AS src
@@ -218,7 +213,7 @@ RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked \
     sh tests/parity/fetch.sh tests/parity/corpus.txt /data && sh tests/parity/profile.sh prep /bench && du -sh /bench
 
 # v4-diag.yml: which false-deps target features this rustc knows (tests/parity/v4-diag.sh).
-# Needs no crate source and no token.
+# Needs no crate source.
 FROM rust:1.99.1-bookworm AS v4-diag
 ARG DIAG_RUN=0
 COPY tests/parity/v4-diag.sh /v4-diag.sh

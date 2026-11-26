@@ -54,15 +54,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { lfs: false }
-      - name: Create isobmff-rs read token (dobbo-ca-ci-read app)
-        id: app
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          app-id: ${{ vars.CI_READ_APP_ID }}
-          private-key: ${{ secrets.CI_READ_APP_KEY }}
-          owner: dobbo-ca
-          repositories: isobmff-rs
-          permission-contents: read
       - name: Free disk
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc && df -h /
       # ASan cannot map its shadow memory with the 32-bit mmap randomisation of recent kernels.
@@ -78,8 +69,6 @@ jobs:
           tags: av1-fuzz:local
           cache-from: type=gha,scope=av1-rs-fuzz-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=av1-rs-fuzz-${{ matrix.arch }}
-          secrets: |
-            gh_token=${{ steps.app.outputs.token }}
       # The corpus is kept between runs: restored here, copied into the container, copied back
       # out and saved, so a run goes on from where the last one stopped. One cache per target
       # and architecture; a first arm64 run starts from the x86_64 corpus of the same target.
