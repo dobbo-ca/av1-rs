@@ -469,13 +469,14 @@ fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
         r
     });
     match r {
-        // A tile refused while others decoded beside it may fit alone. As `decode` does for a
-        // batch, the tiles from the lowest refused one decode again one at a time, each with only
+        // A tile refused while others decoded beside it, or while it read with a split item-read
+        // share (`workers > 1`, even when it is the only tile after tile 0), may fit alone. As
+        // `decode` does for a batch, the tiles from the lowest refused one decode again one at a time, each with only
         // the canvas booked beside it and the whole item-read share, as in a serial decode (a
         // tile that was pasted already is pasted again with the same samples), so the result is
         // the serial one. The error of `run_parallel` is the one of its lowest failing tile: a
         // refusal there is `refused`.
-        Err(Error::AllocLimit | Error::OutOfMemory) if max_threads.min(rest) > 1 => {
+        Err(Error::AllocLimit | Error::OutOfMemory) if workers > 1 => {
             for i in refused.load(Ordering::Relaxed)..grid.tiles.len() {
                 put(ctx, i)?;
             }
