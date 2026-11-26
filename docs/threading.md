@@ -22,7 +22,10 @@ crate denies `unsafe` outside `src/simd` (docs/safety.md).
   pasted and freed, the transforms of each tile (their output and the scratch `isobmff` may
   allocate, booked before they run and passed to `isobmff` as its exact limit) and the primary
   image held while the alpha item decodes are charged to it too. Item bytes inside `isobmff` (an
-  eighth of `max_alloc`, split between the workers, and kept out of the ledger's share) are not.
+  eighth of `max_alloc`, kept out of the ledger's share; split between the workers while tiles
+  decode in parallel, whole for tile 0 and the retry) are not; a copy over its share is
+  `AllocLimit`. A refused tile gives back its whole booking, metadata included, and a tile's
+  decoder gives back metadata that follows its last frame.
   A tile refused (`AllocLimit`, `OutOfMemory`) while others decoded beside it is retried as
   `decode` retries a batch: the tiles from the lowest refused one decode again one at a time,
   each with only the canvas booked beside it, as in a serial decode. So for a grid with at least
@@ -60,7 +63,10 @@ crate denies `unsafe` outside `src/simd` (docs/safety.md).
   before it, those of earlier units included, are in `take_frames`. When any frame of a flush
   hits `AllocLimit` or `OutOfMemory`, the results are dropped and the flush decodes its frames
   one at a time with all the threads, which is exactly the single decode path, so a refusal is
-  the one a loop gives. With `max_threads = 1` the batch is a loop of `decode_temporal_unit`.
+  not caused by the frames that decoded beside it. It can still come at an earlier unit than in
+  a loop, or where a loop is not refused: the batch keeps every unit's frames booked until it
+  returns, while a loop hands them back unit by unit. With `max_threads = 1` the batch decodes
+  the frames as a loop of `decode_temporal_unit` does, with the same caveat about held frames.
   Differences from the loop that are not visible in the output: the slots a frame refreshes are
   emptied when the frame is committed, not before its tiles decode, so the old planes are held a
   little longer; and `W` frame states are alive at once (docs/limits.md).

@@ -94,7 +94,10 @@ RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked \
 # Parity gate (tests/parity/run.sh full): av1-rs vs dav1d and aomdec on the corpus, and one
 # thread vs default threads. The stage does not fail on a diff: the report (summary.md, *.diff,
 # status) is the build output (target parity-report), and the workflow fails on `status`. Job
-# `parity` builds it on x86_64, job `parity-arm64` on aarch64 (NEON, and the scalar tier).
+# `parity` builds it on x86_64, job `parity-arm64` on aarch64 (NEON, and the scalar tier). The
+# scratch dir of the run (/work, several GB of decoded output; /work-tr for the transform gate,
+# /work for the bench) is removed in the same RUN, so it never reaches the layer that the
+# workflow exports to the Actions cache.
 FROM oracles AS parity
 COPY . .
 COPY --from=data /data.list /data.list
@@ -103,7 +106,7 @@ RUN --mount=type=cache,id=av1-rs-target-parity,sharing=locked,target=/src/target
     && cargo build --locked --release --example oracle --example avifx && cp target/release/examples/oracle /usr/local/bin/av1-oracle && cp target/release/examples/avifx /usr/local/bin/av1-avifx
 RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked \
     sh tests/parity/fetch.sh tests/parity/corpus.txt /data \
-    && mkdir -p /report && { sh tests/parity/run.sh full /report; echo $? > /report/status; }
+    && mkdir -p /report && { sh tests/parity/run.sh full /report; echo $? > /report/status; } && rm -rf /work
 
 FROM scratch AS parity-report
 COPY --from=parity /report /
@@ -148,7 +151,7 @@ RUN --mount=type=cache,id=av1-rs-target-parity,sharing=locked,target=/src/target
     && cargo build --locked --release --example oracle && cp target/release/examples/oracle /usr/local/bin/av1-oracle
 RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked \
     sh tests/parity/fetch.sh tests/parity/corpus.txt /data \
-    && mkdir -p /report && { sh tests/parity/transform.sh /report; echo $? > /report/status; }
+    && mkdir -p /report && { sh tests/parity/transform.sh /report; echo $? > /report/status; } && rm -rf /work-tr
 
 FROM scratch AS transform-report
 COPY --from=transform /report /
@@ -192,7 +195,7 @@ RUN --mount=type=cache,id=av1-rs-target-bench,sharing=locked,target=/src/target 
 FROM bench-bin AS bench
 ARG BENCH_RUN=0
 RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked \
-    echo "run $BENCH_RUN" && sh tests/parity/fetch.sh tests/parity/corpus.txt /data && mkdir -p /report && { sh tests/parity/bench.sh /report; echo $? > /report/status; }
+    echo "run $BENCH_RUN" && sh tests/parity/fetch.sh tests/parity/corpus.txt /data && mkdir -p /report && { sh tests/parity/bench.sh /report; echo $? > /report/status; } && rm -rf /work
 
 FROM scratch AS bench-report
 COPY --from=bench /report /
