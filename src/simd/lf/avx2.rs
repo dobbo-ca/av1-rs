@@ -1,5 +1,5 @@
 //! AVX2 loop filter kernel: 16 samples along the edge per vector, one 16-bit lane each.
-//! The AVX-512 tier uses it too (docs/safety.md).
+//! The AVX-512 tier uses it too for runs of 16 or fewer samples (longer runs: `avx512.rs`).
 
 use super::{Edge, ROWS};
 use crate::simd::x86::{load256_u16, store256_u16};
