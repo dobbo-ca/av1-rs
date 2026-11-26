@@ -162,6 +162,31 @@ cannot open perf events), or under callgrind when perf cannot record. The job su
 self time by source file per class; the artifact has the per-symbol and per-line reports. Never
 profile on a workstation: CI only.
 
+The job summary starts with the runner's CPU model and AVX-512 subsets. With `simd=avx512`
+the job stops before the image build on a runner without AVX-512; dispatch it again.
+
+### The SIMD kernels before the AVX-512 kernels
+
+Profile run 45889645675 (`simd=avx512`, main e0275cf plus the CPU line), AMD EPYC 9V45 (Zen 5,
+4 vCPU, AVX-512 F, BW, VL, DQ, CD, VBMI, VBMI2, VNNI, IFMA, BITALG, VPOPCNTDQ, BF16). The
+AVX-512 tier then ran the AVX2 kernels. Self time over all classes, inlining off
+(`all.noinline.symbol.txt`), one thread:
+
+| kernel family | AVX2 symbols | share |
+|---|---|---|
+| itx | `inverse_transform_add` 5.5%, `transform_1d` 4.0% (N = 8: 1.8%, 16: 1.4%, 32: 0.6%, 64: 0.2%) | 9.5% |
+| cdef | `filter` 4.8%, `dir_costs` 0.7% | 5.5% |
+| lf | `filter` | 1.8% |
+| lr | `box_pass` 1.0%, `weigh` 0.2% (and `wiener`, 1.3% in avifhi) | 1.2% |
+| ipred | `smooth` 0.8%, `cfl` 0.4%, `filter_edge` 0.2% | 1.4% |
+| entropy | `adapt` | 0.5% |
+
+The rest is scalar: coefficient and symbol decoding (`coeffs` 27%, `transform_block` 17%,
+`read_levels`, `read_symbol`), the CDEF and loop filter drivers (`cdef::filter` 4.5%,
+`lf::filter_run`, `lf::edge_params`) and `memmove`/`memset`. By class, CDEF is the largest
+kernel in tiles8 (9% + 8% for its driver) and q10; itx in allintra (9%) and avifhi; the loop
+filter is 4% in avifhi and tiles8.
+
 ## Earlier runs
 
 2026-11-23, main 49f2864 (old bench, 24 streams, 100 frames, `.yuv` written by av1-rs only):
