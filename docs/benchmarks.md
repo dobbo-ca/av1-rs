@@ -188,6 +188,23 @@ The rest is scalar: coefficient and symbol decoding (`coeffs` 27%, `transform_bl
 kernel in tiles8 (9% + 8% for its driver) and q10; itx in allintra (9%) and avifhi; the loop
 filter is 4% in avifhi and tiles8.
 
+## AVX-512 kernels
+
+Each candidate was benched on its branch (`bench` dispatch with `avx512`): the SIMD tiers table
+times the same build with `AV1_SIMD=avx2` and with the AVX-512 tier in one run on one machine.
+The figure is the sum of the nine classes, one thread; a kernel stays only if it is faster in
+every run. No run showed a class that got slower with the AVX-512 tier (no sign of a
+frequency drop on these CPUs).
+
+| kernel | change | runs: CPU, avx2 ms, avx512 ms, avx512 / avx2 | result |
+|---|---|---|---|
+| cdef `filter` | 32 samples per vector (8x8, 8x4, 4x8 blocks), AVX-512 BW | 45895171894: Xeon Platinum 8573C, 1618, 1584, 97.9%; 45898261819: Xeon 6975P-C, 1274, 1263, 99.1% | kept |
+| itx | `itx_kernels!` on 16 `i32` lanes for blocks at least 16 wide, AVX-512 F (commit f13d71f) | 45892560939: Xeon 6975P-C, 1266, 1267, 100% | dropped: most of the itx time is in blocks up to 8 wide (`transform_1d::<_, 8>`), which 16 lanes cannot fill |
+| lr Wiener, self guided | 16 `i32` lanes for blocks at least 16 wide, AVX-512 F (commit 993c03a) | 45896614027: AMD EPYC 9V45, 1077, 1076, 100% | dropped: 1.2% of the time, below what a bench can show |
+
+Not tried (each below 1% of the time in the profile): ipred `smooth`, `cfl`, `filter_edge`,
+cdef `dir_costs`, entropy `adapt`.
+
 ## Earlier runs
 
 2026-11-23, main 49f2864 (old bench, 24 streams, 100 frames, `.yuv` written by av1-rs only):
