@@ -17,7 +17,8 @@ threads" is 4) and `bench-arm64` on `ubuntu-24.04-arm` (aarch64, 4 vCPU). The su
 line names the CPU model and `nproc`. Hosted runners are shared VMs and noisy: every figure is
 the best of 5 runs, and a difference of a few percent between two runs means nothing. A hosted
 x86_64 runner does not always have AVX-512; on one without it the v4 build cannot run, so the v4
-columns and the avx512 tier show `-`. The numbers before the move (the self-hosted runner, 16
+columns and the avx512 tier show `-`. A dispatch with the input `avx512` stops the x86_64 job at
+once on such a runner (dispatch it again) and skips `bench-arm64`. The numbers before the move (the self-hosted runner, 16
 threads, AVX-512) are not comparable with these: compare runs on the same runner type only.
 
 `bench-arm64` measures the NEON tier: dav1d 1.0.0 (bookworm's arm64 build, with its NEON asm;
