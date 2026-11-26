@@ -891,4 +891,78 @@ mod tests {
             }
         }
     }
+
+    /// At every `max_alloc` from too small for one band to room for several, 2 and 4 threads
+    /// give what 1 thread gives (the samples, or the same error), every time: a refusal that
+    /// depends on how many bands ran at once is retried on one thread.
+    #[test]
+    fn every_max_alloc_gives_the_one_thread_result() {
+        let (w, h) = (64usize, 200usize);
+        let (cw, ch) = (w / 2, h / 2);
+        let y: Vec<u16> = (0..w * h).map(|i| (i * 7 % 256) as u16).collect();
+        let u: Vec<u16> = (0..cw * ch).map(|i| (i * 5 % 256) as u16).collect();
+        let v: Vec<u16> = (0..cw * ch).map(|i| (i * 3 % 256) as u16).collect();
+        let input = GrainInput {
+            bit_depth: 8,
+            mono_chrome: false,
+            subsampling_x: true,
+            subsampling_y: true,
+            matrix_coefficients: 1,
+            width: w,
+            height: h,
+            planes: [&y, &u, &v],
+            strides: [w, cw, cw],
+        };
+        let mut p = FilmGrainParams {
+            apply_grain: true,
+            grain_seed: 4321,
+            num_y_points: 1,
+            num_cb_points: 1,
+            num_cr_points: 1,
+            overlap_flag: true,
+            ..Default::default()
+        };
+        p.point_y_value[0] = 128;
+        p.point_y_scaling[0] = 64;
+        p.point_cb_value[0] = 128;
+        p.point_cb_scaling[0] = 64;
+        p.point_cr_value[0] = 128;
+        p.point_cr_scaling[0] = 64;
+        let go = AtomicBool::new(false);
+        let run = |max_alloc: usize, threads: usize| {
+            let ledger = Ledger::default();
+            ledger.reset(max_alloc, 0).unwrap();
+            let mut got = [vec![0; y.len()], vec![0; u.len()], vec![0; v.len()]];
+            let [g0, g1, g2] = &mut got;
+            let r = apply_film_grain(
+                &p,
+                &input,
+                [g0, g1, g2],
+                &ledger,
+                &go,
+                threads,
+                Simd::scalar(),
+            );
+            r.map(|()| got)
+        };
+        let (mut fitted, mut refused) = (0, 0);
+        for max_alloc in (crate::ledger::SMALL..400 << 10).step_by(4 << 10) {
+            let want = run(max_alloc, 1);
+            fitted += usize::from(want.is_ok());
+            refused += usize::from(want.is_err());
+            for _ in 0..4 {
+                for threads in [2, 4] {
+                    assert!(
+                        run(max_alloc, threads) == want,
+                        "max_alloc {max_alloc}: {threads} threads differ from 1"
+                    );
+                }
+            }
+        }
+        // Both sides of the limit were checked.
+        assert!(
+            fitted > 0 && refused > 0,
+            "{fitted} fitted, {refused} refused"
+        );
+    }
 }

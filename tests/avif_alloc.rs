@@ -5,9 +5,10 @@
 //! `apply_transforms` on), at many `max_alloc` and `max_threads` values, the heap held at once
 //! (the parse, the item bytes, the item copy, the decoders, the transforms, the canvas and the
 //! output) stays within the ledger's three quarters of `max_alloc` plus what the parse and the
-//! item-byte copies held and the few fixed-size buffers that are not charged, and a grid gives
-//! the same result (the image or the error) for every thread count up to its tile count. For a
-//! batch of units: the peak stays within `max_alloc` plus the uncharged buffers at 2 and 4 threads.
+//! item-byte copies held and the few fixed-size buffers that are not charged, and a single
+//! item, and a grid up to its tile count, give the same result (the image or the error) at every
+//! thread count. For a batch of units: the peak stays within `max_alloc` plus the uncharged
+//! buffers at 2 and 4 threads.
 
 use av1::{AvifImage, Decoder, Error, Format, Frame, Limits, Options};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -367,9 +368,10 @@ fn refs(kind: &[u8; 4], from: u8, to: &[u8]) -> Vec<u8> {
 }
 
 /// The test files: name, file, and the thread counts up to which the result must be the same
-/// as at one thread (0: none). That holds for a grid of at least as many tiles as threads (each
-/// tile decodes with one thread, so its memory does not depend on the thread count); a single
-/// item decodes with all the threads, and its threaded wrapup books bands a serial one does not.
+/// as at one thread. That holds for a grid of at least as many tiles as threads (each tile
+/// decodes with one thread, so its memory does not depend on the thread count), and for a single
+/// item: it decodes with all the threads, and a frame whose threaded decode is refused decodes
+/// again on one thread, so its result is the one of a serial decode.
 fn files() -> Vec<(&'static str, Vec<u8>, usize)> {
     let (data, _) = decodable_unit(0, (64, 32));
     let plain = build(&[av01(1, &data, &[1, 0x82])], &props(), &[]);
@@ -442,12 +444,12 @@ fn files() -> Vec<(&'static str, Vec<u8>, usize)> {
         build(&items, &props(), &[refs(b"dimg", 1, &[2, 3, 4, 5])])
     };
     vec![
-        ("plain", plain, 0),
-        ("alpha", alpha, 0),
+        ("plain", plain, 4),
+        ("alpha", alpha, 4),
         ("grid", small_grid, 4),
         ("split grid", split_grid, 4),
         ("split grid 1x2", split_pair, 2),
-        ("big", big, 0),
+        ("big", big, 4),
         ("big grid", big_grid, 4),
     ]
 }

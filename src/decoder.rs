@@ -2586,6 +2586,40 @@ mod tests {
         }
     }
 
+    /// At every `max_alloc` from too small for the frame to enough, 2, 3 and 6 threads give what
+    /// 1 thread gives (the same state, or the same error), every time: a refusal that depends on
+    /// how many tile states or bands were booked at once is retried on one thread.
+    #[test]
+    fn every_max_alloc_gives_the_one_thread_result() {
+        let (mut fitted, mut refused) = (0, 0);
+        for max_alloc in (crate::ledger::SMALL..1 << 20).step_by(8 << 10) {
+            let (want, _) = run_tiles(1, 1, max_alloc);
+            let no = matches!(want, Err(Error::AllocLimit));
+            fitted += usize::from(!no);
+            refused += usize::from(no);
+            for _ in 0..3 {
+                for threads in [2, 3, 6] {
+                    let (got, ledger) = run_tiles(1, threads, max_alloc);
+                    assert!(ledger.peak() <= max_alloc as u64);
+                    match (&want, &got) {
+                        (Ok(a), Ok(b)) => assert_same_state(a, b),
+                        (Err(a), Err(b)) => assert_eq!(a, b, "max_alloc {max_alloc}"),
+                        _ => panic!(
+                            "max_alloc {max_alloc}: {threads} threads give {:?}, 1 thread {:?}",
+                            got.as_ref().err(),
+                            want.as_ref().err()
+                        ),
+                    }
+                }
+            }
+        }
+        // Both sides of the limit were checked.
+        assert!(
+            fitted > 0 && refused > 0,
+            "{fitted} fitted, {refused} refused"
+        );
+    }
+
     #[test]
     fn still_sequence_header_constant_matches_the_writer() {
         assert_eq!(STILL_SEQUENCE_HEADER.as_slice(), still_sequence_header());
