@@ -3,7 +3,8 @@
 //! The scalar code of each kernel is the oracle and the fallback: it is always compiled, and
 //! every SIMD kernel must give the same output, bit for bit. The tiers the CPU has are detected
 //! once. `AV1_SIMD` (`scalar`, `avx2`, `avx512`, `neon`; read once, empty or unset = best)
-//! forces a lower tier; a tier the CPU does not have falls back to the best one below it.
+//! forces a lower tier; a tier the CPU does not have falls back to the best one below it,
+//! except `avx512`, which panics on a CPU without the AVX-512 tier (CI under an emulator).
 //!
 //! A [`Simd`] value is the proof that its tier was detected: its field is private, and only
 //! [`available`] and [`best`] make one. The dispatch fn of each kernel family matches on
@@ -98,11 +99,17 @@ fn requested() -> Option<Tier> {
 }
 
 /// The tier the decoder uses: the best available one, capped by `AV1_SIMD`. Resolved once.
+/// `AV1_SIMD=avx512` is not a cap but a requirement: it panics when the CPU lacks the AVX-512
+/// tier (always on a non-x86_64 target), so a test run cannot fall back to AVX2 without a word.
 pub(crate) fn best() -> Simd {
     static BEST: OnceLock<Simd> = OnceLock::new();
     *BEST.get_or_init(|| {
         let avail = available();
         let cap = requested();
+        assert!(
+            cap != Some(Tier::Avx512) || avail.contains(&Simd(Tier::Avx512)),
+            "AV1_SIMD=avx512, but this CPU lacks the AVX-512 tier (F, BW, VL, DQ, CD)"
+        );
         avail
             .into_iter()
             .rfind(|s| cap.is_none_or(|r| s.0 <= r))
@@ -121,10 +128,22 @@ mod tests {
     fn simd_is_detected() {
         let a: Vec<Tier> = available().iter().map(|s| s.tier()).collect();
         assert_eq!(a[0], Tier::Scalar);
+        // Also logs the tier in use (`--nocapture`), so a CI log shows what the run tested.
+        // `best()` panics here under AV1_SIMD=avx512 on a CPU without the AVX-512 tier.
+        eprintln!(
+            "SIMD tier: {:?}, AVX-512 kernels: {}",
+            best().tier(),
+            a.contains(&Tier::Avx512)
+        );
+        let forced = std::env::var("AV1_SIMD").is_ok_and(|v| v.trim() == "avx512");
+        if forced {
+            assert_eq!(best().tier(), Tier::Avx512);
+        }
         #[cfg(target_arch = "x86_64")]
         {
             assert!(a.contains(&Tier::Avx2), "{a:?}");
-            if let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") {
+            // Under an emulator /proc/cpuinfo is the host's, not the emulated CPU's.
+            if let (false, Ok(info)) = (forced, std::fs::read_to_string("/proc/cpuinfo")) {
                 let flags: Vec<&str> = info
                     .lines()
                     .find(|l| l.starts_with("flags"))
