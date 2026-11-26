@@ -19,6 +19,19 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { lfs: false }
+      # The CPU decides which SIMD kernels run. A hosted runner can lack AVX-512: with
+      # simd=avx512 the job stops here on such a runner, before the image build.
+      - name: CPU
+        env:
+          AV1_SIMD: ${{ inputs.simd }}
+        run: |
+          model=$(lscpu | sed -n 's/^Model name: *//p')
+          feats=$(grep -ow 'avx512[a-z_0-9]*' /proc/cpuinfo | sort -u | tr '\n' ' ')
+          echo "CPU: $model, $(nproc) vCPU; AVX-512: ${feats:-none}; AV1_SIMD=${AV1_SIMD:-best}" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$AV1_SIMD" = avx512 ] && ! grep -qw avx512f /proc/cpuinfo; then
+            echo '::error title=No AVX-512::simd=avx512, but this runner has no AVX-512; dispatch again.'
+            exit 1
+          fi
       - name: Free disk
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc && df -h /
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
