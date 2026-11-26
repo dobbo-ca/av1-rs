@@ -138,8 +138,12 @@ impl Ledger {
             found
         };
         if let Some((mut v, charged)) = found {
-            v.clear();
-            return Ok((v, charged));
+            if charged == bytes {
+                v.clear();
+                return Ok((v, charged));
+            }
+            drop(v);
+            self.release(charged);
         }
         self.reserve(bytes)?;
         let mut v = Vec::new();

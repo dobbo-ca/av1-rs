@@ -440,8 +440,9 @@ fn build_stripe(
 ///
 /// How many bands hold their stripes at once depends on timing, so a refusal (`AllocLimit`,
 /// `OutOfMemory`) with more than one thread runs the bands again on one thread, after the pool
-/// is emptied: the result is the one of `max_threads = 1`, whose refusal is final. Every
-/// output sample is written again, so nothing of the refused run is left.
+/// is emptied: the result is the one of `max_threads = 1`, whose refusal is final (what the
+/// pool holds does not change whether a charge fits, see [`Ledger::take`]). Every output sample
+/// is written again, so nothing of the refused run is left.
 pub(crate) fn apply_film_grain(
     p: &FilmGrainParams,
     input: &GrainInput,
@@ -461,7 +462,8 @@ pub(crate) fn apply_film_grain(
         simd,
     );
     match r {
-        Err(Error::AllocLimit | Error::OutOfMemory) if max_threads > 1 => {
+        // One band (32 rows or fewer) already ran serially: its refusal is final.
+        Err(Error::AllocLimit | Error::OutOfMemory) if max_threads > 1 && input.height > 32 => {
             ledger.evict();
             grain_bands(p, input, out, ledger, cancel, 1, simd)
         }

@@ -609,16 +609,26 @@ fn decode_temporal_units_keeps_the_heap_within_max_alloc() {
         );
     }
     let (mut fitted, mut runs) = (0, 0);
-    for threads in [2, 4] {
-        for max_alloc in sweep(64 << 10) {
+    for max_alloc in sweep(64 << 10) {
+        let batch = |threads: usize| {
             let limits = Limits {
                 max_alloc,
                 max_threads: threads,
                 ..Limits::default()
             };
             let mut d = Decoder::new(Options::default(), limits);
-            let (r, peak) = measured(|| d.decode_temporal_units(&units, Format::Section5, &cancel));
+            measured(|| d.decode_temporal_units(&units, Format::Section5, &cancel))
+        };
+        let (one, _) = batch(1);
+        for threads in [2, 4] {
+            let (r, peak) = batch(threads);
             runs += 1;
+            assert!(
+                r == one,
+                "max_alloc {max_alloc} threads {threads}: {:?}, 1 thread {:?}",
+                r.as_ref().map(|f| f.len()),
+                one.as_ref().map(|f| f.len())
+            );
             assert!(
                 peak <= max_alloc as isize + UNCHARGED * (threads as isize + 1),
                 "max_alloc {max_alloc} threads {threads}: {peak} bytes held, result {:?}",

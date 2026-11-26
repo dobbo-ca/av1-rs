@@ -1349,8 +1349,10 @@ fn decode_frame(
             // Whether a refused booking of a band or a tile state comes depends on how many items
             // ran at once, so the frame decodes again on one thread, which books none of them:
             // the result is the one of `max_threads = 1`. Every buffer of the team goes back and
-            // the pool is emptied first, so no buffer the threads left (pooled at a larger
-            // charge) is reused. The serial path never comes back here, so its refusal is final.
+            // the pool is emptied first; what the pool holds does not change whether a charge
+            // fits either way (`Ledger::take` reuses only a buffer charged exactly what is asked),
+            // so the planes the serial path took from the pool give the same result as new ones.
+            // The serial path never comes back here, so its refusal is final.
             // Cost: a refused frame decodes its tiles twice (the filters changed CurrFrame in
             // place); that costs time only near the limit.
             drop((w.curr, w.cdef, w.up_cdef, w.up_curr, w.out));
