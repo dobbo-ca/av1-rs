@@ -1,13 +1,13 @@
 //! Peak heap of `decode_avif` and of `Decoder::decode_temporal_units`, measured by a counting
 //! global allocator over every thread. For AVIF: a plain item, an item with an alpha image, a
-//! 2x2 grid, the same grid with each tile stored in two extents, and an item and a grid whose
-//! decoded frames are above the uncharged slack (rotated tiles, a mirrored grid, with
+//! 2x2 grid, the same grid and a 1x2 grid with each tile stored in two extents, and an item and
+//! a grid whose decoded frames are above the uncharged slack (rotated tiles, a mirrored grid, with
 //! `apply_transforms` on), at many `max_alloc` and `max_threads` values, the heap held at once
 //! (the parse, the item bytes, the item copy, the decoders, the transforms, the canvas and the
 //! output) stays within the ledger's three quarters of `max_alloc` plus what the parse and the
 //! item-byte copies held and the few fixed-size buffers that are not charged, and a grid gives
-//! the same result (the image or the error) for every thread count. For a batch of units: the
-//! peak stays within `max_alloc` plus the uncharged buffers at 2 and 4 threads.
+//! the same result (the image or the error) for every thread count up to its tile count. For a
+//! batch of units: the peak stays within `max_alloc` plus the uncharged buffers at 2 and 4 threads.
 
 use av1::{AvifImage, Decoder, Error, Format, Frame, Limits, Options};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -326,7 +326,8 @@ fn ispe(w: u32, h: u32) -> Vec<u8> {
 }
 
 /// The `ipco` list: small item and tile `ispe` (1), `av1C` (2), alpha `auxC` (3), small grid
-/// `ispe` (4), `irot` 90 (5), `imir` (6), large item and tile `ispe` (7), large grid `ispe` (8).
+/// `ispe` (4), `irot` 90 (5), `imir` (6), large item and tile `ispe` (7), large grid `ispe` (8),
+/// 1x2 grid `ispe` (9).
 fn props() -> Vec<Vec<u8>> {
     let urn = b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0";
     vec![
@@ -338,6 +339,7 @@ fn props() -> Vec<Vec<u8>> {
         bx(b"imir", &[0]),
         ispe(BIG_TILE, BIG_TILE),
         ispe(2 * BIG_TILE, 2 * BIG_TILE),
+        ispe(128, 32),
     ]
 }
 
@@ -364,11 +366,11 @@ fn refs(kind: &[u8; 4], from: u8, to: &[u8]) -> Vec<u8> {
     bx(kind, &v)
 }
 
-/// The test files: name, file, and whether the result must be the same for every thread count
-/// tested. That holds for a grid of at least as many tiles as threads (each tile decodes with
-/// one thread, so its memory does not depend on the thread count); a single item decodes with
-/// all the threads, and its threaded wrapup books bands a serial one does not.
-fn files() -> Vec<(&'static str, Vec<u8>, bool)> {
+/// The test files: name, file, and the thread counts up to which the result must be the same
+/// as at one thread (0: none). That holds for a grid of at least as many tiles as threads (each
+/// tile decodes with one thread, so its memory does not depend on the thread count); a single
+/// item decodes with all the threads, and its threaded wrapup books bands a serial one does not.
+fn files() -> Vec<(&'static str, Vec<u8>, usize)> {
     let (data, _) = decodable_unit(0, (64, 32));
     let plain = build(&[av01(1, &data, &[1, 0x82])], &props(), &[]);
     let alpha = build(
@@ -400,6 +402,29 @@ fn files() -> Vec<(&'static str, Vec<u8>, bool)> {
             })
             .collect(),
     );
+    // 128x32 from two of those split tiles: one tile decodes beside tile 0's canvas, so its read
+    // must get the whole item-read share, as in a serial decode.
+    let split_pair = build(
+        &[
+            Item {
+                id: 1,
+                kind: b"grid",
+                data: vec![0, 0, 0, 1, 0, 128, 0, 32],
+                props: vec![9],
+                split: false,
+            },
+            Item {
+                split: true,
+                ..av01(2, &padded, &[1, 0x82])
+            },
+            Item {
+                split: true,
+                ..av01(3, &padded, &[1, 0x82])
+            },
+        ],
+        &props(),
+        &[refs(b"dimg", 1, &[2, 3])],
+    );
     let (tile, _) = decodable_unit(0, (u64::from(BIG_TILE), u64::from(BIG_TILE)));
     // Rotated by 90 degrees, so the transform makes new planes.
     let big = build(&[av01(1, &tile, &[7, 0x82, 0x85])], &props(), &[]);
@@ -417,12 +442,13 @@ fn files() -> Vec<(&'static str, Vec<u8>, bool)> {
         build(&items, &props(), &[refs(b"dimg", 1, &[2, 3, 4, 5])])
     };
     vec![
-        ("plain", plain, false),
-        ("alpha", alpha, false),
-        ("grid", small_grid, true),
-        ("split grid", split_grid, true),
-        ("big", big, false),
-        ("big grid", big_grid, true),
+        ("plain", plain, 0),
+        ("alpha", alpha, 0),
+        ("grid", small_grid, 4),
+        ("split grid", split_grid, 4),
+        ("split grid 1x2", split_pair, 2),
+        ("big", big, 0),
+        ("big grid", big_grid, 4),
     ]
 }
 
@@ -480,7 +506,7 @@ fn decode_avif_keeps_the_heap_within_max_alloc(name: &str) {
         let mut first: Option<Result<AvifImage, Error>> = None;
         for threads in [1, 2, 4] {
             let ledger = (max_alloc - 2 * (max_alloc / 8)) as isize;
-            let reads = if name == "split grid" {
+            let reads = if name.starts_with("split grid") {
                 (max_alloc / 8) as isize
             } else {
                 0
@@ -509,7 +535,7 @@ fn decode_avif_keeps_the_heap_within_max_alloc(name: &str) {
                     "{name} max_alloc {max_alloc} threads {threads}: {e:?}"
                 ),
             }
-            if !same {
+            if threads > same {
                 continue;
             }
             match &first {
@@ -548,6 +574,11 @@ fn decode_avif_grid_keeps_the_heap_within_max_alloc() {
 #[test]
 fn decode_avif_split_grid_keeps_the_heap_within_max_alloc() {
     decode_avif_keeps_the_heap_within_max_alloc("split grid");
+}
+
+#[test]
+fn decode_avif_split_grid_1x2_keeps_the_heap_within_max_alloc() {
+    decode_avif_keeps_the_heap_within_max_alloc("split grid 1x2");
 }
 
 #[test]
