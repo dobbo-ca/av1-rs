@@ -875,6 +875,26 @@ mod tests {
         }
     }
 
+    // A grid tile comes booked with its metadata: a refused transform gives all of it back, so a
+    // refused tile leaves nothing booked for the serial retry.
+    #[test]
+    fn refused_transform_gives_back_the_metadata_booking() {
+        let mut f = numbered();
+        f.metadata.push(crate::Metadata {
+            metadata_type: 4,
+            payload: vec![0; 100],
+        });
+        let held = held_bytes(&f);
+        let ledger = Ledger::default();
+        ledger.reset(crate::ledger::SMALL + held, 0).unwrap();
+        ledger.reserve(held).unwrap();
+        let cancel = AtomicBool::new(false);
+        let rot = [Transform::Rotate(90)];
+        let r = transform_frame(&ON, &Limits::default(), &ledger, &cancel, &rot, f);
+        assert_eq!(r, Err(Error::AllocLimit));
+        assert_eq!(ledger.left(), held);
+    }
+
     const ON: Options = Options {
         operating_point: 0,
         all_layers: false,

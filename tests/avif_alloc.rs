@@ -1,11 +1,13 @@
 //! Peak heap of `decode_avif` and of `Decoder::decode_temporal_units`, measured by a counting
 //! global allocator over every thread. For AVIF: a plain item, an item with an alpha image, a
-//! 2x2 grid, and items and a grid whose decoded size is far above the uncharged slack (rotated
-//! tiles, a mirrored grid, with `apply_transforms` on), at many `max_alloc` and `max_threads`
-//! values, the heap held at once (the parse, the item bytes, the item copy, the decoders, the
-//! transforms, the canvas and the output) stays within `max_alloc` plus the few fixed-size
-//! buffers that are not charged, and a grid gives the same result (the image or the error) for
-//! every thread count. For a batch of units: the same peak bound at 2 and 4 threads.
+//! 2x2 grid, the same grid with each tile stored in two extents, and an item and a grid whose
+//! decoded frames are above the uncharged slack (rotated tiles, a mirrored grid, with
+//! `apply_transforms` on), at many `max_alloc` and `max_threads` values, the heap held at once
+//! (the parse, the item bytes, the item copy, the decoders, the transforms, the canvas and the
+//! output) stays within the ledger's three quarters of `max_alloc` plus what the parse and the
+//! item-byte copies held and the few fixed-size buffers that are not charged, and a grid gives
+//! the same result (the image or the error) for every thread count. For a batch of units: the
+//! peak stays within `max_alloc` plus the uncharged buffers at 2 and 4 threads.
 
 use av1::{AvifImage, Decoder, Error, Format, Frame, Limits, Options};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -235,12 +237,27 @@ fn bx(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
     v
 }
 
-/// An image item: id, type, data and its `ipma` associations.
+/// A padding OBU of `n` zero bytes (its size field is LEB128).
+fn padding(n: usize) -> Vec<u8> {
+    let mut v = vec![(15 << 3) | 2];
+    let mut s = n;
+    while s >= 0x80 {
+        v.push((s & 0x7f) as u8 | 0x80);
+        s >>= 7;
+    }
+    v.push(s as u8);
+    v.resize(v.len() + n, 0);
+    v
+}
+
+/// An image item: id, type, data and its `ipma` associations. A `split` item is stored as two
+/// `iloc` extents, so `isobmff` copies its bytes.
 struct Item {
     id: u8,
     kind: &'static [u8; 4],
     data: Vec<u8>,
     props: Vec<u8>,
+    split: bool,
 }
 
 /// An AVIF whose primary item is item 1. `props` is the `ipco` list, `refs` the `iref` boxes.
@@ -258,10 +275,18 @@ fn build(items: &[Item], props: &[Vec<u8>], refs: &[Vec<u8>]) -> Vec<u8> {
                 b"infe",
                 &[&[2, 0, 0, 0, 0, it.id, 0, 0][..], it.kind, &[0]].concat(),
             ));
-            iloc.extend_from_slice(&[0, it.id, 0, 0, 0, 1]);
-            iloc.extend_from_slice(&at.to_be_bytes());
-            iloc.extend_from_slice(&(it.data.len() as u32).to_be_bytes());
-            at += it.data.len() as u32;
+            let n = it.data.len() as u32;
+            let extents = if it.split {
+                vec![(at, n / 2), (at + n / 2, n - n / 2)]
+            } else {
+                vec![(at, n)]
+            };
+            iloc.extend_from_slice(&[0, it.id, 0, 0, 0, extents.len() as u8]);
+            for (offset, length) in extents {
+                iloc.extend_from_slice(&offset.to_be_bytes());
+                iloc.extend_from_slice(&length.to_be_bytes());
+            }
+            at += n;
             ipma.extend_from_slice(&[0, it.id, it.props.len() as u8]);
             ipma.extend_from_slice(&it.props);
         }
@@ -301,8 +326,7 @@ fn ispe(w: u32, h: u32) -> Vec<u8> {
 }
 
 /// The `ipco` list: small item and tile `ispe` (1), `av1C` (2), alpha `auxC` (3), small grid
-/// `ispe` (4), `irot` 90 (5), `imir` (6), large tile `ispe` (7), large grid `ispe` (8), large
-/// item `ispe` (9).
+/// `ispe` (4), `irot` 90 (5), `imir` (6), large item and tile `ispe` (7), large grid `ispe` (8).
 fn props() -> Vec<Vec<u8>> {
     let urn = b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0";
     vec![
@@ -314,12 +338,12 @@ fn props() -> Vec<Vec<u8>> {
         bx(b"imir", &[0]),
         ispe(BIG_TILE, BIG_TILE),
         ispe(2 * BIG_TILE, 2 * BIG_TILE),
-        ispe(BIG_TILE, BIG_TILE / 2),
     ]
 }
 
-/// The tiles of the large grid are this square size: each decoded tile, and the canvas even
-/// more, is far above the uncharged slack.
+/// The large item and the tiles of the large grid are this square size: each decoded frame
+/// (384 KiB at 8-bit 4:2:0), and the canvas even more, is above the uncharged slack at 4 threads
+/// (320 KiB).
 const BIG_TILE: u32 = 512;
 
 fn av01(id: u8, data: &[u8], props: &[u8]) -> Item {
@@ -328,6 +352,7 @@ fn av01(id: u8, data: &[u8], props: &[u8]) -> Item {
         kind: b"av01",
         data: data.to_vec(),
         props: props.to_vec(),
+        split: false,
     }
 }
 
@@ -352,20 +377,32 @@ fn files() -> Vec<(&'static str, Vec<u8>, bool)> {
         &[refs(b"auxl", 2, &[1])],
     );
     // 128x64 from four 64x32 tiles.
-    let small_grid = {
+    let grid = |tiles: Vec<Item>| {
         let mut items = vec![Item {
             id: 1,
             kind: b"grid",
             data: vec![0, 0, 1, 1, 0, 128, 0, 64],
             props: vec![4],
+            split: false,
         }];
-        items.extend((2..=5).map(|id| av01(id, &data, &[1, 0x82])));
+        items.extend(tiles);
         build(&items, &props(), &[refs(b"dimg", 1, &[2, 3, 4, 5])])
     };
-    let (item, _) = decodable_unit(0, (u64::from(BIG_TILE), u64::from(BIG_TILE / 2)));
-    // Rotated by 90 degrees, so the transform makes new planes.
-    let big = build(&[av01(1, &item, &[9, 0x82, 0x85])], &props(), &[]);
+    let small_grid = grid((2..=5).map(|id| av01(id, &data, &[1, 0x82])).collect());
+    // The same grid with every tile padded to 64 KiB and stored as two extents, so each tile's
+    // bytes are copied under the item-read share of `max_alloc`.
+    let padded = [data.clone(), padding(64 << 10)].concat();
+    let split_grid = grid(
+        (2..=5)
+            .map(|id| Item {
+                split: true,
+                ..av01(id, &padded, &[1, 0x82])
+            })
+            .collect(),
+    );
     let (tile, _) = decodable_unit(0, (u64::from(BIG_TILE), u64::from(BIG_TILE)));
+    // Rotated by 90 degrees, so the transform makes new planes.
+    let big = build(&[av01(1, &tile, &[7, 0x82, 0x85])], &props(), &[]);
     // Every tile is rotated before it is pasted; the grid is mirrored after.
     let big_grid = {
         let side = (2 * BIG_TILE) as u16;
@@ -374,6 +411,7 @@ fn files() -> Vec<(&'static str, Vec<u8>, bool)> {
             kind: b"grid",
             data: [&[0, 0, 1, 1][..], &side.to_be_bytes(), &side.to_be_bytes()].concat(),
             props: vec![8, 0x86],
+            split: false,
         }];
         items.extend((2..=5).map(|id| av01(id, &tile, &[7, 0x82, 0x85])));
         build(&items, &props(), &[refs(b"dimg", 1, &[2, 3, 4, 5])])
@@ -382,6 +420,7 @@ fn files() -> Vec<(&'static str, Vec<u8>, bool)> {
         ("plain", plain, false),
         ("alpha", alpha, false),
         ("grid", small_grid, true),
+        ("split grid", split_grid, true),
         ("big", big, false),
         ("big grid", big_grid, true),
     ]
@@ -399,72 +438,126 @@ fn sweep(from: usize) -> Vec<usize> {
     v
 }
 
-#[test]
-fn decode_avif_keeps_the_heap_within_max_alloc() {
+/// The sweep of [`files`] entry `name` at 1, 2 and 4 threads. The peak is checked against what
+/// `decode_avif` may hold: its ledger (three quarters of `max_alloc`), what the `isobmff` parse
+/// held (measured here; the parse result lives through the call), the item-byte copies (only a
+/// split item is copied, within an eighth of `max_alloc`) and the uncharged buffers of each
+/// decoder. So a frame or a transform output that is not booked shows up once it is larger than
+/// that slack.
+fn decode_avif_keeps_the_heap_within_max_alloc(name: &str) {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, file, same) = files()
+        .into_iter()
+        .find(|f| f.0 == name)
+        .expect("a test file");
     let cancel = AtomicBool::new(false);
     let options = Options {
         apply_transforms: true,
         ..Options::default()
     };
-    let decode = |file: &[u8], max_alloc: usize, max_threads: usize| {
+    let decode = |max_alloc: usize, max_threads: usize| {
         let limits = Limits {
             max_alloc,
             max_threads,
             ..Limits::default()
         };
-        measured(|| av1::decode_avif(file, &options, &limits, &cancel))
+        measured(|| av1::decode_avif(&file, &options, &limits, &cancel))
     };
-    for (name, file, same) in files() {
-        let (want, _) = decode(&file, 64 << 20, 1);
-        let want: AvifImage = want.unwrap_or_else(|e| panic!("{name}: reference decode: {e:?}"));
-        let want_frames: Vec<&Frame> = std::iter::once(&want.image).chain(&want.alpha).collect();
-        let (mut fitted, mut runs) = (0, 0);
-        for max_alloc in sweep(16 << 10) {
-            let mut first: Option<Result<AvifImage, Error>> = None;
-            for threads in [1, 2, 4] {
-                let (r, peak) = decode(&file, max_alloc, threads);
-                runs += 1;
-                assert!(
-                    peak <= max_alloc as isize + UNCHARGED * (threads as isize + 1),
-                    "{name} max_alloc {max_alloc} threads {threads}: {peak} bytes held, result {:?}",
-                    r.as_ref().map(|_| ())
-                );
-                match &r {
-                    Ok(got) => {
-                        fitted += 1;
-                        let frames: Vec<&Frame> =
-                            std::iter::once(&got.image).chain(&got.alpha).collect();
-                        assert_eq!(frames, want_frames, "{name} max_alloc {max_alloc}");
-                    }
-                    Err(e) => assert!(
-                        matches!(
-                            e,
-                            Error::AllocLimit | Error::OutOfMemory | Error::Container(_)
-                        ),
-                        "{name} max_alloc {max_alloc} threads {threads}: {e:?}"
+    let parse = |max_alloc: usize, max_threads: usize| {
+        let ilimits = av1::isobmff::Limits {
+            max_alloc: max_alloc / 8,
+            max_threads,
+            max_pixels: Limits::default().max_pixels,
+            ..av1::isobmff::Limits::default()
+        };
+        measured(|| av1::isobmff::parse(&file, &ilimits, &cancel)).1
+    };
+    let (want, _) = decode(64 << 20, 1);
+    let want: AvifImage = want.unwrap_or_else(|e| panic!("{name}: reference decode: {e:?}"));
+    let want_frames: Vec<&Frame> = std::iter::once(&want.image).chain(&want.alpha).collect();
+    let (mut fitted, mut runs) = (0, 0);
+    for max_alloc in sweep(16 << 10) {
+        let mut first: Option<Result<AvifImage, Error>> = None;
+        for threads in [1, 2, 4] {
+            let ledger = (max_alloc - 2 * (max_alloc / 8)) as isize;
+            let reads = if name == "split grid" {
+                (max_alloc / 8) as isize
+            } else {
+                0
+            };
+            let bound =
+                ledger + parse(max_alloc, threads) + reads + UNCHARGED * (threads as isize + 1);
+            let (r, peak) = decode(max_alloc, threads);
+            runs += 1;
+            assert!(
+                peak <= bound,
+                "{name} max_alloc {max_alloc} threads {threads}: {peak} bytes held, bound {bound}, result {:?}",
+                r.as_ref().map(|_| ())
+            );
+            match &r {
+                Ok(got) => {
+                    fitted += 1;
+                    let frames: Vec<&Frame> =
+                        std::iter::once(&got.image).chain(&got.alpha).collect();
+                    assert_eq!(frames, want_frames, "{name} max_alloc {max_alloc}");
+                }
+                Err(e) => assert!(
+                    matches!(
+                        e,
+                        Error::AllocLimit | Error::OutOfMemory | Error::Container(_)
                     ),
-                }
-                if !same {
-                    continue;
-                }
-                match &first {
-                    None => first = Some(r),
-                    Some(f) => assert!(
-                        *f == r,
-                        "{name} max_alloc {max_alloc}: {threads} threads give {:?}, 1 thread {:?}",
-                        r.as_ref().map(|_| ()),
-                        f.as_ref().map(|_| ())
-                    ),
-                }
+                    "{name} max_alloc {max_alloc} threads {threads}: {e:?}"
+                ),
+            }
+            if !same {
+                continue;
+            }
+            match &first {
+                None => first = Some(r),
+                Some(f) => assert!(
+                    *f == r,
+                    "{name} max_alloc {max_alloc}: {threads} threads give {:?}, 1 thread {:?}",
+                    r.as_ref().map(|_| ()),
+                    f.as_ref().map(|_| ())
+                ),
             }
         }
-        // Some limits fit and some do not, so both paths were checked.
-        assert!(
-            fitted > 0 && fitted < runs,
-            "{name}: {fitted} of {runs} fitted"
-        );
     }
+    // Some limits fit and some do not, so both paths were checked.
+    assert!(
+        fitted > 0 && fitted < runs,
+        "{name}: {fitted} of {runs} fitted"
+    );
+}
+
+#[test]
+fn decode_avif_plain_keeps_the_heap_within_max_alloc() {
+    decode_avif_keeps_the_heap_within_max_alloc("plain");
+}
+
+#[test]
+fn decode_avif_alpha_keeps_the_heap_within_max_alloc() {
+    decode_avif_keeps_the_heap_within_max_alloc("alpha");
+}
+
+#[test]
+fn decode_avif_grid_keeps_the_heap_within_max_alloc() {
+    decode_avif_keeps_the_heap_within_max_alloc("grid");
+}
+
+#[test]
+fn decode_avif_split_grid_keeps_the_heap_within_max_alloc() {
+    decode_avif_keeps_the_heap_within_max_alloc("split grid");
+}
+
+#[test]
+fn decode_avif_big_keeps_the_heap_within_max_alloc() {
+    decode_avif_keeps_the_heap_within_max_alloc("big");
+}
+
+#[test]
+fn decode_avif_big_grid_keeps_the_heap_within_max_alloc() {
+    decode_avif_keeps_the_heap_within_max_alloc("big grid");
 }
 
 #[test]

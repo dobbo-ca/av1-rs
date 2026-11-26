@@ -191,9 +191,10 @@ fn two_extent_avif(n: u32) -> Vec<u8> {
 }
 
 // `decode_avif` reads the item bytes under an eighth of `max_alloc`, outside the ledger, so the
-// copy and the ledger together stay within `max_alloc`.
+// copy and the ledger together stay within `max_alloc`. A copy over that eighth is refused like
+// any other allocation (and so retried by a grid), not reported as a broken file.
 #[test]
-fn avif_item_bytes_over_an_eighth_of_max_alloc_are_a_container_error() {
+fn avif_item_bytes_over_an_eighth_of_max_alloc_are_an_alloc_limit() {
     let file = two_extent_avif(4000);
     let cancel = AtomicBool::new(false);
     let o = Options::default();
@@ -204,7 +205,7 @@ fn avif_item_bytes_over_an_eighth_of_max_alloc_are_a_container_error() {
         };
         av1::decode_avif(&file, &o, &l, &cancel).map(|a| a.image)
     };
-    assert!(matches!(at(16 << 10), Err(Error::Container(_))));
+    assert_eq!(at(16 << 10), Err(Error::AllocLimit));
     // With an eighth above the item size the bytes are read, and the decode fails on them.
     let r = at(64 << 10);
     assert!(

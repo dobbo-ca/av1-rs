@@ -2428,6 +2428,22 @@ mod tests {
         assert_eq!(ledger.left(), 1 << 20);
     }
 
+    // An AVIF item's decoder is dropped after its one unit: metadata after the last shown frame
+    // belongs to no frame, so `decode_unit_booked` gives its booking back.
+    #[test]
+    fn booked_unit_keeps_no_trailing_metadata_booked() {
+        let m = obu(OBU_METADATA, &[1, 0x03, 0xe8, 0x01, 0x90, 0x80]);
+        let ledger = Arc::new(Ledger::default());
+        ledger.reset(crate::ledger::SMALL + (1 << 20), 0).unwrap();
+        let mut d = Decoder::with_ledger(Options::default(), Limits::default(), ledger.clone());
+        let (frames, booked) = d
+            .decode_unit_booked(&m, Format::Section5, &cancel())
+            .unwrap();
+        assert!(frames.is_empty());
+        ledger.release(booked);
+        assert_eq!(ledger.left(), 1 << 20);
+    }
+
     #[test]
     fn padding_and_reserved_obus_are_ignored() {
         let data = [obu(OBU_PADDING, &[1, 2, 3]), obu(9, &[7])].concat();
