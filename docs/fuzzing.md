@@ -31,7 +31,10 @@ uploaded as artifacts.
 
 Every target runs on x86_64 (`ubuntu-24.04`), and each `simd_*` target runs again natively on
 aarch64 (`ubuntu-24.04-arm`; the same Dockerfile stage `fuzz`, ASan included), so the NEON tier
-is compared with scalar. The dispatch input `only` picks one target. The arm64 corpus cache
+is compared with scalar. The dispatch input `only` picks one target. A hosted x86_64 runner does
+not always have AVX-512, and a `simd_*` target compares the AVX-512 tier only where the CPU has
+it: each job prints the CPU first, and the dispatch input `avx512` stops an x86_64 job at once
+on a runner without AVX-512 (dispatch again). The arm64 corpus cache
 (`fuzz-corpus-arm64-<target>`) starts from the x86_64 corpus of the same target; its artifacts
 are `crashers-arm64-<target>` and `corpus-arm64-<target>`.
 
