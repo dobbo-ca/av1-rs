@@ -161,7 +161,7 @@ pub(crate) fn filter(
         #[cfg(target_arch = "x86_64")]
         Tier::Avx512 if f.w * f.h >= 32 => {
             // SAFETY: `simd` is a detected tier (only `simd::available`/`best` make one), and
-            // the AVX-512 tier includes AVX-512 BW (the kernel's feature).
+            // the AVX-512 tier includes AVX2 and AVX-512 BW (the kernel's features).
             unsafe { avx512::filter(&tmp, &mut out, &f) }
         }
         #[cfg(target_arch = "x86_64")]

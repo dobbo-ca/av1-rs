@@ -1,6 +1,7 @@
 //! AVX-512 CDEF filter: the AVX2 filter (`super::avx2::filter`, same padded-block design) on
-//! 32 samples per vector, four rows of 8 or eight rows of 4. AVX-512 BW instructions only; the
-//! dispatch uses it for blocks of at least 32 samples (8x8, 8x4, 4x8).
+//! 32 samples per vector, four rows of 8 or eight rows of 4. The arithmetic is AVX-512 BW; the
+//! loads are the AVX2 kernel's (`avx2::ld`, two per vector). The dispatch uses it for blocks of
+//! at least 32 samples (8x8, 8x4, 4x8).
 
 use super::{CENTER, Filt, TMP, TS, avx2};
 use crate::simd::x86::store512_u16;
