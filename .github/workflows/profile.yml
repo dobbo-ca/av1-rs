@@ -19,15 +19,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { lfs: false }
-      - name: Create isobmff-rs read token (dobbo-ca-ci-read app)
-        id: app
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          app-id: ${{ vars.CI_READ_APP_ID }}
-          private-key: ${{ secrets.CI_READ_APP_KEY }}
-          owner: dobbo-ca
-          repositories: isobmff-rs
-          permission-contents: read
       - name: Free disk
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc && df -h /
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -40,10 +31,7 @@ jobs:
           push: false
           tags: av1-profile:local
           cache-from: type=gha,scope=av1-rs-profile
-          cache-to: type=gha,mode=max,scope=av1-rs-profile
-          secrets: |
-            gh_token=${{ steps.app.outputs.token }}
-      # perf needs perf_event_open, which a BuildKit RUN does not allow; profile.sh falls back
+          cache-to: type=gha,mode=max,scope=av1-rs-profile      # perf needs perf_event_open, which a BuildKit RUN does not allow; profile.sh falls back
       # to callgrind when perf cannot record here either.
       - env:
           AV1_SIMD: ${{ inputs.simd }}
