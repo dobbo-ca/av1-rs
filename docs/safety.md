@@ -23,10 +23,11 @@ There is no inline assembly and no unsafe threading (docs/threading.md).
 `src/simd/mod.rs` detects the tiers once: scalar (always), AVX2 (with FMA, BMI1, BMI2) and
 AVX-512 (F, BW, VL, DQ, CD) on x86_64, NEON on aarch64. `AV1_SIMD=scalar|avx2|avx512|neon`
 (read once; empty or unset = best) caps the tier; a tier the CPU lacks falls back to the best
-one below it. This variable is the only one the crate reads.
+one below it, except `avx512`, which panics on a CPU without the AVX-512 tier (for CI under an
+emulator). This variable is the only one the crate reads.
 
 The scalar code of every kernel stays and is the oracle: each SIMD kernel must give its output
-bit for bit. CI checks this four ways:
+bit for bit. CI checks this five ways:
 
 - Unit tests per kernel family compare every available tier with scalar on many
   pseudo-random inputs (own xorshift) and on the edge sizes and values.
@@ -35,8 +36,11 @@ bit for bit. CI checks this four ways:
   all have AVX-512: the best tier there is AVX-512 or AVX2, whichever the CPU has (the job log
   prints it), so the AVX-512 tier is exercised only on a runner that has it. A job on a runner
   without it gets a "No AVX-512" warning annotation: such a run of the required check, and of
-  the `tiers` gate, passes without the AVX-512 kernels having run, so a change to them needs a
-  run that landed on an AVX-512 runner (rerun until one does).
+  the `tiers` gate, passes without the AVX-512 tier having run natively; `avx512-sde` (below)
+  runs its unit tests on every event.
+- SIMD tiers in CI: scalar, AVX2 (x86_64) and NEON (aarch64) natively; the AVX-512 tier under
+  Intel SDE (job `avx512-sde`: the unit tests on `-spr` with `AV1_SIMD=avx512`, which fails on a
+  CPU without AVX-512), and natively when the hosted runner has AVX-512.
 - The parity gate decodes the corpus with the best tier against dav1d and aomdec, and with the
   scalar and AVX2 tiers against the best tier (gate `tiers`); parity-arm64 runs the same gate
   natively on aarch64 (NEON against dav1d and aomdec, scalar against NEON).

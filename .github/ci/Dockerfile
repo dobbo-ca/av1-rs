@@ -32,7 +32,8 @@ RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + \
     && cargo check --locked --manifest-path tests/fuzz/Cargo.toml --target-dir target/fuzz-check
 RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
-    find src examples tests -name '*.rs' -exec touch {} + && cargo test --locked --no-fail-fast
+    find src examples tests -name '*.rs' -exec touch {} + && cargo test --locked --no-fail-fast \
+    && cargo test --locked --lib -- --nocapture simd_is_detected
 # The whole suite again with each lower SIMD tier forced (src/simd; the default run above uses
 # the best tier: AVX-512 when the runner's CPU has it, else AVX2). The cross-tier kernel tests
 # compare every available tier anyway.
@@ -45,7 +46,8 @@ RUN --mount=type=cache,id=av1-rs-target-ci,sharing=locked,target=/src/target \
 FROM src AS arm64
 RUN --mount=type=cache,id=av1-rs-target-arm64,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + && cargo clippy --locked --all-targets -- -D warnings \
-    && cargo test --locked --no-fail-fast && AV1_SIMD=scalar cargo test --locked --no-fail-fast
+    && cargo test --locked --no-fail-fast && cargo test --locked --lib -- --nocapture simd_is_detected \
+    && AV1_SIMD=scalar cargo test --locked --no-fail-fast
 
 # avifdec-new: libavif v1.4.2 (commit c5240fc79fe5) built from source, a second AVIF oracle that
 # follows the dimg order (libavif >= 1.1.1). Its only codec is bookworm's libdav1d-dev (dav1d
