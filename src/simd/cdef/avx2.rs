@@ -1,4 +1,5 @@
-//! AVX2 CDEF kernels (also the AVX-512 tier, see docs/safety.md). The filter follows dav1d's
+//! AVX2 CDEF kernels (also the AVX-512 tier, except its filter of blocks of 32 or more samples,
+//! see `avx512.rs`). The filter follows dav1d's
 //! padded-block design (BSD-2-Clause, Copyright © 2018, VideoLAN and dav1d authors, Copyright
 //! © 2018, Two Orioles, LLC; see NOTICE and `mod.rs`).
 
@@ -9,7 +10,7 @@ use std::arch::x86_64::*;
 /// 16 samples of the window that starts at `s`: two rows of 8 (`w == 8`) or four rows of 4.
 #[inline]
 #[target_feature(enable = "avx2")]
-fn ld(t: &[u16; TMP], s: usize, w: usize) -> __m256i {
+pub(super) fn ld(t: &[u16; TMP], s: usize, w: usize) -> __m256i {
     let (a, b) = if w == 8 {
         (load128_u16(at8(t, s)), load128_u16(at8(t, s + TS)))
     } else {
