@@ -68,7 +68,8 @@ jobs:
           push: false
           tags: av1-fuzz:local
           cache-from: type=gha,scope=av1-rs-fuzz-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=av1-rs-fuzz-${{ matrix.arch }}      # The corpus is kept between runs: restored here, copied into the container, copied back
+          cache-to: type=gha,mode=max,scope=av1-rs-fuzz-${{ matrix.arch }}
+      # The corpus is kept between runs: restored here, copied into the container, copied back
       # out and saved, so a run goes on from where the last one stopped. One cache per target
       # and architecture; a first arm64 run starts from the x86_64 corpus of the same target.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

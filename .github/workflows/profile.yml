@@ -31,7 +31,8 @@ jobs:
           push: false
           tags: av1-profile:local
           cache-from: type=gha,scope=av1-rs-profile
-          cache-to: type=gha,mode=max,scope=av1-rs-profile      # perf needs perf_event_open, which a BuildKit RUN does not allow; profile.sh falls back
+          cache-to: type=gha,mode=max,scope=av1-rs-profile
+      # perf needs perf_event_open, which a BuildKit RUN does not allow; profile.sh falls back
       # to callgrind when perf cannot record here either.
       - env:
           AV1_SIMD: ${{ inputs.simd }}

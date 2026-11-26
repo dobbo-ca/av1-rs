@@ -37,6 +37,7 @@ jobs:
           # Only main and dispatch runs export: a PR's cache is scoped to its ref, so no other PR
           # could read it, and the export takes about two minutes.
           cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max,scope=av1-rs-test' || '' }}
+
   # Native aarch64: clippy and the whole suite, with the NEON tier and with the scalar tier.
   arm64:
     runs-on: ubuntu-24.04-arm
@@ -56,6 +57,7 @@ jobs:
           outputs: type=cacheonly
           cache-from: type=gha,scope=av1-rs-arm64
           cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max,scope=av1-rs-arm64' || '' }}
+
   # dav1d, aomdec and examples/oracle.rs decode the same public corpus
   # (tests/parity/corpus.txt); every output plane must be equal (tests/parity/run.sh). The
   # stage never fails on a diff: the report is the build output, and the last step fails on its
@@ -83,7 +85,8 @@ jobs:
           push: false
           outputs: type=local,dest=parity-out
           cache-from: type=gha,scope=av1-rs-parity
-          cache-to: type=gha,mode=max,scope=av1-rs-parity      - if: always()
+          cache-to: type=gha,mode=max,scope=av1-rs-parity
+      - if: always()
         run: '[ ! -f parity-out/summary.md ] || cat parity-out/summary.md >> "$GITHUB_STEP_SUMMARY"'
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -104,7 +107,8 @@ jobs:
           push: false
           outputs: type=local,dest=transform-out
           cache-from: type=gha,scope=av1-rs-transform
-          cache-to: type=gha,mode=max,scope=av1-rs-transform      - if: always()
+          cache-to: type=gha,mode=max,scope=av1-rs-transform
+      - if: always()
         run: '[ ! -f transform-out/summary.md ] || cat transform-out/summary.md >> "$GITHUB_STEP_SUMMARY"'
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -135,7 +139,8 @@ jobs:
           push: false
           outputs: type=local,dest=parity-out
           cache-from: type=gha,scope=av1-rs-parity-arm64
-          cache-to: type=gha,mode=max,scope=av1-rs-parity-arm64      - if: always()
+          cache-to: type=gha,mode=max,scope=av1-rs-parity-arm64
+      - if: always()
         run: '[ ! -f parity-out/summary.md ] || cat parity-out/summary.md >> "$GITHUB_STEP_SUMMARY"'
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
