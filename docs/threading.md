@@ -96,7 +96,14 @@ shared pool of the conventions does not apply; each call starts its own scope.
 Errors are deterministic, in both: after a failure at index `k` no item above `k` starts, items
 already running finish, and every item below `k` still runs, so the error of the lowest failing
 index is returned, and a serial run would have stopped at that same item. (`Cancelled` from the
-cancel flag and `AllocLimit` from the shared ledger depend on timing by nature.) The cancel flag is
+cancel flag depends on timing by nature.) A refusal from the shared ledger (`AllocLimit`,
+`OutOfMemory`) can depend on how many items held their bookings at once, so no threaded call site
+returns one as it is: a frame (`decode_frame`) gives back every buffer of its team, empties the
+pool and decodes again on one thread (its tiles too, since the filters changed `CurrFrame` in
+place); film grain (`apply_film_grain`) empties the pool and runs its bands again on one thread;
+an AVIF grid and a batch decode the refused tiles or frames again one at a time (above). The one
+thread run is the serial path, which never retries, so its refusal is final and the result, the
+output or the error, is the one of `max_threads = 1`. The cancel flag is
 checked before every tile, once per superblock row inside a tile, and by every wrapup item (once
 per 64-row band, column strip or stripe), on whichever thread runs it, and in film grain.
 
@@ -193,7 +200,9 @@ plane (CDEF: of every plane; loop restoration: one stripe), or for the horizonta
 edges a column strip of one plane (the plane width divided by the threads, full height). So the
 extra memory is at most `threads` bands, a plane of the largest size per stage at worst. The
 filters' small scratch buffers (the loop restoration windows, a few KiB per 64-sample block) are
-not charged, as in the serial path. One thread allocates no band.
+not charged, as in the serial path. One thread allocates no band. A frame whose bands or tile
+states do not fit is not refused for it: it decodes again on one thread (see "The schedulers"), so
+the threaded extra only costs the time of a second decode near the limit.
 
 A tile state's planes come from the ledger's pool and go back to it when the state drops, still
 charged (docs/limits.md, "Buffer reuse"); the pool gives way to any charge that does not fit, so
@@ -280,7 +289,11 @@ decode gets row pipelining, where a persistent pool matters more than one scope 
 - `decoder.rs`: `tiles_decode_the_same_for_every_thread_count` runs the real tile phase and
   wrapup over a 3 x 2 tile frame (pseudo-random tile data, loop restoration on) with 1, 2, 3, 6, 8
   threads and compares every array and plane; `tile_threads_stay_within_max_alloc` checks the
-  ledger peak for several `max_alloc` including a refusal that only the threaded path hits.
+  ledger peak for several `max_alloc` including a refusal that only the threaded path hits;
+  `every_max_alloc_gives_the_one_thread_result` sweeps `max_alloc` in 8 KiB steps across the
+  limit of that frame and requires 2, 3 and 6 threads, three times each, to give the state or
+  the error of 1 thread. `grain.rs`: `every_max_alloc_gives_the_one_thread_result` does the same
+  for film grain at 2 and 4 threads.
   `wrapup_is_the_same_for_every_thread_count` builds frames whose tiles are done
   (`wrapup_frame`: 4:2:0, 4:2:2, 4:4:4 and mono, 8, 10 and 12 bits, superres off and on, the loop
   filter, CDEF and loop restoration on with random parameters, random mode info and samples) and

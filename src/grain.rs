@@ -437,7 +437,40 @@ fn build_stripe(
 /// independent and the output is the same for every thread count. The stripe buffers of a band
 /// come from the ledger's pool (or are allocated fallibly) and are charged to `ledger` while
 /// they live; `cancel` is checked before each band. `simd` picks the blend kernels.
+///
+/// How many bands hold their stripes at once depends on timing, so a refusal (`AllocLimit`,
+/// `OutOfMemory`) with more than one thread runs the bands again on one thread, after the pool
+/// is emptied: the result is the one of `max_threads = 1`, whose refusal is final. Every
+/// output sample is written again, so nothing of the refused run is left.
 pub(crate) fn apply_film_grain(
+    p: &FilmGrainParams,
+    input: &GrainInput,
+    mut out: [&mut [u16]; 3],
+    ledger: &Ledger,
+    cancel: &AtomicBool,
+    max_threads: usize,
+    simd: Simd,
+) -> Result<(), Error> {
+    let r = grain_bands(
+        p,
+        input,
+        out.each_mut().map(|o| &mut **o),
+        ledger,
+        cancel,
+        max_threads,
+        simd,
+    );
+    match r {
+        Err(Error::AllocLimit | Error::OutOfMemory) if max_threads > 1 => {
+            ledger.evict();
+            grain_bands(p, input, out, ledger, cancel, 1, simd)
+        }
+        r => r,
+    }
+}
+
+/// [`apply_film_grain`] on `max_threads` threads, without the retry.
+fn grain_bands(
     p: &FilmGrainParams,
     input: &GrainInput,
     out: [&mut [u16]; 3],

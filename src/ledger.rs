@@ -105,7 +105,7 @@ impl Ledger {
     }
 
     /// Drops every pooled buffer and releases its bytes; false when there were none.
-    fn evict(&self) -> bool {
+    pub(crate) fn evict(&self) -> bool {
         let old = std::mem::take(&mut *self.lock());
         if old.bytes == 0 {
             return false;
