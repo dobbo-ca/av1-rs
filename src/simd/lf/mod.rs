@@ -10,6 +10,8 @@
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;
+#[cfg(target_arch = "x86_64")]
+mod avx512;
 #[cfg(target_arch = "aarch64")]
 mod neon;
 
@@ -48,6 +50,13 @@ pub(crate) fn filter_edge(simd: Simd, px: &mut [u16], e: &Edge) {
         return;
     };
     match simd.tier() {
+        // A run of 16 or fewer samples fills at most half of a 512-bit vector.
+        #[cfg(target_arch = "x86_64")]
+        Tier::Avx512 if e.n > 16 => chunks::<32>(px, e, m, |s| {
+            // SAFETY: `simd` is a `Simd` of tier AVX-512, which `simd::available` or
+            // `simd::best` made only after detecting AVX-512 BW (the kernel's feature).
+            unsafe { avx512::filter(s, e) }
+        }),
         #[cfg(target_arch = "x86_64")]
         Tier::Avx2 | Tier::Avx512 => chunks::<16>(px, e, m, |s| {
             // SAFETY: `simd` is a `Simd` of tier AVX2 or AVX-512, which `simd::available` or

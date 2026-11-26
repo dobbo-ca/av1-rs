@@ -199,6 +199,7 @@ frequency drop on these CPUs).
 | kernel | change | runs: CPU, avx2 ms, avx512 ms, avx512 / avx2 | result |
 |---|---|---|---|
 | cdef `filter` | 32 samples per vector (8x8, 8x4, 4x8 blocks), AVX-512 BW | 45895171894: Xeon Platinum 8573C, 1618, 1584, 97.9%; 45898261819: Xeon 6975P-C, 1274, 1263, 99.1% | kept |
+| lf `filter` | 32 samples along the edge per vector for runs longer than 16, mask registers, AVX-512 BW | 45895175485: AMD EPYC 9V74, 1366, 1358, 99.4%; 45896617239: Xeon Platinum 8573C, 1753, 1742, 99.4%; 45898056586: Xeon 6975P-C, 1271, 1259, 99.1% | kept: the gain is in avifhi, tiles8 and tiles10 (2% to 3% there) |
 | itx | `itx_kernels!` on 16 `i32` lanes for blocks at least 16 wide, AVX-512 F (commit f13d71f) | 45892560939: Xeon 6975P-C, 1266, 1267, 100% | dropped: most of the itx time is in blocks up to 8 wide (`transform_1d::<_, 8>`), which 16 lanes cannot fill |
 | lr Wiener, self guided | 16 `i32` lanes for blocks at least 16 wide, AVX-512 F (commit 993c03a) | 45896614027: AMD EPYC 9V45, 1077, 1076, 100% | dropped: 1.2% of the time, below what a bench can show |
 
