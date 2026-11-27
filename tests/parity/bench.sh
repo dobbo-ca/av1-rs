@@ -70,6 +70,26 @@ table() {
   echo "| all | | | $sd | $sa | $sr | $sv | $(ratio $sr $sd) | $(ratio $sv $sd) | $(ratio $sr $sa) |"
 }
 
+# ab <threads>: the default build of the base commit (av1-oracle-base, bench.yml input `base`)
+# against this commit's, the two runs of each round one after the other, best of 7 rounds; the
+# ratio in tenths of a percent.
+permille() { num "$1" && num "$2" && [ "$2" -gt 0 ] && { x=$(($1 * 1000 / $2)); echo "$((x / 10)).$((x % 10))%"; } || echo "-"; }
+ab() {
+  echo "| class | base ms | this ms | this / base |"
+  echo "|---|---|---|---|"
+  sb=0 st=0
+  for c in $CLASSES; do
+    b= t=
+    for _ in 1 2 3 4 5 6 7; do
+      x=$(ms rs av1-oracle-base $1 $c); { [ -z "$b" ] || [ "$x" -lt "$b" ]; } && b=$x
+      x=$(ms rs av1-oracle $1 $c); { [ -z "$t" ] || [ "$x" -lt "$t" ]; } && t=$x
+    done
+    sb=$((sb + b)) st=$((st + t))
+    echo "| $c | $b | $t | $(permille $t $b) |"
+  done
+  echo "| all | $sb | $st | $(permille $st $sb) |"
+}
+
 # tiers: av1-rs with each SIMD tier forced (AV1_SIMD), one thread; which tier wins per class.
 tiers() {
   echo "| class | scalar ms | avx2 ms | avx512 ms (best) | avx2 / scalar | avx512 / avx2 |"
@@ -104,6 +124,18 @@ neon() {
   echo
   echo "$ARCH, ${CPU:-unknown CPU}, $NT threads (nproc). Classes: tests/parity/bench-lib.sh. Best of 5 wall times; no decoder writes samples."
   echo
+  if command -v av1-oracle-base >/dev/null; then
+    echo "### A/B: this commit against the base $(cat /ab-base.rev 2>/dev/null) (default build, best of 7 rounds)"
+    echo
+    echo "1 thread:"
+    echo
+    ab 1
+    echo
+    echo "default threads ($NT):"
+    echo
+    ab $NT
+    echo
+  fi
   if [ "$ARCH" = aarch64 ]; then
     echo "dav1d C: dav1d --cpumask none (its C code, no NEON asm). av1-rs scalar: AV1_SIMD=scalar."
     echo

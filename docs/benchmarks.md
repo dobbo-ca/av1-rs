@@ -150,6 +150,13 @@ list and the asm, to recheck on a new rustc.
 
 Each decoder decodes the frames that av1-rs outputs (the leading intra frames of a stream).
 
+A dispatch with the input `base` (a commit or branch) also builds the default build of that
+commit in the same image and puts an A/B table first in the summary: the base and this commit,
+one run of each after the other in each of 7 rounds, best of the 7, with one thread and with the
+default threads, the ratio in tenths of a percent. Both builds run on the same machine minutes
+apart, so the A/B ratio is the figure for a change of a few percent, where two separate runs
+differ by more than the change. The base must have the same `Cargo.lock` (the build is offline).
+
 The result is the job summary of the `bench` run (`summary.md`). A command that exits non-zero
 is listed in the summary as a warning, and the times of that run mean nothing. The table of the
 latest run on `main` is the record; the speed PRs copy theirs into the PR description.
