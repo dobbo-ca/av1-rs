@@ -2,18 +2,19 @@
 //! © 2018, VideoLAN and dav1d authors, Copyright © 2018, Two Orioles, LLC; see NOTICE and
 //! `mod.rs`).
 
-use super::{CENTER, Filt, TMP, TS, at4, at8};
+use super::{Filt, at4, at8};
 use crate::simd::arm::{load_i32x4, load_u16x4, load_u16x8, store_u16x8};
 use std::arch::aarch64::*;
 
-/// 8 samples of the window that starts at `s`: one row of 8 (`w == 8`) or two rows of 4.
+/// 8 samples of the window that starts at `s` in `t` (row stride `st`): one row of 8
+/// (`w == 8`) or two rows of 4.
 #[inline]
 #[target_feature(enable = "neon")]
-fn ld(t: &[u16; TMP], s: usize, w: usize) -> uint16x8_t {
+fn ld(t: &[u16], s: usize, w: usize, st: usize) -> uint16x8_t {
     if w == 8 {
         load_u16x8(at8(t, s))
     } else {
-        vcombine_u16(load_u16x4(at4(t, s)), load_u16x4(at4(t, s + TS)))
+        vcombine_u16(load_u16x4(at4(t, s)), load_u16x4(at4(t, s + st)))
     }
 }
 
@@ -29,9 +30,11 @@ fn constrain(p: uint16x8_t, px: int16x8_t, thr: uint16x8_t, sh: int16x8_t) -> in
     vbslq_s16(vcltzq_s16(diff), vnegq_s16(v), v)
 }
 
-/// The filtered block, `f.w` x `f.h` samples packed in `out` (row stride `f.w`).
+/// The filtered block, `f.w` x `f.h` samples packed in `out` (row stride `f.w`), from `t` (the
+/// padded block or the source plane); true when every sample it loaded is below 4096.
 #[target_feature(enable = "neon")]
-pub(super) fn filter(t: &[u16; TMP], out: &mut [u16; 64], f: &Filt) {
+pub(super) fn filter(t: &[u16], out: &mut [u16; 64], f: &Filt) -> bool {
+    let mut or = vdupq_n_u16(0);
     let pri_thr = vdupq_n_u16(f.pri_str as u16);
     let sec_thr = vdupq_n_u16(f.sec_str as u16);
     let pri_sh = vdupq_n_s16(-(f.pri_shift as i16));
@@ -44,19 +47,22 @@ pub(super) fn filter(t: &[u16; TMP], out: &mut [u16; 64], f: &Filt) {
         .take(f.w * f.h / 8)
         .enumerate()
     {
-        let o = n * rows * TS;
-        let pxu = ld(t, CENTER + o, f.w);
+        let o = n * rows * f.stride;
+        let pxu = ld(t, f.center + o, f.w, f.stride);
+        or = vorrq_u16(or, pxu);
         let px = vreinterpretq_s16_u16(pxu);
         let (mut sum, mut mn, mut mx) = (vdupq_n_s16(0), pxu, px);
         for (q, &s) in f.pri.iter().enumerate() {
-            let p = ld(t, s + o, f.w);
+            let p = ld(t, s + o, f.w, f.stride);
+            or = vorrq_u16(or, p);
             let c = constrain(p, px, pri_thr, pri_sh);
             sum = vmlaq_n_s16(sum, c, f.pri_tap[q / 2]);
             mn = vminq_u16(mn, p);
             mx = vmaxq_s16(mx, vreinterpretq_s16_u16(p));
         }
         for (q, &s) in f.sec.iter().enumerate() {
-            let p = ld(t, s + o, f.w);
+            let p = ld(t, s + o, f.w, f.stride);
+            or = vorrq_u16(or, p);
             let c = constrain(p, px, sec_thr, sec_sh);
             // Weight 2 for k = 0, 1 for k = 1.
             let c = if q < 4 { vaddq_s16(c, c) } else { c };
@@ -71,6 +77,8 @@ pub(super) fn filter(t: &[u16; TMP], out: &mut [u16; 64], f: &Filt) {
         let v = vminq_s16(vmaxq_s16(v, vreinterpretq_s16_u16(mn)), mx);
         store_u16x8(dst, vreinterpretq_u16_s16(v));
     }
+    // The largest lane of the OR is below 4096 exactly when no sample has a bit at or above 12.
+    vmaxvq_u16(or) < 4096
 }
 
 /// Adds the 8 rows of `v`, row `n` moved up by `n` lanes, into a 16-lane (lo, hi) partial.

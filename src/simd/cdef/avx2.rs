@@ -3,22 +3,23 @@
 //! padded-block design (BSD-2-Clause, Copyright © 2018, VideoLAN and dav1d authors, Copyright
 //! © 2018, Two Orioles, LLC; see NOTICE and `mod.rs`).
 
-use super::{CENTER, Filt, TMP, TS, at4, at8};
+use super::{Filt, at4, at8};
 use crate::simd::x86::{load64_u16, load128_u16, store256_i32, store256_u16};
 use std::arch::x86_64::*;
 
-/// 16 samples of the window that starts at `s`: two rows of 8 (`w == 8`) or four rows of 4.
+/// 16 samples of the window that starts at `s` in `t` (row stride `st`): two rows of 8
+/// (`w == 8`) or four rows of 4.
 #[inline]
 #[target_feature(enable = "avx2")]
-pub(super) fn ld(t: &[u16; TMP], s: usize, w: usize) -> __m256i {
+pub(super) fn ld(t: &[u16], s: usize, w: usize, st: usize) -> __m256i {
     let (a, b) = if w == 8 {
-        (load128_u16(at8(t, s)), load128_u16(at8(t, s + TS)))
+        (load128_u16(at8(t, s)), load128_u16(at8(t, s + st)))
     } else {
         (
-            _mm_unpacklo_epi64(load64_u16(at4(t, s)), load64_u16(at4(t, s + TS))),
+            _mm_unpacklo_epi64(load64_u16(at4(t, s)), load64_u16(at4(t, s + st))),
             _mm_unpacklo_epi64(
-                load64_u16(at4(t, s + 2 * TS)),
-                load64_u16(at4(t, s + 3 * TS)),
+                load64_u16(at4(t, s + 2 * st)),
+                load64_u16(at4(t, s + 3 * st)),
             ),
         )
     };
@@ -36,10 +37,12 @@ fn constrain(p: __m256i, px: __m256i, thr: __m256i, sh: __m128i) -> __m256i {
     _mm256_sign_epi16(v, diff)
 }
 
-/// The filtered block, `f.w` x `f.h` samples packed in `out` (row stride `f.w`).
+/// The filtered block, `f.w` x `f.h` samples packed in `out` (row stride `f.w`), from `t` (the
+/// padded block or the source plane); true when every sample it loaded is below 4096.
 #[target_feature(enable = "avx2")]
-pub(super) fn filter(t: &[u16; TMP], out: &mut [u16; 64], f: &Filt) {
+pub(super) fn filter(t: &[u16], out: &mut [u16; 64], f: &Filt) -> bool {
     let zero = _mm256_setzero_si256();
+    let mut or = zero;
     let pri_thr = _mm256_set1_epi16(f.pri_str);
     let sec_thr = _mm256_set1_epi16(f.sec_str);
     let pri_sh = _mm_cvtsi32_si128(f.pri_shift);
@@ -56,18 +59,21 @@ pub(super) fn filter(t: &[u16; TMP], out: &mut [u16; 64], f: &Filt) {
         .take(f.w * f.h / 16)
         .enumerate()
     {
-        let o = n * rows * TS;
-        let px = ld(t, CENTER + o, f.w);
+        let o = n * rows * f.stride;
+        let px = ld(t, f.center + o, f.w, f.stride);
+        or = _mm256_or_si256(or, px);
         let (mut sum, mut mn, mut mx) = (zero, px, px);
         for (q, &s) in f.pri.iter().enumerate() {
-            let p = ld(t, s + o, f.w);
+            let p = ld(t, s + o, f.w, f.stride);
+            or = _mm256_or_si256(or, p);
             let c = constrain(p, px, pri_thr, pri_sh);
             sum = _mm256_add_epi16(sum, _mm256_mullo_epi16(c, pri_w[q / 2]));
             mn = _mm256_min_epu16(mn, p);
             mx = _mm256_max_epi16(mx, p);
         }
         for (q, &s) in f.sec.iter().enumerate() {
-            let p = ld(t, s + o, f.w);
+            let p = ld(t, s + o, f.w, f.stride);
+            or = _mm256_or_si256(or, p);
             let c = constrain(p, px, sec_thr, sec_sh);
             // Weight 2 for k = 0, 1 for k = 1.
             let c = if q < 4 { _mm256_add_epi16(c, c) } else { c };
@@ -81,6 +87,8 @@ pub(super) fn filter(t: &[u16; TMP], out: &mut [u16; 64], f: &Filt) {
         let v = _mm256_add_epi16(px, _mm256_srai_epi16::<4>(sum));
         store256_u16(dst, _mm256_min_epi16(_mm256_max_epi16(v, mn), mx));
     }
+    // No sample has a bit at or above bit 12 (0xf000 is -4096 as i16).
+    _mm256_testz_si256(or, _mm256_set1_epi16(-4096)) != 0
 }
 
 /// Adds the 8 rows of `v`, row `n` moved up by `n` lanes, into a 16-lane (lo, hi) partial.
