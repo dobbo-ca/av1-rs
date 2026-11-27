@@ -23,7 +23,8 @@
 //! assembled and cropped; transforms are not applied unless `--transforms` is given), `<stem>.frames` has its one line, and
 //! `<stem>.alpha.yuv` the alpha image when there is one. `--info` does not apply to `.avif`.
 //! With `--transforms` (`Options::apply_transforms`) `clap`, `irot` and `imir` are applied, and
-//! `<stem>.tr` has the number of transform properties of the primary image.
+//! `<stem>.tr` has the number of transform properties of the primary image; when that one
+//! property is a `clap`, `<stem>.crop` has its rectangle on the raw image, `x y w h`.
 //!
 //! With `--null` the samples are decoded but no `.yuv` is written (the bench and profile runs).
 //!
@@ -208,6 +209,21 @@ fn run_file(
                 write_frames(std::slice::from_ref(&avif.image), &stem, args.null)?;
                 if args.transforms {
                     fs::write(out(&stem, "tr"), avif.transforms.len().to_string())?;
+                    // A crop alone: its rectangle on the raw image, so the gate can check the
+                    // output against the raw decode sample by sample.
+                    if let [av1::isobmff::Transform::Clap(c)] = avif.transforms.as_slice() {
+                        let raw = Options {
+                            apply_transforms: false,
+                            ..options.clone()
+                        };
+                        if let Ok(r) = decode_avif(&data, &raw, limits, &AtomicBool::new(false))
+                            && let Some(rect) = c.crop_rounded(r.image.width, r.image.height)
+                        {
+                            let line =
+                                format!("{} {} {} {}", rect.x, rect.y, rect.width, rect.height);
+                            fs::write(out(&stem, "crop"), line)?;
+                        }
+                    }
                 }
                 if let Some(alpha) = avif.alpha.as_ref().filter(|_| !args.null) {
                     let mut yuv = Vec::new();

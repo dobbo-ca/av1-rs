@@ -101,8 +101,18 @@ on two sets:
 - the corpus AVIF files (the libavif `poc_*` reproducers excluded), some of which carry `clap`,
   `irot` or `imir` (`<stem>.tr` counts the properties);
 - files that `avifenc` (libavif 0.11.1 from bookworm) writes in the image: 4:2:0, 4:2:2 and 4:4:4
-  at 64x48, 63x47 and 33x17 with no transform, each `irot`, each `imir`, two `clap` rectangles and
-  combinations of the three. A combination that avifenc refuses is skipped.
+  at 64x48, 63x47 and 33x17 with no transform, each `irot`, each `imir`, three `clap` rectangles
+  (one with an odd origin, which avifenc writes only in 4:4:4) and combinations of the three. A
+  combination that avifenc refuses is skipped. The chroma of these files is smooth, with a
+  different slope across and down per plane, so a chroma plane mirrored, rotated or cropped the
+  wrong way falls outside the by-position window below.
+
+A file whose only transform is a `clap` (`<stem>.crop` holds the rectangle) must also equal,
+sample by sample, that rectangle of av1-rs's raw decode: luma `x, y, w, h`, and chroma with
+factors `sx, sy` from `floor(x / sx), floor(y / sy)`, `ceil(w / sx) x ceil(h / sy)` samples (the
+rule of isobmff-rs `apply_transforms`). At least `TRANSFORM_MIN_CROP` (4) such crops and
+`TRANSFORM_MIN_CHROMA` (20) files compared by chroma position are required. A chroma part that is
+not whole (a plane missing) fails the by-position check.
 
 A file passes when the frame line (`W H bitdepth layout`) and every plane are equal. The documented
 difference: libheif converts a 4:2:0 or 4:2:2 image to 4:4:4 when the geometry is odd (an odd crop
