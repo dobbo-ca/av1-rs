@@ -13,13 +13,21 @@ grep -v '^#' "$list" | while read -r kind sum url name; do
   [ -f "$f.ok" ] && [ -f "$f" ] && continue
   mkdir -p "$(dirname "$f")"
   rm -f "$f.ok"
-  curl -fsSL --retry 3 --limit-rate 20M -o "$f.part" "$url"
-  case $kind in
-    sha1) have=$(sha1sum "$f.part" | cut -d' ' -f1) ;;
-    blob) have=$(git hash-object "$f.part") ;;
-    *) echo "$name: unknown hash kind $kind" >&2; exit 1 ;;
-  esac
-  [ "$have" = "$sum" ] || { echo "$name: hash $have, want $sum" >&2; rm -f "$f.part"; exit 1; }
+  # A host can answer 200 with another body for a while (a rate limit or bot check page), so a
+  # wrong hash is tried again, 3 times in all, before it fails.
+  for try in 1 2 3; do
+    curl -fsSL --retry 3 --limit-rate 20M -o "$f.part" "$url"
+    case $kind in
+      sha1) have=$(sha1sum "$f.part" | cut -d' ' -f1) ;;
+      blob) have=$(git hash-object "$f.part") ;;
+      *) echo "$name: unknown hash kind $kind" >&2; exit 1 ;;
+    esac
+    [ "$have" = "$sum" ] && break
+    echo "$name: hash $have, want $sum (try $try of 3)" >&2
+    rm -f "$f.part"
+    [ "$try" = 3 ] && exit 1
+    sleep $((try * 20))
+  done
   mv "$f.part" "$f"
   touch "$f.ok"
 done
