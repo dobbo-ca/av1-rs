@@ -261,8 +261,25 @@ pub(crate) const QUANT_LEN: usize = 1024;
 /// the padded block and read zero where the spec skips a position outside the block.
 const TX_PAD: usize = 4;
 
-/// The padded levels of the largest coded area (32x32).
-pub(crate) const LEVELS_LEN: usize = (32 + TX_PAD) * (32 + TX_PAD);
+/// The padded levels of the largest coded area (32x32, `(32 + TX_PAD)^2` entries), rounded up
+/// to a power of two: the coefficient loops index it masked with `LEVELS_LEN - 1` (no bounds
+/// check; every index is below `(32 + TX_PAD)^2`, so the mask changes nothing). `Quant[ ]`
+/// indices (scan positions, below 1024) are masked the same way.
+pub(crate) const LEVELS_LEN: usize = 2048;
+const _: () = assert!(LEVELS_LEN.is_power_of_two() && LEVELS_LEN >= (32 + TX_PAD) * (32 + TX_PAD));
+const _: () = assert!(QUANT_LEN.is_power_of_two());
+
+/// `levels[ i ]`, `i` masked into the array (see [`LEVELS_LEN`]).
+#[inline(always)]
+fn lv(i: usize) -> usize {
+    i & (LEVELS_LEN - 1)
+}
+
+/// `quant[ pos ]`, `pos` masked into the array (see [`LEVELS_LEN`]).
+#[inline(always)]
+fn qp(pos: usize) -> usize {
+    pos & (QUANT_LEN - 1)
+}
 
 /// `SegQMLevel` value that disables the quantizer matrix (`NUM_QM_LEVELS - 1`).
 const QM_LEVEL_FLAT: usize = 15;
@@ -346,9 +363,9 @@ impl LevelCtx {
     /// class (spec 9.3), so one set of loads serves [`LevelCtx::base_ctx`] and
     /// [`LevelCtx::br_ctx`].
     #[inline(always)]
-    fn neighbours(&self, levels: &[u8], row: usize, col: usize) -> (usize, usize) {
+    fn neighbours(&self, levels: &[u8; LEVELS_LEN], row: usize, col: usize) -> (usize, usize) {
         let i = row * self.stride + col;
-        let at = |k: usize| usize::from(levels[i + self.base_offs[k]]);
+        let at = |k: usize| usize::from(levels[lv(i + self.base_offs[k])]);
         let s3 = at(0) + at(1) + at(2);
         (s3 + at(3) + at(4), s3)
     }
@@ -420,8 +437,8 @@ fn read_levels<const CLASS: usize>(
     eob_cdf: &mut [u16; 4],
     base_cdfs: &mut [[u16; 5]; 42],
     br_cdfs: &mut [[u16; 5]; 21],
-    levels: &mut [u8],
-    quant: &mut [i32],
+    levels: &mut [u8; LEVELS_LEN],
+    quant: &mut [i32; QUANT_LEN],
 ) -> usize {
     // The brs of a level above NUM_BASE_LEVELS, from the neighbour sum `s3`.
     let mut read_br = |sd: &mut SymbolDecoder<'_>, s3, row, col, mut level: usize| {
@@ -445,8 +462,8 @@ fn read_levels<const CLASS: usize>(
         if level > NUM_BASE_LEVELS {
             level = read_br(&mut *sd, lc.neighbours(levels, row, col).1, row, col, level);
         }
-        levels[row * lc.stride + col] = pack_level(level);
-        quant[pos] = (level as i32) << 11;
+        levels[lv(row * lc.stride + col)] = pack_level(level);
+        quant[qp(pos)] = (level as i32) << 11;
         pos
     };
     for &pos in scan.get(1..last).unwrap_or_default().iter().rev() {
@@ -458,9 +475,9 @@ fn read_levels<const CLASS: usize>(
         if level > NUM_BASE_LEVELS {
             level = read_br(&mut *sd, s3, row, col, level);
         }
-        levels[row * lc.stride + col] = pack_level(level);
+        levels[lv(row * lc.stride + col)] = pack_level(level);
         if level != 0 {
-            quant[pos] = ((level as i32) << 11) | next as i32;
+            quant[qp(pos)] = ((level as i32) << 11) | next as i32;
             next = pos;
         }
     }
@@ -1250,7 +1267,7 @@ impl TileDecoder<'_> {
                 [coeff_base_eob_ctx(tx_sz, eob - 1)];
             let base_cdfs = &mut self.cdf.coeff_base_cdf[tx_sz_ctx][ptype];
             let br_cdfs = &mut self.cdf.coeff_br_cdf[tx_sz_ctx.min(TX_32X32)][ptype];
-            let (sd, levels, quant) = (&mut self.sd, &mut self.levels[..], &mut self.quant[..]);
+            let (sd, levels, quant) = (&mut self.sd, &mut *self.levels, &mut *self.quant);
             let mut pos = match tx_class {
                 TX_CLASS_2D => read_levels::<TX_CLASS_2D>(
                     sd, &lc, scan, eob_cdf, base_cdfs, br_cdfs, levels, quant,
@@ -1266,16 +1283,16 @@ impl TileDecoder<'_> {
             // Reads no symbol, so it can run before the loop that needs it.
             let dc_ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
             let dequant = Dequant::new(&self.recon_params(plane, tx_sz, plane_tx_type));
-            let levels = &mut self.levels[..];
-            let quant = &mut self.quant[..];
+            let levels = &mut *self.levels;
+            let quant = &mut *self.quant;
             let dq = &mut self.itx.dq;
             // The sign pass visits the nonzero positions in scan order (see `read_levels`).
             loop {
-                let packed = quant[pos];
+                let packed = quant[qp(pos)];
                 let next = (packed & 0x7FF) as usize;
                 let mut q = packed >> 11;
                 let row = pos >> lc.bwl;
-                levels[pos + row * TX_PAD] = 0;
+                levels[lv(pos + row * TX_PAD)] = 0;
                 let sign = if pos == 0 {
                     self.sd.read_cdf(&mut self.cdf.dc_sign_cdf[ptype][dc_ctx]) != 0
                 } else {
@@ -1319,7 +1336,7 @@ impl TileDecoder<'_> {
                     dq[(col * DQ_STRIDE + row) & (DQ_LEN - 1)] =
                         d.coef(if sign { -q } else { q }, pos);
                 }
-                quant[pos] = 0;
+                quant[qp(pos)] = 0;
                 if next == 0 {
                     break;
                 }
@@ -1408,7 +1425,13 @@ mod tests {
 
     /// `LevelCtx::base_ctx` for a runtime class, with the DC context of a 2D class (0) that
     /// `read_levels` applies itself.
-    fn base_ctx_of(tx_sz: usize, tx_class: usize, levels: &[u8], row: usize, col: usize) -> usize {
+    fn base_ctx_of(
+        tx_sz: usize,
+        tx_class: usize,
+        levels: &[u8; LEVELS_LEN],
+        row: usize,
+        col: usize,
+    ) -> usize {
         let lc = LevelCtx::new(tx_sz, tx_class);
         let s5 = lc.neighbours(levels, row, col).0;
         match tx_class {
@@ -1420,7 +1443,13 @@ mod tests {
     }
 
     /// `LevelCtx::br_ctx` for a runtime class.
-    fn br_ctx_of(tx_sz: usize, tx_class: usize, levels: &[u8], row: usize, col: usize) -> usize {
+    fn br_ctx_of(
+        tx_sz: usize,
+        tx_class: usize,
+        levels: &[u8; LEVELS_LEN],
+        row: usize,
+        col: usize,
+    ) -> usize {
         let lc = LevelCtx::new(tx_sz, tx_class);
         let s3 = lc.neighbours(levels, row, col).1;
         match tx_class {
