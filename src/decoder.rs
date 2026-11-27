@@ -2590,6 +2590,20 @@ mod tests {
         }
     }
 
+    /// Decoded tiles keep the invariant that the loop filter's segment walk rests on (the
+    /// `lf` module doc): every transform block is whole, with the mode info of one block.
+    #[test]
+    fn decoded_transform_blocks_are_whole() {
+        let mut decoded = 0;
+        for seed in 1..=6 {
+            if let (Ok(fs), _) = run_tiles(seed, 1, 64 << 20) {
+                crate::lf::tests::assert_transform_blocks_whole(&fs);
+                decoded += 1;
+            }
+        }
+        assert!(decoded > 0);
+    }
+
     #[test]
     fn tiles_decode_the_same_for_every_thread_count() {
         let mut decoded = 0;
