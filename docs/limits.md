@@ -62,7 +62,8 @@ checks `Decoder::decode_temporal_units` at 2 and 4 threads against `max_alloc` p
 buffers).
 
 Not charged, because their size does not depend on the input: per tile decoder, the colour map
-buffers and the 16 KiB reconstruction scratch (`recon::ItxScratch`). The loop restoration source
+buffers and the 17.25 KiB reconstruction scratch (`recon::ItxScratch`, with the intra edge
+arrays). The loop restoration source
 window and the kernels' working arrays (about 100 KB, `lr::LrScratch`) are charged: one set per
 `lr_frame` call, or per stripe item when threaded, taken from the ledger pool and not cleared
 between blocks.

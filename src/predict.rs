@@ -88,10 +88,23 @@ pub(crate) fn predict_intra(
     e: IntraEdges,
     p: &IntraParams,
 ) {
-    predict_intra_simd(crate::simd::best(), px, stride, x, y, e, p);
+    predict_intra_simd(
+        crate::simd::best(),
+        px,
+        stride,
+        x,
+        y,
+        e,
+        p,
+        &mut [[0; EDGE_LEN]; 2],
+    );
 }
 
 /// [`predict_intra`] with the kernels of the tier `simd` (`Simd::scalar()` is the oracle).
+///
+/// `edges` is the scratch for `AboveRow` and `LeftCol`, kept by the caller and not cleared
+/// between uses: only the entries the mode reads are built (`na` and `nl` below), and no
+/// prediction reads past them.
 pub(crate) fn predict_intra_simd(
     simd: Simd,
     px: &mut [u16],
@@ -100,41 +113,65 @@ pub(crate) fn predict_intra_simd(
     y: usize,
     e: IntraEdges,
     p: &IntraParams,
+    edges: &mut [Edge; 2],
 ) {
     let w = 1usize << p.log2w;
     let h = 1usize << p.log2h;
     let mid = 1i32 << (p.bit_depth - 1);
 
-    let mut above: Edge = [0; EDGE_LEN];
-    let mut left: Edge = [0; EDGE_LEN];
+    let [above, left] = edges;
 
-    // AboveRow[ 0..w+h-1 ]
+    // The number of AboveRow and LeftCol entries from 0 that the mode reads. Only zone 1
+    // (pAngle < 90) reads AboveRow past w - 1 (the edge filter numPx, maxBaseX) and only zone 3
+    // (pAngle > 180) reads LeftCol past h - 1; zone 2, DC, smooth, Paeth and filter intra read
+    // at most AboveRow[ w - 1 ] and LeftCol[ h - 1 ].
+    let (na, nl) = if !p.use_filter_intra && (V_PRED..=D67_PRED).contains(&p.mode) {
+        let p_angle = MODE_TO_ANGLE[p.mode] + p.angle_delta.clamp(-3, 3) * ANGLE_STEP as i32;
+        (
+            if p_angle < 90 { w + h } else { w },
+            if p_angle > 180 { w + h } else { h },
+        )
+    } else {
+        (w, h)
+    };
+
+    // AboveRow[ 0..na-1 ]
     if !e.have_above && e.have_left {
         let v = i32::from(px[y * stride + x - 1]);
-        above[OFF..OFF + w + h].fill(v);
+        above[OFF..OFF + na].fill(v);
     } else if !e.have_above {
-        above[OFF..OFF + w + h].fill(mid - 1);
+        above[OFF..OFF + na].fill(mid - 1);
     } else {
         let reach = if e.have_above_right { 2 * w } else { w };
         let above_limit = p.max_x.min(x + reach - 1);
         let row = (y - 1) * stride;
-        for i in 0..w + h {
-            above[OFF + i] = i32::from(px[row + above_limit.min(x + i)]);
+        // CurrFrame[ y - 1 ][ Min( aboveLimit, x + i ) ]: x + i <= aboveLimit exactly for
+        // i < n (aboveLimit >= x as x <= maxX), so a copy of n samples, then the last repeated.
+        let n = (above_limit + 1 - x).min(na);
+        for (d, &s) in above[OFF..OFF + n]
+            .iter_mut()
+            .zip(&px[row + x..row + x + n])
+        {
+            *d = i32::from(s);
         }
+        above[OFF + n..OFF + na].fill(i32::from(px[row + above_limit]));
     }
 
-    // LeftCol[ 0..w+h-1 ]
+    // LeftCol[ 0..nl-1 ]
     if !e.have_left && e.have_above {
         let v = i32::from(px[(y - 1) * stride + x]);
-        left[OFF..OFF + w + h].fill(v);
+        left[OFF..OFF + nl].fill(v);
     } else if !e.have_left {
-        left[OFF..OFF + w + h].fill(mid + 1);
+        left[OFF..OFF + nl].fill(mid + 1);
     } else {
         let reach = if e.have_below_left { 2 * h } else { h };
         let left_limit = p.max_y.min(y + reach - 1);
-        for i in 0..w + h {
-            left[OFF + i] = i32::from(px[left_limit.min(y + i) * stride + x - 1]);
+        // The same split as AboveRow, down the column at x - 1.
+        let n = (left_limit + 1 - y).min(nl);
+        for i in 0..n {
+            left[OFF + i] = i32::from(px[(y + i) * stride + x - 1]);
         }
+        left[OFF + n..OFF + nl].fill(i32::from(px[left_limit * stride + x - 1]));
     }
 
     // AboveRow[ -1 ] and LeftCol[ -1 ]
@@ -151,15 +188,15 @@ pub(crate) fn predict_intra_simd(
     left[OFF - 1] = corner;
 
     if p.use_filter_intra {
-        predict_recursive(px, stride, x, y, w, h, &above, &left, p);
+        predict_recursive(px, stride, x, y, w, h, above, left, p);
     } else if (V_PRED..=D67_PRED).contains(&p.mode) {
-        predict_directional(simd, px, stride, x, y, e, w, h, &mut above, &mut left, p);
+        predict_directional(simd, px, stride, x, y, e, w, h, above, left, p);
     } else if matches!(p.mode, SMOOTH_PRED | SMOOTH_V_PRED | SMOOTH_H_PRED) {
-        ipred::smooth(simd, px, stride, x, y, &above, &left, p);
+        ipred::smooth(simd, px, stride, x, y, above, left, p);
     } else if p.mode == DC_PRED {
-        predict_dc(px, stride, x, y, e, &above, &left, p);
+        predict_dc(px, stride, x, y, e, above, left, p);
     } else {
-        ipred::paeth(simd, px, stride, x, y, w, h, &above, &left);
+        ipred::paeth(simd, px, stride, x, y, w, h, above, left);
     }
 }
 
