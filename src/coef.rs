@@ -1031,19 +1031,15 @@ impl TileDecoder<'_> {
             // set 1 is only chosen for 4x4 and 8x8 squares (get_tx_set).
             return match set {
                 TX_SET_INTER_1 => {
-                    let sym = self
-                        .sd
-                        .read_symbol(&mut self.cdf.inter_tx_type_set1_cdf[sqr]);
+                    let sym = self.sd.read_cdf(&mut self.cdf.inter_tx_type_set1_cdf[sqr]);
                     TX_TYPE_INTER_INV_SET1[sym]
                 }
                 TX_SET_INTER_2 => {
-                    let sym = self.sd.read_symbol(&mut self.cdf.inter_tx_type_set2_cdf);
+                    let sym = self.sd.read_cdf(&mut self.cdf.inter_tx_type_set2_cdf);
                     TX_TYPE_INTER_INV_SET2[sym]
                 }
                 _ => {
-                    let sym = self
-                        .sd
-                        .read_symbol(&mut self.cdf.inter_tx_type_set3_cdf[sqr]);
+                    let sym = self.sd.read_cdf(&mut self.cdf.inter_tx_type_set3_cdf[sqr]);
                     TX_TYPE_INTER_INV_SET3[sym]
                 }
             };
@@ -1057,12 +1053,12 @@ impl TileDecoder<'_> {
         if set == TX_SET_INTRA_1 {
             let sym = self
                 .sd
-                .read_symbol(&mut self.cdf.intra_tx_type_set1_cdf[sqr][intra_dir]);
+                .read_cdf(&mut self.cdf.intra_tx_type_set1_cdf[sqr][intra_dir]);
             TX_TYPE_INTRA_INV_SET1[sym]
         } else {
             let sym = self
                 .sd
-                .read_symbol(&mut self.cdf.intra_tx_type_set2_cdf[sqr][intra_dir]);
+                .read_cdf(&mut self.cdf.intra_tx_type_set2_cdf[sqr][intra_dir]);
             TX_TYPE_INTRA_INV_SET2[sym]
         }
     }
@@ -1194,17 +1190,13 @@ impl TileDecoder<'_> {
             let eob_multisize = TX_WIDTH_LOG2[tx_sz].min(5) + TX_HEIGHT_LOG2[tx_sz].min(5) - 4;
             let ctx = usize::from(tx_class != TX_CLASS_2D);
             let eob_pt = 1 + match eob_multisize {
-                0 => self.sd.read_symbol(&mut self.cdf.eob_pt_16_cdf[ptype][ctx]),
-                1 => self.sd.read_symbol(&mut self.cdf.eob_pt_32_cdf[ptype][ctx]),
-                2 => self.sd.read_symbol(&mut self.cdf.eob_pt_64_cdf[ptype][ctx]),
-                3 => self
-                    .sd
-                    .read_symbol(&mut self.cdf.eob_pt_128_cdf[ptype][ctx]),
-                4 => self
-                    .sd
-                    .read_symbol(&mut self.cdf.eob_pt_256_cdf[ptype][ctx]),
-                5 => self.sd.read_symbol(&mut self.cdf.eob_pt_512_cdf[ptype]),
-                _ => self.sd.read_symbol(&mut self.cdf.eob_pt_1024_cdf[ptype]),
+                0 => self.sd.read_cdf(&mut self.cdf.eob_pt_16_cdf[ptype][ctx]),
+                1 => self.sd.read_cdf(&mut self.cdf.eob_pt_32_cdf[ptype][ctx]),
+                2 => self.sd.read_cdf(&mut self.cdf.eob_pt_64_cdf[ptype][ctx]),
+                3 => self.sd.read_cdf(&mut self.cdf.eob_pt_128_cdf[ptype][ctx]),
+                4 => self.sd.read_cdf(&mut self.cdf.eob_pt_256_cdf[ptype][ctx]),
+                5 => self.sd.read_cdf(&mut self.cdf.eob_pt_512_cdf[ptype]),
+                _ => self.sd.read_cdf(&mut self.cdf.eob_pt_1024_cdf[ptype]),
             };
             eob = if eob_pt < 2 {
                 eob_pt

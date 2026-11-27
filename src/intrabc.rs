@@ -251,7 +251,7 @@ impl TileDecoder<'_> {
         let mut diff_mv = [0i32; 2];
         let mv_joint = self
             .sd
-            .read_symbol(&mut self.cdf.mv_joint_cdf[MV_INTRABC_CONTEXT]);
+            .read_cdf(&mut self.cdf.mv_joint_cdf[MV_INTRABC_CONTEXT]);
         if mv_joint == MV_JOINT_HZVNZ || mv_joint == MV_JOINT_HNZVNZ {
             diff_mv[0] = self.read_mv_component(0);
         }
@@ -266,23 +266,17 @@ impl TileDecoder<'_> {
     /// are 1, not read) in an intra frame.
     fn read_mv_component(&mut self, comp: usize) -> i32 {
         const MV_CTX: usize = MV_INTRABC_CONTEXT;
-        let mv_sign = self.sd.read_symbol(&mut self.cdf.mv_sign_cdf[MV_CTX][comp]) != 0;
-        let mv_class = self
-            .sd
-            .read_symbol(&mut self.cdf.mv_class_cdf[MV_CTX][comp]);
+        let mv_sign = self.sd.read_cdf(&mut self.cdf.mv_sign_cdf[MV_CTX][comp]) != 0;
+        let mv_class = self.sd.read_cdf(&mut self.cdf.mv_class_cdf[MV_CTX][comp]);
         let mag = if mv_class == MV_CLASS_0 {
-            let mv_class0_bit = self
-                .sd
-                .read_symbol(&mut self.cdf.mv_class0_bit_cdf[MV_CTX][comp])
-                as i32;
+            let mv_class0_bit =
+                self.sd
+                    .read_cdf(&mut self.cdf.mv_class0_bit_cdf[MV_CTX][comp]) as i32;
             ((mv_class0_bit << 3) | (3 << 1) | 1) + 1
         } else {
             let mut d = 0i32;
             for i in 0..mv_class {
-                let mv_bit = self
-                    .sd
-                    .read_symbol(&mut self.cdf.mv_bit_cdf[MV_CTX][comp][i])
-                    as i32;
+                let mv_bit = self.sd.read_cdf(&mut self.cdf.mv_bit_cdf[MV_CTX][comp][i]) as i32;
                 d |= mv_bit << i;
             }
             let mag = (CLASS0_SIZE as i32) << (mv_class + 2);
