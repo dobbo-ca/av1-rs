@@ -203,6 +203,12 @@ COPY --from=bench /report /
 FROM bench-bin AS profile
 RUN apt-get update && apt-get install -y --no-install-recommends linux-perf valgrind \
     && rm -rf /var/lib/apt/lists/*
+# dav1d's symbols for its profile: the dbgsym package of the installed libdav1d6 (the same
+# version), from the Debian debug archive. Without it the dav1d profile has addresses only.
+RUN echo 'deb http://deb.debian.org/debian-debug bookworm-debug bookworm-proposed-updates-debug main' > /etc/apt/sources.list.d/debug.list \
+    && apt-get update && { apt-get install -y --no-install-recommends "libdav1d6-dbgsym=$(dpkg-query -W -f '${Version}' libdav1d6)" \
+       || echo 'no libdav1d6-dbgsym for this version'; } \
+    && rm -rf /var/lib/apt/lists/*
 RUN --mount=type=cache,id=av1-rs-target-bench,sharing=locked,target=/src/target \
     find src examples tests -name '*.rs' -exec touch {} + \
     && RUSTFLAGS="-C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
