@@ -104,8 +104,11 @@ on two sets:
   at 64x48, 63x47 and 33x17 with no transform, each `irot`, each `imir`, three `clap` rectangles
   (one with an odd origin, which avifenc writes only in 4:4:4) and combinations of the three. A
   combination that avifenc refuses is skipped. The chroma of these files is smooth, with a
-  different slope across and down per plane, so a chroma plane mirrored, rotated or cropped the
-  wrong way falls outside the by-position window below.
+  different slope across and down per plane, so a chroma plane left unmirrored or rotated the
+  wrong way falls outside the by-position window below (the self-check shows it on every run). A
+  shift of one chroma sample stays inside that window: it is caught only for a crop alone, by
+  the exact check below. A subsampled crop with an odd origin is checked exactly only by the
+  unit test `odd_crop_keeps_420_and_takes_the_chroma_rectangle` (avifenc does not write one).
 
 A file whose only transform is a `clap` (`<stem>.crop` holds the rectangle) must also equal,
 sample by sample, that rectangle of av1-rs's raw decode: luma `x, y, w, h`, and chroma with

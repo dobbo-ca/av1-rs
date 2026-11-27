@@ -35,8 +35,9 @@ MIN_MUT=${TRANSFORM_MIN_MUT:-4}
 # gen <dst>: 4:2:0, 4:2:2 and 4:4:4 images of three sizes written by avifenc with every
 # combination of clap, irot and imir below. Luma is a gradient with some noise inside the RGB
 # gamut, so a wrong row or column shows. Chroma is smooth, with a different slope across and down
-# and per plane, so that a chroma plane mirrored, rotated or cropped the wrong way is far from
-# libheif's samples in its window (chrompos); it stays within 120..135, near grey, because
+# and per plane, so that a chroma plane left unmirrored or rotated the wrong way is far from
+# libheif's samples in its window (chrompos; a shift of one chroma sample stays inside it, which
+# only cropcmp sees, for a crop alone); it stays within 120..135, near grey, because
 # libheif goes through RGB for odd geometry and a colour outside the gamut clips and moves the
 # luma (88..168 failed the luma check on 25 files). A combination that avifenc refuses (a crop that
 # 4:2:0 or 4:2:2 cannot hold) is skipped.
