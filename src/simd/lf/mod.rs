@@ -2,7 +2,9 @@
 //! vector, each lane doing exactly what `lf::sample_filter` (the scalar oracle) does for one
 //! sample. Like dav1d's loop filter, the lanes run along the edge; the samples across the edge
 //! (`p6..p0`, `q0..q6`) are gathered into rows of a small buffer first, in safe code, and
-//! written back after the kernel.
+//! written back after the kernel. On a vertical edge those samples are adjacent in memory, so
+//! the AVX2 and NEON kernels load them as one vector per lane and transpose them in registers
+//! instead (`filter_v`).
 //!
 //! Every lane works in 16 bits: samples are below `1 << bd` (12 bits at most), so the narrow
 //! filter's signed values stay within `i16` and the wide filter's sums (taps add up to 8 or 16)
@@ -50,6 +52,18 @@ pub(crate) fn filter_edge(simd: Simd, px: &mut [u16], e: &Edge) {
         return;
     };
     match simd.tier() {
+        #[cfg(target_arch = "x86_64")]
+        Tier::Avx2 | Tier::Avx512 if rows_fit(px.len(), e, m) => {
+            // SAFETY: `simd` is a `Simd` of tier AVX2 or AVX-512, which `simd::available` or
+            // `simd::best` made only after detecting AVX2.
+            unsafe { avx2::filter_v(px, e, m) }
+        }
+        #[cfg(target_arch = "aarch64")]
+        Tier::Neon if rows_fit(px.len(), e, m) => {
+            // SAFETY: `simd` is a `Simd` of tier NEON, which `simd::available` or `simd::best`
+            // made only after detecting NEON.
+            unsafe { neon::filter_v(px, e, m) }
+        }
         // A run of 16 or fewer samples fills at most half of a 512-bit vector.
         #[cfg(target_arch = "x86_64")]
         Tier::Avx512 if e.n > 16 => chunks::<32>(px, e, m, |s| {
@@ -104,6 +118,21 @@ fn vector_taps(len: usize, e: &Edge) -> Option<usize> {
             .checked_add(e.pos)?
             < len;
     ok.then_some(m)
+}
+
+/// Whether the vertical-edge kernels (`filter_v`) may run on `e`, which `vector_taps` accepted
+/// with `m` taps: `e` is vertical, and the 8 (`m <= 4`) or 16 samples each lane loads, from
+/// `w / 2` before its `q0`, are inside a buffer of `len` samples and do not overlap.
+fn rows_fit(len: usize, e: &Edge, m: usize) -> bool {
+    let w = if m <= 4 { 8 } else { 16 };
+    e.step == 1
+        && e.along >= w
+        && e.pos >= w / 2
+        && (e.n - 1)
+            .checked_mul(e.along)
+            .and_then(|d| d.checked_add(e.pos))
+            .and_then(|d| d.checked_add(w / 2))
+            .is_some_and(|end| end <= len)
 }
 
 /// Runs `kernel` on the samples of `e` in chunks of `L` lanes (the last one padded with zero
@@ -170,7 +199,7 @@ pub(crate) fn check(data: &[u8]) {
     let b = |i: usize| data.get(i).copied().unwrap_or(0);
     let seed = data
         .iter()
-        .skip(11)
+        .skip(12)
         .fold(0x9e37_79b9_7f4a_7c15u64, |h, &v| {
             (h ^ u64::from(v)).wrapping_mul(0x100_0000_01b3)
         });
@@ -186,6 +215,7 @@ pub(crate) fn check(data: &[u8]) {
         start: usize::from(b(8)) % 24,
         mode: b(9) % 5,
         delta: usize::from(b(10)),
+        edge: [16, 4, 8][usize::from(b(11)) % 3],
         seed: seed | 1,
     });
 }
@@ -208,6 +238,9 @@ struct Case {
     /// 4 flat each side with a step of `delta`.
     mode: u8,
     delta: usize,
+    /// Samples before the edge across it: 16 leaves room for every filter, 4 and 8 put the run
+    /// at the left or top of the plane.
+    edge: usize,
     seed: u64,
 }
 
@@ -226,16 +259,17 @@ fn check_case(c: &Case) {
         c.filter_size
     };
     let max = (1u32 << c.bd) - 1;
-    // The plane: 16 samples each side across the edge, `start + n` along it, plus spare.
+    // The plane: `edge` samples before the edge across it and 8 (vertical: just room for the
+    // 16-sample rows of `filter_v`) or 16 after, `start + n` along it, plus spare.
     let (w, h) = if c.vertical {
-        (32 + c.extra, c.start + c.n)
+        (c.edge + 8 + c.extra, c.start + c.n)
     } else {
-        (c.start + c.n + c.extra, 32)
+        (c.start + c.n + c.extra, c.edge + 16)
     };
     let (pos, step, along) = if c.vertical {
-        (c.start * w + 16, 1, w)
+        (c.start * w + c.edge, 1, w)
     } else {
-        (16 * w + c.start, w, 1)
+        (c.edge * w + c.start, w, 1)
     };
     let base = (next() as u32) & max;
     let step_px = (c.delta as u32) << (c.bd - 8);
@@ -248,7 +282,7 @@ fn check_case(c: &Case) {
             1 => (base + (r % 3) * (1 << (c.bd - 8))).min(max),
             2 => {
                 let near = (base + (r % 5)).min(max);
-                if across >= 16 {
+                if across >= c.edge {
                     (near + step_px).min(max)
                 } else {
                     near
@@ -262,7 +296,7 @@ fn check_case(c: &Case) {
                 }
             }
             _ => {
-                if across >= 16 {
+                if across >= c.edge {
                     (base + step_px).min(max)
                 } else {
                     base
@@ -335,6 +369,7 @@ mod tests {
                                     start,
                                     mode,
                                     delta: (seed % 40) as usize,
+                                    edge: [16, 4, 8][(seed / 3 % 3) as usize],
                                     seed,
                                 });
                             }
@@ -345,7 +380,8 @@ mod tests {
         }
     }
 
-    /// Runs that break a SIMD precondition still match scalar (they take the scalar path).
+    /// Runs that break a SIMD precondition still match scalar (they take the scalar path, or
+    /// the gather path when only the `filter_v` one fails).
     #[test]
     fn unsupported_runs_fall_back() {
         let mut px: Vec<u16> = (0..64 * 8).map(|i| (i * 7 % 256) as u16).collect();
@@ -378,6 +414,28 @@ mod tests {
                 step: 1,
                 along: 64,
                 n: 8,
+                plane: 0,
+                bd: 8,
+                lims: [10, 40, 1],
+                filter_size: 16,
+            },
+            // Vertical, lanes closer than the 16-sample rows of `filter_v` (gathered instead).
+            Edge {
+                pos: 8,
+                step: 1,
+                along: 14,
+                n: 8,
+                plane: 0,
+                bd: 8,
+                lims: [10, 40, 1],
+                filter_size: 16,
+            },
+            // Vertical, `q0` 7 samples from the start: room for the taps, not for the rows.
+            Edge {
+                pos: 7,
+                step: 1,
+                along: 64,
+                n: 7,
                 plane: 0,
                 bd: 8,
                 lims: [10, 40, 1],

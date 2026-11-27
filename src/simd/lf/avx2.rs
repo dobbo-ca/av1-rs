@@ -1,8 +1,9 @@
 //! AVX2 loop filter kernel: 16 samples along the edge per vector, one 16-bit lane each.
-//! The AVX-512 tier uses it too for runs of 16 or fewer samples (longer runs: `avx512.rs`).
+//! The AVX-512 tier uses it too for every vertical edge (`filter_v`) and for horizontal runs
+//! of 16 or fewer samples (longer runs: `avx512.rs`).
 
 use super::{Edge, ROWS};
-use crate::simd::x86::{load256_u16, store256_u16};
+use crate::simd::x86::{load128_u16, load256_u16, store128_u16, store256_u16};
 use std::arch::x86_64::*;
 
 #[inline]
@@ -53,6 +54,134 @@ pub(super) fn filter(s: &mut [[u16; 16]; ROWS], e: &Edge) {
     for t in 0..ROWS {
         r[t] = load256_u16(&s[t]);
     }
+    if let Some(o) = kernel(r, e) {
+        for t in 0..ROWS {
+            store256_u16(&mut s[t], o[t]);
+        }
+    }
+}
+
+/// `lf::sample_filter` on every sample of the vertical edge `e` (`step` 1) with `m` taps, 16
+/// at a time. Each lane's samples across the edge are one row in memory: 8 (`m <= 4`) or 16
+/// samples around its `q0` are loaded whole and transposed into the kernel rows, and back, as
+/// dav1d's `lpf_v_sb` assembly does (dav1d, BSD-2-Clause). The samples of a row that the
+/// filter does not change are stored back unchanged. `super::rows_fit` checked that the rows
+/// are disjoint and inside `px`.
+#[target_feature(enable = "avx2")]
+pub(super) fn filter_v(px: &mut [u16], e: &Edge, m: usize) {
+    let zero = _mm256_setzero_si256();
+    let mut k0 = 0;
+    while k0 < e.n {
+        let cnt = (e.n - k0).min(16);
+        let q0 = e.pos + k0 * e.along;
+        let mut r = [zero; ROWS];
+        if m <= 4 {
+            // Columns -4..4 from `q0` are rows 3..11.
+            let first = q0 - 4;
+            r[3..11].copy_from_slice(&load_cols(px, first, e.along, cnt));
+            if let Some(o) = kernel(r, e) {
+                let mut c = [zero; 8];
+                c.copy_from_slice(&o[3..11]);
+                store_cols(px, first, e.along, cnt, c);
+            }
+        } else {
+            // Columns -8..8: column j is row j + 7; columns -8 and 7 are not filtered.
+            let first = q0 - 8;
+            let mut lo = load_cols(px, first, e.along, cnt);
+            let mut hi = load_cols(px, first + 8, e.along, cnt);
+            r[..7].copy_from_slice(&lo[1..]);
+            r[7..].copy_from_slice(&hi[..7]);
+            if let Some(o) = kernel(r, e) {
+                lo[1..].copy_from_slice(&o[..7]);
+                hi[..7].copy_from_slice(&o[7..]);
+                store_cols(px, first, e.along, cnt, lo);
+                store_cols(px, first + 8, e.along, cnt, hi);
+            }
+        }
+        k0 += 16;
+    }
+}
+
+/// Transposes the 8x8 block of 16-bit samples in the low 128-bit half of `a`, and the one in
+/// the high half: sample `j` of row `i` becomes sample `i` of row `j`, in each half.
+#[inline]
+#[target_feature(enable = "avx2")]
+fn transpose8(a: [__m256i; 8]) -> [__m256i; 8] {
+    let t0 = _mm256_unpacklo_epi16(a[0], a[1]);
+    let t1 = _mm256_unpackhi_epi16(a[0], a[1]);
+    let t2 = _mm256_unpacklo_epi16(a[2], a[3]);
+    let t3 = _mm256_unpackhi_epi16(a[2], a[3]);
+    let t4 = _mm256_unpacklo_epi16(a[4], a[5]);
+    let t5 = _mm256_unpackhi_epi16(a[4], a[5]);
+    let t6 = _mm256_unpacklo_epi16(a[6], a[7]);
+    let t7 = _mm256_unpackhi_epi16(a[6], a[7]);
+    let u0 = _mm256_unpacklo_epi32(t0, t2);
+    let u1 = _mm256_unpackhi_epi32(t0, t2);
+    let u2 = _mm256_unpacklo_epi32(t1, t3);
+    let u3 = _mm256_unpackhi_epi32(t1, t3);
+    let u4 = _mm256_unpacklo_epi32(t4, t6);
+    let u5 = _mm256_unpackhi_epi32(t4, t6);
+    let u6 = _mm256_unpacklo_epi32(t5, t7);
+    let u7 = _mm256_unpackhi_epi32(t5, t7);
+    [
+        _mm256_unpacklo_epi64(u0, u4),
+        _mm256_unpackhi_epi64(u0, u4),
+        _mm256_unpacklo_epi64(u1, u5),
+        _mm256_unpackhi_epi64(u1, u5),
+        _mm256_unpacklo_epi64(u2, u6),
+        _mm256_unpackhi_epi64(u2, u6),
+        _mm256_unpacklo_epi64(u3, u7),
+        _mm256_unpackhi_epi64(u3, u7),
+    ]
+}
+
+/// The 8 columns from `px[first + l * along]` of the first `cnt` of 16 lanes: lane `l` of
+/// column `j` is `px[first + l * along + j]`, zero for the lanes from `cnt` on.
+#[inline]
+#[target_feature(enable = "avx2")]
+fn load_cols(px: &[u16], first: usize, along: usize, cnt: usize) -> [__m256i; 8] {
+    let mut h = [_mm_setzero_si128(); 16];
+    for l in 0..cnt.min(16) {
+        if let Some(s) = px
+            .get(first + l * along..)
+            .and_then(|s| s.first_chunk::<8>())
+        {
+            h[l] = load128_u16(s);
+        }
+    }
+    // Lane l in the low half of row l, lane l + 8 in the high half.
+    let mut a = [_mm256_setzero_si256(); 8];
+    for l in 0..8 {
+        a[l] = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(h[l]), h[l + 8]);
+    }
+    transpose8(a)
+}
+
+/// Stores the columns `c` of the first `cnt` lanes back where `load_cols` read them.
+#[inline]
+#[target_feature(enable = "avx2")]
+fn store_cols(px: &mut [u16], first: usize, along: usize, cnt: usize, c: [__m256i; 8]) {
+    let a = transpose8(c);
+    for l in 0..cnt.min(16) {
+        let v = if l < 8 {
+            _mm256_castsi256_si128(a[l])
+        } else {
+            _mm256_extracti128_si256::<1>(a[l - 8])
+        };
+        if let Some(d) = px
+            .get_mut(first + l * along..)
+            .and_then(|s| s.first_chunk_mut::<8>())
+        {
+            store128_u16(d, v);
+        }
+    }
+}
+
+/// `lf::sample_filter` on the 16 lanes of the rows `r`, or `None` when no lane passes the
+/// filter mask (the rows are then unchanged).
+#[inline]
+#[target_feature(enable = "avx2")]
+fn kernel(r: [__m256i; ROWS], e: &Edge) -> Option<[__m256i; ROWS]> {
     let sh = e.bd - 8;
     let [limit, blimit, thresh] = e.lims;
     let limit = _mm256_set1_epi16((limit << sh) as i16);
@@ -89,7 +218,7 @@ pub(super) fn filter(s: &mut [[u16; 16]; ROWS], e: &Edge) {
     }
     let mask = _mm256_andnot_si256(bad, _mm256_set1_epi16(-1));
     if _mm256_movemask_epi8(mask) == 0 {
-        return;
+        return None;
     }
     let mut flat = _mm256_setzero_si256();
     if e.filter_size >= 8 {
@@ -148,7 +277,5 @@ pub(super) fn filter(s: &mut [[u16; 16]; ROWS], e: &Edge) {
     if e.filter_size >= 16 {
         wide(&r, &mut o, 6, 1, 4, flat2);
     }
-    for t in 0..ROWS {
-        store256_u16(&mut s[t], o[t]);
-    }
+    Some(o)
 }
