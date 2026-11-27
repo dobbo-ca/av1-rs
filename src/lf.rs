@@ -645,6 +645,85 @@ pub(crate) fn sample_filter(
     }
 }
 
+/// Lays out the mode info and `loopfilter_tx_sizes` of `fs` as the decoder lays them out (the
+/// invariant of the module doc), drawing from `next` (a value in 0..n): one random block size
+/// up to 64x64 per 64x64 region tiling it, with random skip, reference, segment and (with
+/// `delta_lf_present`, else 0 as in the decoder) `DeltaLF`s per block, and in each block one
+/// random transform size per plane that fits (up to 32x32 for chroma, as `get_tx_size`),
+/// tiling the block's part of the plane (for chroma at least one 4x4 chroma unit, as for the
+/// chroma of 4xN blocks).
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn random_blocks(
+    fs: &mut FrameState,
+    delta_lf_present: bool,
+    next: &mut impl FnMut(u64) -> u64,
+) {
+    use crate::consts::{BLOCK_SIZES, TX_SIZES_ALL};
+    use crate::tile::fill_rows;
+    let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+    for r0 in (0..mi_rows).step_by(16) {
+        for c0 in (0..mi_cols).step_by(16) {
+            let b = loop {
+                let b = next(BLOCK_SIZES as u64) as usize;
+                if BLOCK_WIDTH[b] <= 64 && BLOCK_HEIGHT[b] <= 64 {
+                    break b;
+                }
+            };
+            let (bw, bh) = (BLOCK_WIDTH[b] / MI_SIZE, BLOCK_HEIGHT[b] / MI_SIZE);
+            let (r1, c1) = ((r0 + 16).min(mi_rows), (c0 + 16).min(mi_cols));
+            for r in (r0..r1).step_by(bh) {
+                for c in (c0..c1).step_by(bw) {
+                    let (rows, cols) = (bh.min(mi_rows - r), bw.min(mi_cols - c));
+                    let delta = if delta_lf_present {
+                        [0i8; 4].map(|_| next(33) as i8 - 16)
+                    } else {
+                        [0; 4]
+                    };
+                    fill_rows(&mut fs.mi_sizes, mi_cols, r, c, rows, cols, b as u8);
+                    fill_rows(&mut fs.skips, mi_cols, r, c, rows, cols, next(2) == 1);
+                    let ref0 = next(3) as i8 - 1;
+                    fill_rows(&mut fs.ref_frames0, mi_cols, r, c, rows, cols, ref0);
+                    let seg = next(MAX_SEGMENTS as u64) as u8;
+                    fill_rows(&mut fs.segment_ids, mi_cols, r, c, rows, cols, seg);
+                    fill_rows(&mut fs.delta_lfs, mi_cols, r, c, rows, cols, delta);
+                }
+            }
+            for plane in 0..fs.num_planes {
+                let (px, py, cap) = if plane == 0 {
+                    (0, 0, 16)
+                } else {
+                    (fs.subsampling_x, fs.subsampling_y, 8)
+                };
+                // The block's part of the plane, in luma and in plane mode info units.
+                let (uw, uh) = (bw.max(1 << px), bh.max(1 << py));
+                let (pw, ph) = (uw >> px, uh >> py);
+                for r in (r0..r1).step_by(uh) {
+                    for c in (c0..c1).step_by(uw) {
+                        let t = loop {
+                            let t = next(TX_SIZES_ALL as u64) as usize;
+                            let (tw, th) = (TX_WIDTH[t] / MI_SIZE, TX_HEIGHT[t] / MI_SIZE);
+                            if tw <= pw.min(cap) && th <= ph.min(cap) {
+                                break t;
+                            }
+                        };
+                        let (tw, th) = (TX_WIDTH[t] / MI_SIZE, TX_HEIGHT[t] / MI_SIZE);
+                        for y in (0..ph).step_by(th) {
+                            for x in (0..pw).step_by(tw) {
+                                // Clipped to the grid as `transform_block` clips it.
+                                let (pr, pc) = ((r >> py) + y, (c >> px) + x);
+                                let rows = th.min(mi_rows.saturating_sub(pr));
+                                let cols = tw.min(mi_cols.saturating_sub(pc));
+                                let txs = &mut fs.loopfilter_tx_sizes[plane];
+                                fill_rows(txs, mi_cols, pr, pc, rows, cols, t as u8);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -864,18 +943,13 @@ pub(crate) mod tests {
         }
     }
 
-    /// A 196x132 frame with subsampling `(sx, sy)` and random loop filter parameters, whose
-    /// blocks and transform blocks are laid out as the decoder lays them out (the invariant of
-    /// the module doc): one random block size per 64x64 region tiling it, and in each block one
-    /// random transform size per plane that fits, tiling the block's part of the plane (for
-    /// chroma at least one 4x4 chroma unit, as for the chroma of 4xN blocks). The samples are
-    /// near flat 8x8 cells, so that most edges filter.
+    /// A 196x132 frame with subsampling `(sx, sy)`, random loop filter parameters and the
+    /// blocks of [`random_blocks`]. The samples are near flat 8x8 cells, so that most edges
+    /// filter.
     fn random_layout(
         next: &mut impl FnMut(u64) -> u64,
         (sx, sy): (u8, u8),
     ) -> (FrameState, FrameHeader) {
-        use crate::consts::{BLOCK_SIZES, TX_SIZES_ALL};
-        use crate::tile::fill_rows;
         let mut seq =
             SequenceHeader::parse(&crate::seq::tests::still_sequence_header(), 0).unwrap();
         (seq.subsampling_x, seq.subsampling_y) = (sx, sy);
@@ -906,68 +980,7 @@ pub(crate) mod tests {
         let ledger = Arc::new(Ledger::default());
         ledger.reset(16 << 20, 0).unwrap();
         let mut fs = FrameState::new(&fh, &seq, &ledger).unwrap();
-        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
-        for r0 in (0..mi_rows).step_by(16) {
-            for c0 in (0..mi_cols).step_by(16) {
-                let b = loop {
-                    let b = next(BLOCK_SIZES as u64) as usize;
-                    if BLOCK_WIDTH[b] <= 64 && BLOCK_HEIGHT[b] <= 64 {
-                        break b;
-                    }
-                };
-                let (bw, bh) = (BLOCK_WIDTH[b] / MI_SIZE, BLOCK_HEIGHT[b] / MI_SIZE);
-                let (r1, c1) = ((r0 + 16).min(mi_rows), (c0 + 16).min(mi_cols));
-                for r in (r0..r1).step_by(bh) {
-                    for c in (c0..c1).step_by(bw) {
-                        let (rows, cols) = (bh.min(mi_rows - r), bw.min(mi_cols - c));
-                        // Without loop filter deltas every DeltaLF is 0, as in the decoder.
-                        let delta = if fh.delta_lf_present {
-                            [0i8; 4].map(|_| next(33) as i8 - 16)
-                        } else {
-                            [0; 4]
-                        };
-                        fill_rows(&mut fs.mi_sizes, mi_cols, r, c, rows, cols, b as u8);
-                        fill_rows(&mut fs.skips, mi_cols, r, c, rows, cols, next(2) == 1);
-                        let ref0 = next(3) as i8 - 1;
-                        fill_rows(&mut fs.ref_frames0, mi_cols, r, c, rows, cols, ref0);
-                        let seg = next(MAX_SEGMENTS as u64) as u8;
-                        fill_rows(&mut fs.segment_ids, mi_cols, r, c, rows, cols, seg);
-                        fill_rows(&mut fs.delta_lfs, mi_cols, r, c, rows, cols, delta);
-                    }
-                }
-                for plane in 0..3 {
-                    let (px, py) = if plane == 0 {
-                        (0, 0)
-                    } else {
-                        (usize::from(sx), usize::from(sy))
-                    };
-                    // The block's part of the plane, in luma and in plane mode info units.
-                    let (uw, uh) = (bw.max(1 << px), bh.max(1 << py));
-                    let (pw, ph) = (uw >> px, uh >> py);
-                    for r in (r0..r1).step_by(uh) {
-                        for c in (c0..c1).step_by(uw) {
-                            let t = loop {
-                                let t = next(TX_SIZES_ALL as u64) as usize;
-                                if TX_WIDTH[t] / MI_SIZE <= pw && TX_HEIGHT[t] / MI_SIZE <= ph {
-                                    break t;
-                                }
-                            };
-                            let (tw, th) = (TX_WIDTH[t] / MI_SIZE, TX_HEIGHT[t] / MI_SIZE);
-                            for y in (0..ph).step_by(th) {
-                                for x in (0..pw).step_by(tw) {
-                                    // Clipped to the grid as `transform_block` clips it.
-                                    let (pr, pc) = ((r >> py) + y, (c >> px) + x);
-                                    let rows = th.min(mi_rows.saturating_sub(pr));
-                                    let cols = tw.min(mi_cols.saturating_sub(pc));
-                                    let txs = &mut fs.loopfilter_tx_sizes[plane];
-                                    fill_rows(txs, mi_cols, pr, pc, rows, cols, t as u8);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        random_blocks(&mut fs, fh.delta_lf_present, &mut *next);
         for p in fs.curr_frame.iter_mut() {
             let mut levels = vec![0u16; p.stride.div_ceil(8)];
             for (y, row) in p.px.chunks_mut(p.stride).enumerate() {
