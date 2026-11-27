@@ -23,7 +23,7 @@ use crate::consts::*;
 use crate::error::Error;
 use crate::predict::{IntraEdges, IntraParams, predict_cfl, predict_intra, predict_palette};
 use crate::quant::{ac_q, dc_q};
-use crate::recon::{ReconParams, reconstruct_region};
+use crate::recon::{Dequant, ReconParams, transform_dq};
 use crate::scan::get_scan;
 use crate::symbol::SymbolDecoder;
 use crate::tables::{
@@ -32,6 +32,7 @@ use crate::tables::{
     TX_HEIGHT_LOG2, TX_SIZE_SQR, TX_SIZE_SQR_UP, TX_WIDTH, TX_WIDTH_LOG2,
 };
 use crate::tile::{TileDecoder, fill_cols, fill_rows};
+use crate::transform::{DQ_LEN, DQ_STRIDE};
 
 /// `Tx_Type_In_Set_Intra` (spec 5.11.40).
 const TX_TYPE_IN_SET_INTRA: [[u8; TX_TYPES]; TX_SET_TYPES_INTRA] = [
@@ -830,10 +831,10 @@ impl TileDecoder<'_> {
         Ok(())
     }
 
-    /// The call of the reconstruction process (spec 7.12.3) with `get_dc_quant( plane )` and
-    /// `get_ac_quant( plane )` (spec 7.12.2), on `self.quant` whose nonzero entries lie in the
-    /// coded `region` (rows, columns) that `coeffs` returned. `self.quant` is all zero again
-    /// afterwards, as `coeffs` expects for the next transform block.
+    /// The inverse transform and sample update of the reconstruction process (spec 7.12.3) on
+    /// the `Dequant` values that `coeffs` wrote into `self.itx` for the coded `region` (rows,
+    /// columns) it returned. That region of `self.itx` is all zero again afterwards, as
+    /// `coeffs` expects for the next transform block.
     fn reconstruct_block(
         &mut self,
         plane: usize,
@@ -843,6 +844,23 @@ impl TileDecoder<'_> {
         plane_tx_type: usize,
         region: (usize, usize),
     ) {
+        let p = self.recon_params(plane, tx_sz, plane_tx_type);
+        let fp = &mut self.fs.curr_frame[plane];
+        transform_dq(
+            &mut fp.px,
+            fp.stride,
+            start_x,
+            start_y,
+            &p,
+            region,
+            &mut self.itx,
+            crate::simd::best(),
+        );
+    }
+
+    /// The [`ReconParams`] of a transform block: `get_dc_quant( plane )` and
+    /// `get_ac_quant( plane )` (spec 7.12.2) and the quantizer matrix level.
+    fn recon_params(&self, plane: usize, tx_sz: usize, plane_tx_type: usize) -> ReconParams {
         let fh = self.fh;
         let bit_depth = u32::from(self.seq.bit_depth);
         let qindex = fh.get_qindex(false, self.segment_id, self.current_q_index);
@@ -856,7 +874,7 @@ impl TileDecoder<'_> {
         } else {
             QM_LEVEL_FLAT
         };
-        let p = ReconParams {
+        ReconParams {
             tx_sz,
             tx_type: plane_tx_type,
             plane,
@@ -865,22 +883,6 @@ impl TileDecoder<'_> {
             qm_level,
             lossless: self.lossless,
             bit_depth,
-        };
-        let fp = &mut self.fs.curr_frame[plane];
-        reconstruct_region(
-            &mut fp.px,
-            fp.stride,
-            start_x,
-            start_y,
-            &p,
-            &self.quant[..],
-            region,
-            &mut self.itx,
-            crate::simd::best(),
-        );
-        let tw = 1 << TX_WIDTH_LOG2[ADJUSTED_TX_SIZE[tx_sz]];
-        for row in self.quant.chunks_exact_mut(tw).take(region.0) {
-            row[..region.1].fill(0);
         }
     }
 
@@ -1139,14 +1141,16 @@ impl TileDecoder<'_> {
         )
     }
 
-    /// Spec 5.11.39 `coeffs( plane, startX, startY, txSz )`: fills `self.quant` (the spec's
-    /// `Quant[ ]`) and the above / left level and dc contexts. Returns `eob`, `PlaneTxType` and
-    /// the coded region of `Quant[ ]` (rows, columns; see `recon::reconstruct_region`).
+    /// Spec 5.11.39 `coeffs( plane, startX, startY, txSz )`: writes `Dequant` (spec 7.12.3) of
+    /// each nonzero coefficient of the spec's `Quant[ ]` into `self.itx` and fills the above /
+    /// left level and dc contexts. Returns `eob`, `PlaneTxType` and the coded region of
+    /// `Quant[ ]` (rows, columns; see `recon::reconstruct_region`).
     ///
-    /// `self.quant` and `self.levels` are all zero on entry (they start zeroed and only ever
-    /// hold one transform block): the levels are cleared here as the sign loop reads them, and
-    /// `Quant[ ]` by `reconstruct_block` (it is only read by the reconstruction of a block with
-    /// eob > 0), so no block clears the whole arrays.
+    /// `self.quant` (the levels and the list of nonzero positions here), `self.levels` and the
+    /// `Dequant` values of `self.itx` are all zero on entry (they start zeroed and only ever
+    /// hold one transform block): the levels and `self.quant` are cleared here as the sign loop
+    /// reads them, and the `Dequant` region by `reconstruct_block` (called for every block
+    /// with eob > 0), so no block clears the whole arrays.
     ///
     /// # Errors
     /// `Invalid` when `golomb_length_bit` is 0 at `length` 20 (spec 6.10.35 conformance).
@@ -1252,8 +1256,10 @@ impl TileDecoder<'_> {
 
             // Reads no symbol, so it can run before the loop that needs it.
             let dc_ctx = self.dc_sign_ctx(plane, x4, y4, w4, h4);
+            let dequant = Dequant::new(&self.recon_params(plane, tx_sz, plane_tx_type));
             let levels = &mut self.levels[..];
             let quant = &mut self.quant[..];
+            let dq = &mut self.itx.dq;
             // The sign pass visits the nonzero positions in scan order (see `read_levels`).
             loop {
                 let packed = quant[pos];
@@ -1277,6 +1283,7 @@ impl TileDecoder<'_> {
                             // Back to all zero for the next tile decoder that reuses them.
                             levels.fill(0);
                             quant.fill(0);
+                            dq.fill(0);
                             return Err(Error::Invalid("golomb_length_bit"));
                         }
                     }
@@ -1292,11 +1299,18 @@ impl TileDecoder<'_> {
                 }
                 q &= 0xFFFFF;
                 cul_level += q as u32;
+                let col = pos - (row << lc.bwl);
                 if q != 0 {
                     rows = rows.max(row + 1);
-                    cols = cols.max(pos - (row << lc.bwl) + 1);
+                    cols = cols.max(col + 1);
                 }
-                quant[pos] = if sign { -q } else { q };
+                // Dequant[ row ][ col ] at once (spec 7.12.3), so only the nonzero coefficients
+                // are dequantized; row and col are below 32, so the mask changes nothing.
+                if let Some(d) = &dequant {
+                    dq[(col * DQ_STRIDE + row) & (DQ_LEN - 1)] =
+                        d.coef(if sign { -q } else { q }, pos);
+                }
+                quant[pos] = 0;
                 if next == 0 {
                     break;
                 }
