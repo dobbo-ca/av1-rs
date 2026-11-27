@@ -146,15 +146,28 @@ pub(crate) fn cdef_rows(
             if idx >= 8 {
                 continue;
             }
+            // A filter with both strengths 0 leaves every sample as it is (`sum` is 0, so the
+            // output is `x`, inside [min, max]), and `out` already holds `curr`: that work is
+            // skipped, as dav1d's `src/cdef_apply_tmpl.c` does (BSD-2-Clause, Copyright © 2018,
+            // VideoLAN and dav1d authors, Copyright © 2018, Two Orioles, LLC; see NOTICE). The
+            // direction only matters through a nonzero luma or chroma primary strength.
+            let (y_pri, y_sec) = (fh.cdef_y_pri_strength[idx], fh.cdef_y_sec_strength[idx]);
+            let (uv_pri, uv_sec) = (fh.cdef_uv_pri_strength[idx], fh.cdef_uv_sec_strength[idx]);
+            if (y_pri | y_sec | uv_pri | uv_sec) == 0 {
+                continue;
+            }
             let sk =
                 |rr: usize, cc: usize| fs.skips.get(rr * mi_cols + cc).copied().unwrap_or(true);
             if sk(r, c) && sk(r + 1, c) && sk(r, c + 1) && sk(r + 1, c + 1) {
                 continue;
             }
-            let (y_dir, var) =
-                simd::cdef::direction(best, &curr[0], r, c, u32::from(seq.bit_depth));
-            let mut pri_str = i32::from(fh.cdef_y_pri_strength[idx]) << coeff_shift;
-            let sec_str = i32::from(fh.cdef_y_sec_strength[idx]) << coeff_shift;
+            let (y_dir, var) = if (y_pri | uv_pri) != 0 {
+                simd::cdef::direction(best, &curr[0], r, c, u32::from(seq.bit_depth))
+            } else {
+                (0, 0)
+            };
+            let mut pri_str = i32::from(y_pri) << coeff_shift;
+            let sec_str = i32::from(y_sec) << coeff_shift;
             let dir = if pri_str == 0 { 0 } else { y_dir };
             let var_str = if (var >> 6) != 0 {
                 floor_log2((var >> 6) as u32).min(12) as i32
@@ -172,24 +185,26 @@ pub(crate) fn cdef_rows(
                 mi_cols,
                 coeff_shift,
             };
-            simd::cdef::filter(
-                best,
-                &ctx,
-                &curr[0],
-                &mut out[0],
-                0,
-                (sub_x, sub_y),
-                r,
-                c,
-                (pri_str, sec_str),
-                damping,
-                dir,
-            );
-            if num_planes == 1 {
+            if pri_str != 0 || sec_str != 0 {
+                simd::cdef::filter(
+                    best,
+                    &ctx,
+                    &curr[0],
+                    &mut out[0],
+                    0,
+                    (sub_x, sub_y),
+                    r,
+                    c,
+                    (pri_str, sec_str),
+                    damping,
+                    dir,
+                );
+            }
+            if num_planes == 1 || (uv_pri | uv_sec) == 0 {
                 continue;
             }
-            let pri_str = i32::from(fh.cdef_uv_pri_strength[idx]) << coeff_shift;
-            let sec_str = i32::from(fh.cdef_uv_sec_strength[idx]) << coeff_shift;
+            let pri_str = i32::from(uv_pri) << coeff_shift;
+            let sec_str = i32::from(uv_sec) << coeff_shift;
             let dir = if pri_str == 0 {
                 0
             } else {
@@ -476,6 +491,41 @@ mod tests {
                 dir,
             );
             assert!(dst.px.iter().all(|&v| v == 100));
+        }
+    }
+
+    #[test]
+    fn zero_strengths_are_identity() {
+        // `cdef_rows` skips a filter whose strengths are both 0, which is exact only if every
+        // tier leaves the samples as they are, whatever they hold.
+        let src = plane(16, 16, |y, x| {
+            (((y * 16 + x) as u32).wrapping_mul(2_654_435_761) >> 22) as u16
+        });
+        let ctx = FilterCtx {
+            mi_rows: 4,
+            mi_cols: 4,
+            coeff_shift: 2,
+        };
+        for s in simd::available() {
+            for (p, r, c, damping) in [(0, 0, 0, 8), (0, 2, 2, 8), (1, 0, 0, 7), (2, 2, 2, 7)] {
+                for dir in 0..8 {
+                    let mut dst = plane(16, 16, |y, x| src.px[y * 16 + x]);
+                    simd::cdef::filter(
+                        s,
+                        &ctx,
+                        &src,
+                        &mut View::of(&mut dst),
+                        p,
+                        (1, 1),
+                        r,
+                        c,
+                        (0, 0),
+                        damping,
+                        dir,
+                    );
+                    assert_eq!(dst.px, src.px, "{s:?} plane {p} dir {dir}");
+                }
+            }
         }
     }
 }
