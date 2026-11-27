@@ -1,5 +1,5 @@
 //! Heap use of a decode with buffer reuse, measured by a counting global allocator: with
-//! `max_threads = 1`, a second temporal unit of the same shape allocates nothing once the frames
+//! `max_threads = 1`, a second temporal unit of the same shape (one tile) allocates nothing once the frames
 //! of the first were handed back with `Decoder::recycle`, and no decode holds more heap than
 //! `max_alloc` plus the few fixed-size buffers that are not charged.
 

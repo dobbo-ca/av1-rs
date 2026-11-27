@@ -118,7 +118,9 @@ With `max_threads = 1`, a `decode_temporal_unit` of the same shape as the previo
 heap allocation once the previous unit's frames were recycled (`tests/alloc.rs` counts them
 with a global allocator and checks the heap peak against `max_alloc`). What still allocates:
 the first frames, a change of shape (the frame state is rebuilt, the pool fills with the new
-sizes), metadata OBUs, film grain (its list of output bands, one per frame), the layer
+sizes), a frame of several tiles without intra block copy (its whole-frame tile decoder
+buffers are dropped after the frame at every thread count, so that what stays booked does not
+depend on `max_threads`, and are made again for the next frame), metadata OBUs, film grain (its list of output bands, one per frame), the layer
 selection of a layered stream, probe mode, and threads: a call with more than one thread spawns
 the frame's team (the worker stacks, the scheduler's result slots), builds one tile-sized state
 per tile of a multi-tile frame (its planes come from the pool, its arrays and tile buffers are

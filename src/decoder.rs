@@ -758,7 +758,8 @@ impl Decoder {
     /// lists and the `Vec` itself. The next frames this decoder outputs are built in them, so with
     /// the frame buffers the decoder keeps from one frame to the next (`docs/limits.md`), a
     /// [`Decoder::decode_temporal_unit`] of the same shape as the previous one, with
-    /// `Limits::max_threads` 1, allocates nothing once its frames were recycled.
+    /// `Limits::max_threads` 1, allocates nothing once its frames were recycled, for single-tile
+    /// frames (a frame of several tiles makes its tile decoder buffers again, docs/limits.md).
     ///
     /// The buffers count against `Limits::max_alloc` while the decoder keeps them; a buffer that
     /// does not fit is dropped, and kept buffers are dropped when a later allocation needs their
@@ -1401,8 +1402,6 @@ fn decode_job(
     )
 }
 
-/// The threads of a frame decode: `max_threads` (0 counts as 1), but no more than its largest
-/// stage has items (the tiles, or the 64-row bands of all planes).
 /// True when a threaded decode runs the tiles of the frame on the team, each into a tile-sized
 /// state freed after it is merged: several tiles and no intra block copy. Such a frame keeps no
 /// whole-frame tile scratch (`FrameState::tile_scratch`) after it at any thread count, so what
@@ -1413,6 +1412,8 @@ fn splits(h: &FrameHeader, tiles: &[TileRange]) -> bool {
     !h.allow_intrabc && tiles.len() > 1
 }
 
+/// The threads of a frame decode: `max_threads` (0 counts as 1), but no more than its largest
+/// stage has items (the tiles, or the 64-row bands of all planes).
 fn team_size(max_threads: usize, fs: &FrameState, tiles: usize) -> usize {
     let bands = fs.mi_rows.div_ceil(16) * fs.num_planes;
     max_threads.max(1).min(tiles.max(bands))

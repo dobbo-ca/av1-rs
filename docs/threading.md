@@ -218,7 +218,8 @@ the peak argument above is unchanged. What a call with more than one thread allo
 and its result slots, the wrapup's shared buffer lists, the private band of every wrapup item, and
 per tile the mode-info arrays and tile decoder buffers of its tile-sized state (the bands' sample
 buffers and the tile states' planes come from the pool when it holds one of the size). So only a
-`max_threads = 1` call of the same shape as the previous one allocates nothing (`tests/alloc.rs`).
+`max_threads = 1` call of single-tile frames of the same shape as the previous one allocates
+nothing (`tests/alloc.rs`; docs/limits.md lists what still allocates).
 
 ## Tried and not kept: a rayon pool (2026-11-25)
 
