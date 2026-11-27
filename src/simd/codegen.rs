@@ -6,9 +6,18 @@
 //! The baseline build is the oracle and runs on the scalar tier (`AV1_SIMD=scalar`), on CPUs
 //! without the AVX2 tier and on other targets.
 
-use super::{Simd, Tier};
+use super::Simd;
+#[cfg(target_arch = "x86_64")]
+use super::Tier;
 use crate::error::Error;
 use crate::tile::TileDecoder;
+
+/// True when `simd` is a tier whose detection includes every feature of `v3` (AVX-512
+/// implies AVX2).
+#[cfg(target_arch = "x86_64")]
+fn is_v3(simd: Simd) -> bool {
+    matches!(simd.tier(), Tier::Avx2 | Tier::Avx512)
+}
 
 /// `TileDecoder::coeffs` in the build of tier `simd`.
 #[inline]
@@ -21,29 +30,30 @@ pub(crate) fn coeffs(
     start_y: usize,
     tx_sz: usize,
 ) -> Result<(usize, usize, (usize, usize)), Error> {
-    match simd.tier() {
-        #[cfg(target_arch = "x86_64")]
-        Tier::Avx2 | Tier::Avx512 => {
-            // SAFETY: `simd` is the proof (simd::available / simd::best) that the CPU has this
-            // tier, whose detection includes every feature of `v3`; AVX-512 implies AVX2.
-            unsafe { v3::coeffs(td, plane, start_x, start_y, tx_sz) }
-        }
-        _ => td.coeffs_body(plane, start_x, start_y, tx_sz),
+    #[cfg(target_arch = "x86_64")]
+    if is_v3(simd) {
+        // SAFETY: `simd` is the proof (simd::available / simd::best) that the CPU has this
+        // tier, and `is_v3` holds only for tiers whose detection includes every feature of
+        // `v3::coeffs`.
+        return unsafe { v3::coeffs(td, plane, start_x, start_y, tx_sz) };
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = simd;
+    td.coeffs_body(plane, start_x, start_y, tx_sz)
 }
 
 /// `TileDecoder::intra_frame_mode_info` in the build of tier `simd`.
 #[inline]
 #[allow(unsafe_code)]
 pub(crate) fn intra_frame_mode_info(simd: Simd, td: &mut TileDecoder<'_>) -> Result<(), Error> {
-    match simd.tier() {
-        #[cfg(target_arch = "x86_64")]
-        Tier::Avx2 | Tier::Avx512 => {
-            // SAFETY: as in `coeffs`.
-            unsafe { v3::intra_frame_mode_info(td) }
-        }
-        _ => td.intra_frame_mode_info_body(),
+    #[cfg(target_arch = "x86_64")]
+    if is_v3(simd) {
+        // SAFETY: as in `coeffs`.
+        return unsafe { v3::intra_frame_mode_info(td) };
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = simd;
+    td.intra_frame_mode_info_body()
 }
 
 #[cfg(target_arch = "x86_64")]
