@@ -168,7 +168,9 @@ latest run on `main` is the record; the speed PRs copy theirs into the PR descri
 and frame pointers under `perf record` (in a `--privileged` container, because a BuildKit RUN
 cannot open perf events), or under callgrind when perf cannot record. The job summary lists the
 self time by source file per class; the artifact has the per-symbol and per-line reports. Never
-profile on a workstation: CI only.
+profile on a workstation: CI only. dav1d (bookworm's build, its asm on, symbols from
+`libdav1d6-dbgsym`) is profiled on the same frames with one thread: the "dav1d, all" list in the
+summary and `all.dav1d.symbol.txt`.
 
 The job summary starts with the runner's CPU model and AVX-512 subsets. With `simd=avx512`
 the job stops before the image build on a runner without AVX-512; dispatch it again.
