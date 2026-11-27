@@ -184,7 +184,12 @@ RUN --mount=type=cache,id=av1-rs-target-bench,sharing=locked,target=/src/target 
          RUSTFLAGS="-C target-cpu=x86-64-v4" \
          CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_PANIC=abort \
          cargo build --locked --release --example oracle --target-dir target/v4 \
-         && cp target/v4/release/examples/oracle /usr/local/bin/av1-oracle-v4; fi
+         && cp target/v4/release/examples/oracle /usr/local/bin/av1-oracle-v4; fi \
+    && if [ -f ab-base/Cargo.toml ]; then \
+         find ab-base/src ab-base/examples -name '*.rs' -exec touch {} + \
+         && cargo build --locked --release --example oracle --manifest-path ab-base/Cargo.toml --target-dir target/ab-base \
+         && cp target/ab-base/release/examples/oracle /usr/local/bin/av1-oracle-base \
+         && cat ab-base/REV > /ab-base.rev; fi
 
 # Benchmark: dav1d, aomdec and av1-rs on the bench classes, in one container, so the ratio
 # compares the same machine. Information only (no speed bar). BENCH_RUN changes per run, so a
