@@ -2054,8 +2054,9 @@ const STILL_SEQUENCE_HEADER: [u8; 6] = [0x19, 0x1d, 0x8f, 0xcf, 0xb6, 0x01];
 /// format (4:2:0, 4:2:2, 4:4:4, mono), `data[ 1 ]` the bit depth (8, 10, 12), `data[ 2 ]`
 /// superres off or on; a hash of all of `data` seeds the rest: the size (up to 200x200), loop
 /// filter, CDEF and loop restoration parameters, the mode info and the `CurrFrame` samples
-/// (8x8 blocks of a level plus noise, so the filters have edges to work on). The mode info is
-/// random, not the result of a decode: the wrapup must not rely on it being consistent.
+/// (8x8 blocks of a level plus noise, so the filters have edges to work on). The mode info and
+/// transform sizes are random but laid out as a decode lays them out, as the loop filter
+/// relies on ([`crate::lf::random_blocks`]); the CDEF indices are random at every position.
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn wrapup_frame(
     data: &[u8],
@@ -2110,6 +2111,7 @@ pub(crate) fn wrapup_frame(
         mi_rows: 2 * ((height + 7) >> 3),
         loop_filter_sharpness: next(8) as u8,
         loop_filter_delta_enabled: next(2) == 1,
+        delta_lf_present: next(2) == 1,
         delta_lf_multi: next(2) == 1,
         cdef_damping: 3 + next(4) as u8,
         cdef_bits: 3,
@@ -2146,16 +2148,9 @@ pub(crate) fn wrapup_frame(
         Ok(fs) => fs,
         Err(e) => return (Err(e), ledger),
     };
+    crate::lf::random_blocks(&mut fs, h.delta_lf_present, &mut next);
     for i in 0..fs.mi_rows * fs.mi_cols {
-        fs.mi_sizes[i] = next(BLOCK_SIZES as u64) as u8;
-        fs.skips[i] = next(2) == 1;
         fs.cdef_idx[i] = next(9) as i8 - 1;
-        for d in fs.delta_lfs[i].iter_mut() {
-            *d = next(33) as i8 - 16;
-        }
-        for plane in 0..fs.num_planes {
-            fs.loopfilter_tx_sizes[plane][i] = next(TX_SIZES_ALL as u64) as u8;
-        }
     }
     for plane in 0..3 {
         for u in 0..fs.lr_type[plane].len() {
@@ -2588,6 +2583,20 @@ mod tests {
                 assert_eq!(p.px, q.px);
             }
         }
+    }
+
+    /// Decoded tiles keep the invariant that the loop filter's segment walk rests on (the
+    /// `lf` module doc): every transform block is whole, with the mode info of one block.
+    #[test]
+    fn decoded_transform_blocks_are_whole() {
+        let mut decoded = 0;
+        for seed in 1..=6 {
+            if let (Ok(fs), _) = run_tiles(seed, 1, 64 << 20) {
+                crate::lf::tests::assert_transform_blocks_whole(&fs);
+                decoded += 1;
+            }
+        }
+        assert!(decoded > 0);
     }
 
     #[test]
