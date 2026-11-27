@@ -404,6 +404,28 @@ fn pack_level(level: usize) -> u8 {
     (level | (level.min(3) << 6)) as u8
 }
 
+/// The brs of a level above NUM_BASE_LEVELS at (`row`, `col`), from the neighbour sum `s3`.
+#[inline(always)]
+fn read_br<const CLASS: usize>(
+    sd: &mut SymbolDecoder<'_>,
+    lc: &LevelCtx,
+    br_cdfs: &mut [[u16; 5]; 21],
+    s3: usize,
+    row: usize,
+    col: usize,
+    mut level: usize,
+) -> usize {
+    let br_cdf = &mut br_cdfs[lc.br_ctx::<CLASS>(s3, row, col)];
+    for _ in 0..COEFF_BASE_RANGE / (BR_CDF_SIZE - 1) {
+        let coeff_br = sd.read_cdf(br_cdf);
+        level += coeff_br;
+        if coeff_br < BR_CDF_SIZE - 1 {
+            break;
+        }
+    }
+    level
+}
+
 /// Reads the `coeff_base_eob`, `coeff_base` and `coeff_br` levels of the scan positions
 /// `scan` (`eob` of them) from the last to the first, as the first loop of spec 5.11.39 does,
 /// for the transform class `CLASS`. Stores each level in `levels` (padded) and, for each
@@ -414,7 +436,7 @@ fn pack_level(level: usize) -> u8 {
 /// The eob position is always nonzero, so the list is never empty.
 #[inline(always)]
 fn read_levels<const CLASS: usize>(
-    sd: &mut SymbolDecoder<'_>,
+    dec: &mut SymbolDecoder<'_>,
     lc: &LevelCtx,
     scan: &[u16],
     eob_cdf: &mut [u16; 4],
@@ -423,18 +445,10 @@ fn read_levels<const CLASS: usize>(
     levels: &mut [u8],
     quant: &mut [i32],
 ) -> usize {
-    // The brs of a level above NUM_BASE_LEVELS, from the neighbour sum `s3`.
-    let mut read_br = |sd: &mut SymbolDecoder<'_>, s3, row, col, mut level: usize| {
-        let br_cdf = &mut br_cdfs[lc.br_ctx::<CLASS>(s3, row, col)];
-        for _ in 0..COEFF_BASE_RANGE / (BR_CDF_SIZE - 1) {
-            let coeff_br = sd.read_cdf(br_cdf);
-            level += coeff_br;
-            if coeff_br < BR_CDF_SIZE - 1 {
-                break;
-            }
-        }
-        level
-    };
+    // The symbol decoder as a local for the whole block: nothing takes its address (the br
+    // reads are inlined), so its state stays in registers. Written back at the end.
+    let mut local = dec.clone();
+    let sd = &mut local;
     let last = scan.len() - 1;
     // The eob position: its level is at least 1.
     let mut next = {
@@ -443,7 +457,8 @@ fn read_levels<const CLASS: usize>(
         let col = pos - (row << lc.bwl);
         let mut level = sd.read_cdf(eob_cdf) + 1;
         if level > NUM_BASE_LEVELS {
-            level = read_br(&mut *sd, lc.neighbours(levels, row, col).1, row, col, level);
+            let s3 = lc.neighbours(levels, row, col).1;
+            level = read_br::<CLASS>(sd, lc, br_cdfs, s3, row, col, level);
         }
         levels[row * lc.stride + col] = pack_level(level);
         quant[pos] = (level as i32) << 11;
@@ -456,7 +471,7 @@ fn read_levels<const CLASS: usize>(
         let (s5, s3) = lc.neighbours(levels, row, col);
         let mut level = sd.read_cdf(&mut base_cdfs[lc.base_ctx::<CLASS>(s5, row, col)]);
         if level > NUM_BASE_LEVELS {
-            level = read_br(&mut *sd, s3, row, col, level);
+            level = read_br::<CLASS>(sd, lc, br_cdfs, s3, row, col, level);
         }
         levels[row * lc.stride + col] = pack_level(level);
         if level != 0 {
@@ -474,7 +489,7 @@ fn read_levels<const CLASS: usize>(
         };
         let mut level = sd.read_cdf(&mut base_cdfs[ctx]);
         if level > NUM_BASE_LEVELS {
-            level = read_br(&mut *sd, s3, 0, 0, level);
+            level = read_br::<CLASS>(sd, lc, br_cdfs, s3, 0, 0, level);
         }
         levels[0] = pack_level(level);
         if level != 0 {
@@ -482,6 +497,7 @@ fn read_levels<const CLASS: usize>(
             next = 0;
         }
     }
+    *dec = local;
     next
 }
 
@@ -1269,6 +1285,8 @@ impl TileDecoder<'_> {
             let levels = &mut self.levels[..];
             let quant = &mut self.quant[..];
             let dq = &mut self.itx.dq;
+            // A local symbol decoder for the pass, as in `read_levels`; written back below.
+            let mut sd = self.sd.clone();
             // The sign pass visits the nonzero positions in scan order (see `read_levels`).
             loop {
                 let packed = quant[pos];
@@ -1277,15 +1295,15 @@ impl TileDecoder<'_> {
                 let row = pos >> lc.bwl;
                 levels[pos + row * TX_PAD] = 0;
                 let sign = if pos == 0 {
-                    self.sd.read_cdf(&mut self.cdf.dc_sign_cdf[ptype][dc_ctx]) != 0
+                    sd.read_cdf(&mut self.cdf.dc_sign_cdf[ptype][dc_ctx]) != 0
                 } else {
-                    self.sd.read_bool()
+                    sd.read_bool()
                 };
                 if q > (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32 {
                     let mut length = 0;
                     loop {
                         length += 1;
-                        if self.sd.read_bool() {
+                        if sd.read_bool() {
                             break;
                         }
                         if length == 20 {
@@ -1293,12 +1311,13 @@ impl TileDecoder<'_> {
                             levels.fill(0);
                             quant.fill(0);
                             dq.fill(0);
+                            self.sd = sd;
                             return Err(Error::Invalid("golomb_length_bit"));
                         }
                     }
                     let mut x = 1i32;
                     for _ in 0..length - 1 {
-                        x = (x << 1) | i32::from(self.sd.read_bool());
+                        x = (x << 1) | i32::from(sd.read_bool());
                     }
                     q = x + (COEFF_BASE_RANGE + NUM_BASE_LEVELS) as i32;
                 }
@@ -1325,6 +1344,7 @@ impl TileDecoder<'_> {
                 }
                 pos = next;
             }
+            self.sd = sd;
             cul_level = cul_level.min(63);
         }
 

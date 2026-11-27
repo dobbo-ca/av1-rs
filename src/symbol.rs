@@ -24,6 +24,11 @@ const EC_PROB_SHIFT: u32 = crate::consts::EC_PROB_SHIFT as u32;
 const EC_MIN_PROB: u32 = crate::consts::EC_MIN_PROB as u32;
 
 /// Arithmetic decoder over the bytes of one tile (spec 8.2).
+///
+/// `Clone` lets a hot loop work on a local copy and write it back at the end
+/// (`coef::read_levels`), so the window, range and count stay in registers instead of going
+/// through memory at every symbol.
+#[derive(Clone)]
 pub(crate) struct SymbolDecoder<'a> {
     data: &'a [u8],
     /// The next byte of `data` to load into the window.
