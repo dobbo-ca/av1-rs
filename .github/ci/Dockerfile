@@ -203,7 +203,8 @@ RUN --mount=type=cache,id=av1-rs-target-bench,sharing=locked,target=/src/target 
     && find src examples tests -name '*.rs' -exec touch {} + \
     && rm -rf /pgo && RUSTFLAGS="-Cprofile-generate=/pgo" \
        cargo build --locked --release --example oracle --target-dir target/pgo-gen \
-    && for c in /pgo-c/*; do for t in 1 4; do target/pgo-gen/release/examples/oracle --null --threads $t $c /pgo-o >/dev/null 2>&1 || true; done; done \
+    && for c in /pgo-c/*; do [ -n "$(ls "$c")" ] || { echo "no PGO training input in $c"; exit 1; }; \
+         for t in 1 4; do target/pgo-gen/release/examples/oracle --null --threads $t "$c" /pgo-o >/dev/null || exit 1; done; done \
     && "$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-profdata" merge -o /pgo.profdata /pgo \
     && RUSTFLAGS="-Cprofile-use=/pgo.profdata" \
        cargo build --locked --release --example oracle --target-dir target/pgo-use \
