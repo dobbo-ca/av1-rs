@@ -1119,7 +1119,7 @@ impl<'a> TileDecoder<'a> {
         self.read_delta_lf();
         self.read_deltas = false;
         self.use_intrabc =
-            self.fh.allow_intrabc && self.sd.read_symbol(&mut self.cdf.intrabc_cdf) != 0;
+            self.fh.allow_intrabc && self.sd.read_cdf(&mut self.cdf.intrabc_cdf) != 0;
         if self.use_intrabc {
             // motion_mode is SIMPLE, compound_type COMPOUND_AVERAGE and interp_filter BILINEAR:
             // fixed values the intrabc prediction hard-codes.
@@ -1146,7 +1146,7 @@ impl<'a> TileDecoder<'a> {
         let left_ctx = INTRA_MODE_CONTEXT[left_mode.min(INTRA_MODES - 1)];
         self.y_mode = self
             .sd
-            .read_symbol(&mut self.cdf.intra_frame_y_mode_cdf[above_ctx][left_ctx]);
+            .read_cdf(&mut self.cdf.intra_frame_y_mode_cdf[above_ctx][left_ctx]);
         self.intra_angle_info_y();
         if self.has_chroma {
             let (ssx, ssy) = (self.fs.subsampling_x, self.fs.subsampling_y);
@@ -1157,10 +1157,10 @@ impl<'a> TileDecoder<'a> {
             };
             self.uv_mode = if cfl_allowed {
                 self.sd
-                    .read_symbol(&mut self.cdf.uv_mode_cfl_allowed_cdf[self.y_mode])
+                    .read_cdf(&mut self.cdf.uv_mode_cfl_allowed_cdf[self.y_mode])
             } else {
                 self.sd
-                    .read_symbol(&mut self.cdf.uv_mode_cfl_not_allowed_cdf[self.y_mode])
+                    .read_cdf(&mut self.cdf.uv_mode_cfl_not_allowed_cdf[self.y_mode])
             };
             if self.uv_mode == UV_CFL_PRED {
                 self.read_cfl_alphas();
@@ -1220,7 +1220,7 @@ impl<'a> TileDecoder<'a> {
         } else {
             0
         };
-        let coded = self.sd.read_symbol(&mut self.cdf.segment_id_cdf[ctx]) as i32;
+        let coded = self.sd.read_cdf(&mut self.cdf.segment_id_cdf[ctx]) as i32;
         let last = i32::from(self.fh.last_active_seg_id);
         let v = neg_deinterleave(coded, pred, last + 1);
         if !(0..=last).contains(&v) {
@@ -1242,7 +1242,7 @@ impl<'a> TileDecoder<'a> {
             if self.avail_l {
                 ctx += usize::from(self.fs.skips[self.mi_idx(self.mi_row, self.mi_col - 1)]);
             }
-            self.skip = self.sd.read_symbol(&mut self.cdf.skip_cdf[ctx]) != 0;
+            self.skip = self.sd.read_cdf(&mut self.cdf.skip_cdf[ctx]) != 0;
         }
     }
 
@@ -1281,7 +1281,7 @@ impl<'a> TileDecoder<'a> {
             return;
         }
         if self.read_deltas {
-            let mut delta_q_abs = self.sd.read_symbol(&mut self.cdf.delta_q_cdf) as i32;
+            let mut delta_q_abs = self.sd.read_cdf(&mut self.cdf.delta_q_cdf) as i32;
             if delta_q_abs == DELTA_Q_SMALL as i32 {
                 let delta_q_rem_bits = self.sd.read_literal(3) + 1;
                 let delta_q_abs_bits = self.sd.read_literal(delta_q_rem_bits) as i32;
@@ -1346,7 +1346,7 @@ impl<'a> TileDecoder<'a> {
         if self.mi_size >= BLOCK_8X8 && is_directional_mode(self.y_mode) {
             let v = self
                 .sd
-                .read_symbol(&mut self.cdf.angle_delta_cdf[self.y_mode - V_PRED]);
+                .read_cdf(&mut self.cdf.angle_delta_cdf[self.y_mode - V_PRED]);
             self.angle_delta_y = v as i32 - MAX_ANGLE_DELTA as i32;
         }
     }
@@ -1357,19 +1357,19 @@ impl<'a> TileDecoder<'a> {
         if self.mi_size >= BLOCK_8X8 && is_directional_mode(self.uv_mode) {
             let v = self
                 .sd
-                .read_symbol(&mut self.cdf.angle_delta_cdf[self.uv_mode - V_PRED]);
+                .read_cdf(&mut self.cdf.angle_delta_cdf[self.uv_mode - V_PRED]);
             self.angle_delta_uv = v as i32 - MAX_ANGLE_DELTA as i32;
         }
     }
 
     /// Spec 5.11.45 `read_cfl_alphas( )`.
     fn read_cfl_alphas(&mut self) {
-        let cfl_alpha_signs = self.sd.read_symbol(&mut self.cdf.cfl_sign_cdf);
+        let cfl_alpha_signs = self.sd.read_cdf(&mut self.cdf.cfl_sign_cdf);
         let sign_u = (cfl_alpha_signs + 1) / 3;
         let sign_v = (cfl_alpha_signs + 1) % 3;
         if sign_u != CFL_SIGN_ZERO {
             let ctx = (sign_u - 1) * 3 + sign_v;
-            let v = self.sd.read_symbol(&mut self.cdf.cfl_alpha_cdf[ctx]) as i32;
+            let v = self.sd.read_cdf(&mut self.cdf.cfl_alpha_cdf[ctx]) as i32;
             self.cfl_alpha_u = if sign_u == CFL_SIGN_NEG {
                 -(1 + v)
             } else {
@@ -1380,7 +1380,7 @@ impl<'a> TileDecoder<'a> {
         }
         if sign_v != CFL_SIGN_ZERO {
             let ctx = (sign_v - 1) * 3 + sign_u;
-            let v = self.sd.read_symbol(&mut self.cdf.cfl_alpha_cdf[ctx]) as i32;
+            let v = self.sd.read_cdf(&mut self.cdf.cfl_alpha_cdf[ctx]) as i32;
             self.cfl_alpha_v = if sign_v == CFL_SIGN_NEG {
                 -(1 + v)
             } else {
@@ -1401,10 +1401,10 @@ impl<'a> TileDecoder<'a> {
         {
             self.use_filter_intra = self
                 .sd
-                .read_symbol(&mut self.cdf.filter_intra_cdf[self.mi_size])
+                .read_cdf(&mut self.cdf.filter_intra_cdf[self.mi_size])
                 != 0;
             if self.use_filter_intra {
-                self.filter_intra_mode = self.sd.read_symbol(&mut self.cdf.filter_intra_mode_cdf);
+                self.filter_intra_mode = self.sd.read_cdf(&mut self.cdf.filter_intra_mode_cdf);
             }
         }
     }
@@ -1494,12 +1494,12 @@ impl<'a> TileDecoder<'a> {
             }
             let has_palette_y = self
                 .sd
-                .read_symbol(&mut self.cdf.palette_y_mode_cdf[bsize_ctx][ctx])
+                .read_cdf(&mut self.cdf.palette_y_mode_cdf[bsize_ctx][ctx])
                 != 0;
             if has_palette_y {
                 let n = self
                     .sd
-                    .read_symbol(&mut self.cdf.palette_y_size_cdf[bsize_ctx])
+                    .read_cdf(&mut self.cdf.palette_y_size_cdf[bsize_ctx])
                     + 2;
                 self.palette_size_y = n;
                 let mut cache = [0u16; 16];
@@ -1538,11 +1538,11 @@ impl<'a> TileDecoder<'a> {
         }
         if self.has_chroma && self.uv_mode == DC_PRED {
             let ctx = usize::from(self.palette_size_y > 0);
-            let has_palette_uv = self.sd.read_symbol(&mut self.cdf.palette_uv_mode_cdf[ctx]) != 0;
+            let has_palette_uv = self.sd.read_cdf(&mut self.cdf.palette_uv_mode_cdf[ctx]) != 0;
             if has_palette_uv {
                 let n = self
                     .sd
-                    .read_symbol(&mut self.cdf.palette_uv_size_cdf[bsize_ctx])
+                    .read_cdf(&mut self.cdf.palette_uv_size_cdf[bsize_ctx])
                     + 2;
                 self.palette_size_uv = n;
                 let mut cache = [0u16; 16];
@@ -1707,7 +1707,7 @@ impl<'a> TileDecoder<'a> {
             false
         } else {
             let ctx = self.txfm_split_ctx(row, col, tx_sz);
-            self.sd.read_symbol(&mut self.cdf.txfm_split_cdf[ctx]) != 0
+            self.sd.read_cdf(&mut self.cdf.txfm_split_cdf[ctx]) != 0
         };
         let w4 = TX_WIDTH[tx_sz] / MI_SIZE;
         let h4 = TX_HEIGHT[tx_sz] / MI_SIZE;
@@ -1879,20 +1879,20 @@ impl<'a> TileDecoder<'a> {
         let idx = unit_row * self.fs.lr_unit_cols[plane] + unit_col;
         let restoration_type = match self.fh.frame_restoration_type[plane] {
             RESTORE_WIENER => {
-                if self.sd.read_symbol(&mut self.cdf.use_wiener_cdf) != 0 {
+                if self.sd.read_cdf(&mut self.cdf.use_wiener_cdf) != 0 {
                     RESTORE_WIENER
                 } else {
                     RESTORE_NONE
                 }
             }
             RESTORE_SGRPROJ => {
-                if self.sd.read_symbol(&mut self.cdf.use_sgrproj_cdf) != 0 {
+                if self.sd.read_cdf(&mut self.cdf.use_sgrproj_cdf) != 0 {
                     RESTORE_SGRPROJ
                 } else {
                     RESTORE_NONE
                 }
             }
-            _ => self.sd.read_symbol(&mut self.cdf.restoration_type_cdf) as u8,
+            _ => self.sd.read_cdf(&mut self.cdf.restoration_type_cdf) as u8,
         };
         let fs = &mut *self.fs;
         *fs.lr_type[plane]
