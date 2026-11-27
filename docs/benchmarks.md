@@ -375,7 +375,12 @@ their branches without a PR (to keep within two CI runs at a time); C had PR #77
   apply: C changes no aarch64 code (`simd::codegen` runs the baseline build there), so the
   aarch64 99.9% (1 ms) is noise, not a gain.
 
-The work stopped after these three changes in a row below 1% on x86_64.
+The work stopped after these three changes in a row below 1% on x86_64. The decoder did not
+change in this round, so the ratios to dav1d stay where they were; they move with the host.
+Bench run 46041900099 (main after PR #78), av1-rs / dav1d, all classes: x86_64 Intel Xeon
+6975P-C 1051 / 556 ms (1.89x) with 1 thread, 633 / 424 ms (1.49x) with 4 threads; aarch64
+Neoverse-N2 1178 / 749 ms (1.57x) and 594 / 505 ms (1.18x). The goal of 1.5x at 1 thread on
+x86_64 is not met.
 
 PGO (bench column from PR #78, CI only; the crate does not change; trained on the bench
 classes, so this is the best case), default / PGO build, all classes, bench run 46035159115
