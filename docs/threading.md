@@ -33,7 +33,7 @@ crate denies `unsafe` outside `src/simd` (docs/safety.md).
   (`tests/avif_alloc.rs`).
 
 - **Film grain** (`grain.rs`, `apply_film_grain`). The frame is cut into bands of 32 luma rows
-  (one noise stripe each), run by `run_parallel` on `min(max_threads, bands)` threads. A band
+  (one noise stripe each), run by `run_each` on `min(max_threads, bands)` threads. A band
   builds its own stripe and, with overlap, the stripe above it: the generator is seeded per
   stripe, so a band reads only the grain templates, the input frame and its stripes, and writes
   only its own rows of the output (each band owns its `chunks_mut` of every plane, behind a
@@ -77,8 +77,10 @@ starts when every item of the one before has finished (no row pipelining between
 
 ## The schedulers
 
-`parallel::run_parallel( n, max_threads, f )` (the AVIF grid, film grain) runs `f( 0 ) .. f( n - 1 )` and
-returns the results in item order. One `std::thread::scope` per call;
+`parallel::run_each( n, max_threads, f )` (the AVIF grid, film grain) runs `f( 0 ) .. f( n - 1 )` and
+keeps only the error of the lowest failing item, so its heap does not grow with `n` (a grid
+can list 65536 tiles); `run_parallel` (the frames of a batch, at most `max_threads`) also
+returns a result per item, in item order. One `std::thread::scope` per call;
 `workers = min(max_threads, n)`, the calling thread is one of them. Items are taken from an
 `AtomicUsize` counter in increasing order. With one worker nothing is spawned and the items run in
 order.

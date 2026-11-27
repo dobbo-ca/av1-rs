@@ -6,7 +6,7 @@
 //! runs on each grid tile and identity input, on the derived result and on the alpha image.
 
 use crate::ledger::{Held, Ledger};
-use crate::parallel::run_parallel;
+use crate::parallel::run_each;
 use crate::{Decoder, Error, Format, Frame, Limits, Options, Plane, PlaneData};
 use isobmff::{
     Av1c, Chroma, Codec, CodecConfig, Grid, Heif, Image, ImageKind, PlaneSamples, Transform,
@@ -96,11 +96,13 @@ pub fn decode_avif(
         cancel,
     };
     let primary = heif.primary_image().map_err(container)?;
+    let _list = ctx.book_tile_list(&primary)?;
     let image = decode_image(&ctx, &primary, false)?;
     let image = ctx.transformed_booked(&primary.transforms, image)?;
     let alpha = match primary.alpha {
         Some(id) => {
             let item = heif.image(id).map_err(container)?;
+            let _list = ctx.book_tile_list(&item)?;
             let alpha = decode_image(&ctx, &item, false)?;
             // The alpha image gets the transforms of its master.
             Some(ctx.transformed_booked(&primary.transforms, alpha)?)
@@ -156,11 +158,22 @@ pub fn decode_avif_item(
         cancel,
     };
     let image = heif.image(id).map_err(container)?;
+    let _list = ctx.book_tile_list(&image)?;
     let frame = decode_image(&ctx, &image, false)?;
     ctx.transformed_booked(&image.transforms, frame)
 }
 
 impl Ctx<'_> {
+    /// Books the tile id list of a grid image (4 bytes a tile, up to 65536 tiles, made by
+    /// `Heif::image` outside any budget) while the image is held.
+    fn book_tile_list(&self, image: &Image) -> Result<Held<'_>, Error> {
+        let n = match &image.kind {
+            ImageKind::Grid(g) => g.tiles.capacity().saturating_mul(size_of::<u32>()),
+            _ => 0,
+        };
+        self.ledger.charge(n)
+    }
+
     /// [`transform_frame`] for a frame the ledger holds (a decoded image); the result is booked
     /// in its place.
     fn transformed_booked(&self, ts: &[Transform], frame: Frame) -> Result<Frame, Error> {
@@ -335,6 +348,7 @@ fn decode_image(ctx: &Ctx<'_>, image: &Image, nested: bool) -> Result<Frame, Err
         // The input of an identity image is a coded image or a grid, not another identity.
         ImageKind::Identity { input } if !nested => {
             let inner = ctx.heif.image(*input).map_err(container)?;
+            let _list = ctx.book_tile_list(&inner)?;
             // The input gets its own transforms before the identity image's.
             let frame = decode_image(ctx, &inner, true)?;
             ctx.transformed_booked(&inner.transforms, frame)
@@ -461,7 +475,7 @@ fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
     put(ctx, 0)?;
     let rest = grid.tiles.len() - 1;
     let refused = AtomicUsize::new(usize::MAX);
-    let r = run_parallel(rest, max_threads, |k| {
+    let r = run_each(rest, max_threads, |k| {
         let r = put(split, k + 1);
         if matches!(r, Err(Error::AllocLimit | Error::OutOfMemory)) {
             refused.fetch_min(k + 1, Ordering::Relaxed);
@@ -474,7 +488,7 @@ fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
         // `decode` does for a batch, the tiles from the lowest refused one decode again one at a time, each with only
         // the canvas booked beside it and the whole item-read share, as in a serial decode (a
         // tile that was pasted already is pasted again with the same samples), so the result is
-        // the serial one. The error of `run_parallel` is the one of its lowest failing tile: a
+        // the serial one. The error of `run_each` is the one of its lowest failing tile: a
         // refusal there is `refused`.
         Err(Error::AllocLimit | Error::OutOfMemory) if workers > 1 => {
             for i in refused.load(Ordering::Relaxed)..grid.tiles.len() {

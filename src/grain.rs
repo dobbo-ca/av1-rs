@@ -12,7 +12,7 @@ use crate::decoder::check_cancel;
 use crate::error::Error;
 use crate::header::FilmGrainParams;
 use crate::ledger::{Buf, Ledger};
-use crate::parallel::run_parallel;
+use crate::parallel::run_each;
 use crate::simd::Simd;
 use crate::simd::grain::{blend_chroma, blend_luma};
 use crate::tables::GAUSSIAN_SEQUENCE;
@@ -432,7 +432,7 @@ fn build_stripe(
 /// found where it differs from dav1d's `filmgrain_tmpl.c` output.
 ///
 /// The frame is done in bands of 32 luma rows (one noise stripe each) on up to `max_threads`
-/// threads (`parallel::run_parallel`, one scope). A band builds its own stripe and, with
+/// threads (`parallel::run_each`, one scope). A band builds its own stripe and, with
 /// overlap, the stripe above it (each stripe seeds its own generator), so the bands are
 /// independent and the output is the same for every thread count. The stripe buffers of a band
 /// come from the ledger's pool (or are allocated fallibly) and are charged to `ledger` while
@@ -527,11 +527,13 @@ fn grain_bands(
         o1.chunks_mut(rows(1)),
         o2.chunks_mut(rows(2)),
     ];
+    // The band list grows with the frame height, so it is booked while it lives.
+    let _outs_held = ledger.charge(bands.saturating_mul(size_of::<Mutex<[&mut [u16]; 3]>>()))?;
     let outs: Vec<Mutex<[&mut [u16]; 3]>> = (0..bands)
         .map(|_| Mutex::new(chunks.each_mut().map(|c| c.next().unwrap_or_default())))
         .collect();
 
-    run_parallel(bands, max_threads, |b| {
+    run_each(bands, max_threads, |b| {
         check_cancel(cancel)?;
         let stripes = if p.overlap_flag && b > 0 { 2 } else { 1 };
         // The stripe buffers from the ledger's pool, charged while they live (empty for a plane

@@ -2,7 +2,8 @@
 //! global allocator over every thread. For AVIF: a plain item, an item with an alpha image, a
 //! 2x2 grid, the same grid and a 1x2 grid with each tile stored in two extents, and an item and
 //! a grid whose decoded frames are above the uncharged slack (rotated tiles, a mirrored grid, with
-//! `apply_transforms` on), at many `max_alloc` and `max_threads` values, the heap held at once
+//! `apply_transforms` on), and a hostile grid of 16384 references to one tiny tile, at many
+//! `max_alloc` and `max_threads` values, the heap held at once
 //! (the parse, the item bytes, the item copy, the decoders, the transforms, the canvas and the
 //! output) stays within the ledger's three quarters of `max_alloc` plus what the parse and the
 //! item-byte copies held and the few fixed-size buffers that are not charged, and a single
@@ -328,7 +329,7 @@ fn ispe(w: u32, h: u32) -> Vec<u8> {
 
 /// The `ipco` list: small item and tile `ispe` (1), `av1C` (2), alpha `auxC` (3), small grid
 /// `ispe` (4), `irot` 90 (5), `imir` (6), large item and tile `ispe` (7), large grid `ispe` (8),
-/// 1x2 grid `ispe` (9).
+/// 1x2 grid `ispe` (9), tiny tile `ispe` (10), hostile grid `ispe` (11).
 fn props() -> Vec<Vec<u8>> {
     let urn = b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0";
     vec![
@@ -341,8 +342,15 @@ fn props() -> Vec<Vec<u8>> {
         ispe(BIG_TILE, BIG_TILE),
         ispe(2 * BIG_TILE, 2 * BIG_TILE),
         ispe(128, 32),
+        ispe(TINY, TINY),
+        ispe(HOSTILE * TINY, HOSTILE * TINY),
     ]
 }
+
+/// The hostile grid has `HOSTILE` x `HOSTILE` tiles of `TINY` x `TINY`, every one a reference
+/// to the same item: a small file and a small canvas, but a work list as long as the tile count.
+const HOSTILE: u32 = 128;
+const TINY: u32 = 2;
 
 /// The large item and the tiles of the large grid are this square size: each decoded frame
 /// (384 KiB at 8-bit 4:2:0), and the canvas even more, is above the uncharged slack at 4 threads
@@ -360,7 +368,7 @@ fn av01(id: u8, data: &[u8], props: &[u8]) -> Item {
 }
 
 fn refs(kind: &[u8; 4], from: u8, to: &[u8]) -> Vec<u8> {
-    let mut v = vec![0, from, 0, to.len() as u8];
+    let mut v = [&[0, from][..], &(to.len() as u16).to_be_bytes()].concat();
     for t in to {
         v.extend_from_slice(&[0, *t]);
     }
@@ -443,6 +451,25 @@ fn files() -> Vec<(&'static str, Vec<u8>, usize)> {
         items.extend((2..=5).map(|id| av01(id, &tile, &[7, 0x82, 0x85])));
         build(&items, &props(), &[refs(b"dimg", 1, &[2, 3, 4, 5])])
     };
+    // 16384 references to one 2x2 tile (rotated, so each tile is transformed), mirrored after.
+    let hostile = {
+        let (tiny, _) = decodable_unit(0, (u64::from(TINY), u64::from(TINY)));
+        let side = (HOSTILE * TINY) as u16;
+        let n = (HOSTILE - 1) as u8;
+        let grid = Item {
+            id: 1,
+            kind: b"grid",
+            data: [&[0, 0, n, n][..], &side.to_be_bytes(), &side.to_be_bytes()].concat(),
+            props: vec![11, 0x86],
+            split: false,
+        };
+        let tiles = vec![2; (HOSTILE * HOSTILE) as usize];
+        build(
+            &[grid, av01(2, &tiny, &[10, 0x82, 0x85])],
+            &props(),
+            &[refs(b"dimg", 1, &tiles)],
+        )
+    };
     vec![
         ("plain", plain, 4),
         ("alpha", alpha, 4),
@@ -451,6 +478,7 @@ fn files() -> Vec<(&'static str, Vec<u8>, usize)> {
         ("split grid 1x2", split_pair, 2),
         ("big", big, 4),
         ("big grid", big_grid, 4),
+        ("hostile grid", hostile, 4),
     ]
 }
 
@@ -504,7 +532,13 @@ fn decode_avif_keeps_the_heap_within_max_alloc(name: &str) {
     let want: AvifImage = want.unwrap_or_else(|e| panic!("{name}: reference decode: {e:?}"));
     let want_frames: Vec<&Frame> = std::iter::once(&want.image).chain(&want.alpha).collect();
     let (mut fitted, mut runs) = (0, 0);
-    for max_alloc in sweep(16 << 10) {
+    // The hostile grid decodes 16384 tiles per run and fits well below 16 MiB.
+    let top = if name == "hostile grid" {
+        16 << 20
+    } else {
+        64 << 20
+    };
+    for max_alloc in sweep(16 << 10).into_iter().take_while(|&m| m <= top) {
         let mut first: Option<Result<AvifImage, Error>> = None;
         for threads in [1, 2, 4] {
             let ledger = (max_alloc - 2 * (max_alloc / 8)) as isize;
@@ -647,4 +681,9 @@ fn decode_temporal_units_keeps_the_heap_within_max_alloc() {
         }
     }
     assert!(fitted > 0 && fitted < runs, "{fitted} of {runs} fitted");
+}
+
+#[test]
+fn decode_avif_hostile_grid_keeps_the_heap_within_max_alloc() {
+    decode_avif_keeps_the_heap_within_max_alloc("hostile grid");
 }
