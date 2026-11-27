@@ -8,7 +8,7 @@ description = "AV1 intra-only decoder (AVIF stills and key frames), bit-exact to
 publish = false
 
 [dependencies]
-isobmff = { git = "https://github.com/dobbo-ca/isobmff-rs", rev = "c4f748bbc4798bc6cc5eb56461851a28527be8c9" }
+isobmff = { git = "https://github.com/dobbo-ca/isobmff-rs", rev = "439720afc00ff988ff8e25fe3b2f932b09e809e2" }
 
 # The tests decode whole frames, so they run optimised; this crate keeps its own overflow checks
 # and debug assertions in dev builds.

@@ -164,10 +164,12 @@ pub fn decode_avif_item(
 }
 
 impl Ctx<'_> {
-    /// Books the lists an [`Image`] owns while it is held: `Heif::image` builds them outside any
-    /// budget, and their length comes from the file (a grid's tile ids, up to 65536; an overlay's
-    /// inputs; the thumbnail, Exif, XMP and auxiliary references; the transforms and colour
-    /// properties). Codec configs and ICC data are shared or are extents of the file, not copies.
+    /// Books the lists an [`Image`] owns while it is held. `Heif::image` charges them to its own
+    /// budget (the `max_alloc` of the parse) only while it builds them; the call keeps them for
+    /// the whole decode, so they are booked here once, in the ledger. Their length comes from the
+    /// file, bounded by the items (a grid's tile ids, up to 65536; an overlay's inputs; the
+    /// thumbnail, Exif, XMP and auxiliary images; the transforms and colour properties). Codec
+    /// configs and ICC data are shared or are extents of the file, not copies.
     fn book_image(&self, image: &Image) -> Result<Held<'_>, Error> {
         fn bytes<T>(capacity: usize) -> usize {
             capacity.saturating_mul(size_of::<T>())
