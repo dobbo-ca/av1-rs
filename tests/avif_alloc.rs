@@ -700,9 +700,33 @@ fn decode_temporal_unit_keeps_the_heap_within_max_alloc() {
     let size = (u64::from(BIG_TILE), u64::from(BIG_TILE));
     let (good, _) = decodable_unit(0, size);
     let mut units = vec![good];
-    for tile in [&[0xff_u8; 2][..], &[0; 3], &[0xa5; 40]] {
-        units.push(unit(tile, 0, size));
+    // Tile payloads that the decoder refuses (with room to spare), so the frame is set up and
+    // then fails in its tile; at least two of the candidates must be such.
+    let roomy = Limits {
+        max_alloc: 64 << 20,
+        max_threads: 1,
+        ..Limits::default()
+    };
+    for tile in [
+        &[0xff_u8; 2][..],
+        &[0; 3],
+        &[0xa5; 40],
+        &[0xfe; 6],
+        &[0x7f, 0xff, 0xff],
+        &[0xc3; 12],
+    ] {
+        let data = unit(tile, 0, size);
+        let mut d = Decoder::new(Options::default(), roomy);
+        match d.decode_temporal_unit(&data, Format::Section5, &cancel) {
+            Err(Error::AllocLimit | Error::OutOfMemory) | Ok(_) => {}
+            Err(_) => units.push(data),
+        }
     }
+    assert!(
+        units.len() >= 3,
+        "only {} refused tile payloads",
+        units.len() - 1
+    );
     let (mut fitted, mut runs) = (0, 0);
     for (n, data) in units.iter().enumerate() {
         for max_alloc in sweep(64 << 10) {
@@ -718,8 +742,11 @@ fn decode_temporal_unit_keeps_the_heap_within_max_alloc() {
             let (one, _) = run(1);
             for threads in [1, 2, 4] {
                 let (r, peak) = run(threads);
-                runs += 1;
-                fitted += usize::from(r.is_ok());
+                // The good unit both fits and is refused over the sweep.
+                if n == 0 {
+                    runs += 1;
+                    fitted += usize::from(r.is_ok());
+                }
                 assert!(
                     peak <= max_alloc as isize + UNCHARGED * (threads as isize + 1),
                     "unit {n} max_alloc {max_alloc} threads {threads}: {peak} bytes held, result {:?}",

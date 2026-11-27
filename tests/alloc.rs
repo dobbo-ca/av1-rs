@@ -111,9 +111,8 @@ fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
     v
 }
 
-/// A reduced still picture sequence header: `width` x `height` (one superblock: at most 64x64),
-/// 8-bit (10-bit when `high_bitdepth` is 1) 4:2:0, 64x64 superblocks, CDEF and loop restoration
-/// on.
+/// A reduced still picture sequence header: `width` x `height` (at most 4096x4096), 8-bit
+/// (10-bit when `high_bitdepth` is 1) 4:2:0, 64x64 superblocks, CDEF and loop restoration on.
 fn sequence_header(high_bitdepth: u64, width: u64, height: u64) -> Vec<u8> {
     let mut w = Bits::default();
     for (bits, value) in [
@@ -121,10 +120,10 @@ fn sequence_header(high_bitdepth: u64, width: u64, height: u64) -> Vec<u8> {
         (1, 1),             // still_picture
         (1, 1),             // reduced_still_picture_header
         (5, 4),             // seq_level_idx[0]
-        (4, 7),             // frame_width_bits_minus_1
-        (4, 6),             // frame_height_bits_minus_1
-        (8, width - 1),     // max_frame_width_minus_1
-        (7, height - 1),    // max_frame_height_minus_1
+        (4, 11),            // frame_width_bits_minus_1
+        (4, 11),            // frame_height_bits_minus_1
+        (12, width - 1),    // max_frame_width_minus_1
+        (12, height - 1),   // max_frame_height_minus_1
         (1, 0),             // use_128x128_superblock
         (1, 1),             // enable_filter_intra
         (1, 1),             // enable_intra_edge_filter
@@ -147,13 +146,19 @@ fn sequence_header(high_bitdepth: u64, width: u64, height: u64) -> Vec<u8> {
 }
 
 /// The key frame header of that sequence (loop filter, CDEF, switchable loop restoration on U),
-/// byte aligned, then `tile` as the data of its one tile.
-fn frame(tile: &[u8]) -> Vec<u8> {
+/// byte aligned, then `tile` as the data of its one tile (of a `width` x `height` frame).
+fn frame(tile: &[u8], (width, height): (u64, u64)) -> Vec<u8> {
     let mut w = Bits::default();
     w.put(1, 0); // disable_cdf_update
     w.put(1, 0); // allow_screen_content_tools
     w.put(1, 0); // render_and_frame_size_different
     w.put(1, 1); // uniform_tile_spacing_flag
+    if width > 64 {
+        w.put(1, 0); // increment_tile_cols_log2: one tile column
+    }
+    if height > 64 {
+        w.put(1, 0); // increment_tile_rows_log2: one tile row
+    }
     w.put(8, 100); // base_q_idx
     w.put(4, 0); // DeltaQYDc, DeltaQUDc, DeltaQUAc not coded; using_qmatrix 0
     w.put(1, 0); // segmentation_enabled
@@ -191,7 +196,7 @@ fn unit(tile: &[u8], high_bitdepth: u64, size: (u64, u64)) -> Vec<u8> {
     [
         obu(2, &[]),
         obu(1, &sequence_header(high_bitdepth, size.0, size.1)),
-        obu(6, &frame(tile)),
+        obu(6, &frame(tile, size)),
     ]
     .concat()
 }
@@ -251,9 +256,10 @@ fn reuse_keeps_the_heap_within_max_alloc() {
     // 256x256: the output frame (96 KiB) is above the uncharged slack, so an output that is not
     // charged fails the bound.
     let (data, want) = decodable_unit(0, (256, 256));
+    assert_eq!((want[0].width, want[0].height), (256, 256));
     let cancel = AtomicBool::new(false);
     let (mut fitted, mut runs) = (0, 0);
-    for max_alloc in (1..=128).map(|k| k * (32 << 10)) {
+    for max_alloc in (1..=256).map(|k| k * (16 << 10)) {
         let mut d = Decoder::new(Options::default(), limits(max_alloc));
         let mut ok = None;
         for round in 0..2 {
