@@ -631,8 +631,9 @@ fn decode_avif_big_grid_keeps_the_heap_within_max_alloc() {
 fn decode_temporal_units_keeps_the_heap_within_max_alloc() {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let cancel = AtomicBool::new(false);
-    // Eight key frames far above the slack, decoded several at once.
-    let (data, _) = decodable_unit(0, (u64::from(BIG_TILE), u64::from(BIG_TILE / 2)));
+    // Eight key frames, decoded several at once. Each output frame (384 KiB) is above the
+    // slack at 4 threads (320 KiB), so one frame that is not charged fails the bound.
+    let (data, _) = decodable_unit(0, (u64::from(BIG_TILE), u64::from(BIG_TILE)));
     let units: Vec<&[u8]> = vec![&data[..]; 8];
     let mut d = Decoder::new(Options::default(), limits(64 << 20));
     let mut want = Vec::new();
@@ -686,4 +687,52 @@ fn decode_temporal_units_keeps_the_heap_within_max_alloc() {
 #[test]
 fn decode_avif_hostile_grid_keeps_the_heap_within_max_alloc() {
     decode_avif_keeps_the_heap_within_max_alloc("hostile grid");
+}
+
+/// One 512x512 key frame through `Decoder::decode_temporal_unit` at 1, 2 and 4 threads, with
+/// tile data that decodes and with tile data that is not valid syntax (the frame's buffers are
+/// booked and made before the tile fails): at every `max_alloc` the peak stays within
+/// `max_alloc` plus the uncharged buffers of each thread, and the result is the 1-thread one.
+#[test]
+fn decode_temporal_unit_keeps_the_heap_within_max_alloc() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let cancel = AtomicBool::new(false);
+    let size = (u64::from(BIG_TILE), u64::from(BIG_TILE));
+    let (good, _) = decodable_unit(0, size);
+    let mut units = vec![good];
+    for tile in [&[0xff_u8; 2][..], &[0; 3], &[0xa5; 40]] {
+        units.push(unit(tile, 0, size));
+    }
+    let (mut fitted, mut runs) = (0, 0);
+    for (n, data) in units.iter().enumerate() {
+        for max_alloc in sweep(64 << 10) {
+            let run = |threads: usize| {
+                let limits = Limits {
+                    max_alloc,
+                    max_threads: threads,
+                    ..Limits::default()
+                };
+                let mut d = Decoder::new(Options::default(), limits);
+                measured(|| d.decode_temporal_unit(data, Format::Section5, &cancel))
+            };
+            let (one, _) = run(1);
+            for threads in [1, 2, 4] {
+                let (r, peak) = run(threads);
+                runs += 1;
+                fitted += usize::from(r.is_ok());
+                assert!(
+                    peak <= max_alloc as isize + UNCHARGED * (threads as isize + 1),
+                    "unit {n} max_alloc {max_alloc} threads {threads}: {peak} bytes held, result {:?}",
+                    r.as_ref().map(|f| f.len())
+                );
+                assert!(
+                    r == one,
+                    "unit {n} max_alloc {max_alloc}: {threads} threads give {:?}, 1 thread {:?}",
+                    r.as_ref().map(|f| f.len()),
+                    one.as_ref().map(|f| f.len())
+                );
+            }
+        }
+    }
+    assert!(fitted > 0 && fitted < runs, "{fitted} of {runs} fitted");
 }

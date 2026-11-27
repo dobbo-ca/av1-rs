@@ -248,15 +248,18 @@ fn second_unit_after_recycle_allocates_nothing() {
 
 #[test]
 fn reuse_keeps_the_heap_within_max_alloc() {
-    let (data, want) = decodable_unit(0, (64, 32));
+    // 256x256: the output frame (96 KiB) is above the uncharged slack, so an output that is not
+    // charged fails the bound.
+    let (data, want) = decodable_unit(0, (256, 256));
     let cancel = AtomicBool::new(false);
-    let mut fitted = 0;
-    for max_alloc in (1..=64).map(|k| k * (8 << 10)) {
+    let (mut fitted, mut runs) = (0, 0);
+    for max_alloc in (1..=128).map(|k| k * (32 << 10)) {
         let mut d = Decoder::new(Options::default(), limits(max_alloc));
         let mut ok = None;
         for round in 0..2 {
             let (r, _, peak) =
                 measured(|| d.decode_temporal_unit(&data, Format::Section5, &cancel));
+            runs += 1;
             assert!(
                 peak <= max_alloc as isize + UNCHARGED,
                 "max_alloc {max_alloc} round {round}: {peak} bytes held"
@@ -281,7 +284,18 @@ fn reuse_keeps_the_heap_within_max_alloc() {
         }
     }
     // Some limits fit and some do not, so both paths were checked.
-    assert!(fitted > 0 && fitted < 128);
+    assert!(fitted > 0 && fitted < runs, "{fitted} of {runs} fitted");
+}
+
+/// `decode` of `frames` copies of `data` under `max_alloc`.
+fn decode_repeated(data: &[u8], frames: usize, max_alloc: usize) -> Result<Vec<Frame>, Error> {
+    av1::decode(
+        &data.repeat(frames),
+        Format::Section5,
+        &Options::default(),
+        &limits(max_alloc),
+        &AtomicBool::new(false),
+    )
 }
 
 #[test]
@@ -304,7 +318,14 @@ fn decode_of_many_high_bitdepth_frames_keeps_the_heap_within_max_alloc() {
     assert!(
         peak <= max_alloc as isize + UNCHARGED,
         "{peak} bytes held, result {:?}",
-        r.map(|f| f.len())
+        r.as_ref().map(|f| f.len())
+    );
+    // The stream is refused only once many frames are held: 40 of them fit, so the peak above
+    // was measured with frames collected, not at a refusal of the first.
+    assert_eq!(r.err(), Some(Error::AllocLimit));
+    assert_eq!(
+        decode_repeated(&data, 40, max_alloc).map(|f| f.len()),
+        Ok(40)
     );
 }
 
@@ -332,4 +353,9 @@ fn decode_of_many_tiny_frames_keeps_the_heap_within_max_alloc() {
         r.map(|f| f.len())
     );
     assert_eq!(r.err(), Some(Error::AllocLimit));
+    // A tenth of them fit: the refusal comes from the frames held, not the first frame.
+    assert_eq!(
+        decode_repeated(&data, 400, max_alloc).map(|f| f.len()),
+        Ok(400)
+    );
 }
