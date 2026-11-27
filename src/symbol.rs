@@ -298,6 +298,22 @@ pub(crate) fn search(cdf: &[u16], c: u32, rng: u32) -> (usize, u32, u32) {
 fn search_const<const L: usize>(cdf: &[u16; L], c: u32, rng: u32) -> (usize, u32, u32) {
     let n = L - 1;
     let r = rng >> 8;
+    if L <= 5 {
+        // Up to 4 symbols (the coefficient rows): every `cur` at once and no branch, as
+        // dav1d's `msac_decode_symbol_adapt4` does with one vector compare. `below[i]` is set
+        // while every `cur` up to `i` is above `c`, so the count is the loop's first match
+        // for any values, not only for a CDF of the spec's form. `v[i + 1]` is the `cur` of
+        // symbol `i` (0 for the last), `v[0]` the range.
+        let mut v = [rng, 0, 0, 0, 0];
+        let mut symbol = 0;
+        let mut below = true;
+        for i in 0..n - 1 {
+            v[i + 1] = cur(r, cdf[i], n, i);
+            below &= c < v[i + 1];
+            symbol += usize::from(below);
+        }
+        return (symbol, v[symbol], v[symbol + 1]);
+    }
     let mut prev = rng;
     for i in 0..n - 1 {
         let v = cur(r, cdf[i], n, i);
