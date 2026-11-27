@@ -690,43 +690,33 @@ fn decode_avif_hostile_grid_keeps_the_heap_within_max_alloc() {
 }
 
 /// One 512x512 key frame through `Decoder::decode_temporal_unit` at 1, 2 and 4 threads, with
-/// tile data that decodes and with tile data that is not valid syntax (the frame's buffers are
-/// booked and made before the tile fails): at every `max_alloc` the peak stays within
-/// `max_alloc` plus the uncharged buffers of each thread, and the result is the 1-thread one.
+/// tile data that decodes, with arbitrary tile bytes (the decoder reads any bytes as some
+/// syntax, so these decode to other frames) and with an empty tile, which is refused after the
+/// frame is set up: at every `max_alloc` the peak stays within `max_alloc` plus the uncharged
+/// buffers of each thread, and the result is the 1-thread one.
 #[test]
 fn decode_temporal_unit_keeps_the_heap_within_max_alloc() {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let cancel = AtomicBool::new(false);
     let size = (u64::from(BIG_TILE), u64::from(BIG_TILE));
     let (good, _) = decodable_unit(0, size);
-    let mut units = vec![good];
-    // Tile payloads that the decoder refuses (with room to spare), so the frame is set up and
-    // then fails in its tile; at least two of the candidates must be such.
+    let empty = unit(&[], 0, size);
     let roomy = Limits {
         max_alloc: 64 << 20,
         max_threads: 1,
         ..Limits::default()
     };
-    for tile in [
-        &[0xff_u8; 2][..],
-        &[0; 3],
-        &[0xa5; 40],
-        &[0xfe; 6],
-        &[0x7f, 0xff, 0xff],
-        &[0xc3; 12],
-    ] {
-        let data = unit(tile, 0, size);
-        let mut d = Decoder::new(Options::default(), roomy);
-        match d.decode_temporal_unit(&data, Format::Section5, &cancel) {
-            Err(Error::AllocLimit | Error::OutOfMemory) | Ok(_) => {}
-            Err(_) => units.push(data),
-        }
-    }
+    let mut d = Decoder::new(Options::default(), roomy);
+    let r = d.decode_temporal_unit(&empty, Format::Section5, &cancel);
     assert!(
-        units.len() >= 3,
-        "only {} refused tile payloads",
-        units.len() - 1
+        matches!(r, Err(e) if e != Error::AllocLimit && e != Error::OutOfMemory),
+        "the empty tile must be refused: {:?}",
+        r.map(|f| f.len())
     );
+    let mut units = vec![good, empty];
+    for tile in [&[0xff_u8; 2][..], &[0xa5; 40], &[0x7f, 0xff, 0xff]] {
+        units.push(unit(tile, 0, size));
+    }
     let (mut fitted, mut runs) = (0, 0);
     for (n, data) in units.iter().enumerate() {
         for max_alloc in sweep(64 << 10) {
