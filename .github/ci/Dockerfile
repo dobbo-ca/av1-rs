@@ -191,10 +191,29 @@ RUN --mount=type=cache,id=av1-rs-target-bench,sharing=locked,target=/src/target 
          && cp target/ab-base/release/examples/oracle /usr/local/bin/av1-oracle-base \
          && cat ab-base/REV > /ab-base.rev; fi
 
+# av1-oracle-pgo: the default release build with profile-guided optimisation, which a user can do
+# with the crate unchanged. Trained on the bench classes (1 thread and 4 threads) with
+# -Cprofile-generate, then built with -Cprofile-use; llvm-profdata from rustup's llvm-tools.
+FROM bench-bin AS bench-pgo
+RUN rustup component add llvm-tools
+RUN --mount=type=cache,id=av1-rs-target-bench,sharing=locked,target=/src/target \
+    --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked \
+    sh tests/parity/fetch.sh tests/parity/corpus.txt /data \
+    && sh tests/parity/profile.sh prep /pgo-c \
+    && find src examples tests -name '*.rs' -exec touch {} + \
+    && rm -rf /pgo && RUSTFLAGS="-Cprofile-generate=/pgo" \
+       cargo build --locked --release --example oracle --target-dir target/pgo-gen \
+    && for c in /pgo-c/*; do for t in 1 4; do target/pgo-gen/release/examples/oracle --null --threads $t $c /pgo-o >/dev/null 2>&1 || true; done; done \
+    && "$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-profdata" merge -o /pgo.profdata /pgo \
+    && RUSTFLAGS="-Cprofile-use=/pgo.profdata" \
+       cargo build --locked --release --example oracle --target-dir target/pgo-use \
+    && cp target/pgo-use/release/examples/oracle /usr/local/bin/av1-oracle-pgo \
+    && rm -rf /pgo /pgo-c /pgo-o /pgo.profdata
+
 # Benchmark: dav1d, aomdec and av1-rs on the bench classes, in one container, so the ratio
 # compares the same machine. Information only (no speed bar). BENCH_RUN changes per run, so a
 # cache hit of the same source does not reuse an old timing.
-FROM bench-bin AS bench
+FROM bench-pgo AS bench
 ARG BENCH_RUN=0
 RUN --mount=type=cache,id=av1-rs-data,target=/data,sharing=locked \
     echo "run $BENCH_RUN" && sh tests/parity/fetch.sh tests/parity/corpus.txt /data && mkdir -p /report && { sh tests/parity/bench.sh /report; echo $? > /report/status; } && rm -rf /work

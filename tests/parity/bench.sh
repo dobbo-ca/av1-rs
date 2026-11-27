@@ -90,6 +90,24 @@ ab() {
   echo "| all | $sb | $st | $(permille $st $sb) |"
 }
 
+# pgo <threads>: the PGO build of this commit (av1-oracle-pgo, Dockerfile bench-pgo) against its
+# default build, the two runs of each round one after the other, best of 7 rounds.
+pgo() {
+  echo "| class | default ms | pgo ms | pgo / default |"
+  echo "|---|---|---|---|"
+  sb=0 st=0
+  for c in $CLASSES; do
+    b= t=
+    for _ in 1 2 3 4 5 6 7; do
+      x=$(ms rs av1-oracle $1 $c); { [ -z "$b" ] || [ "$x" -lt "$b" ]; } && b=$x
+      x=$(ms rs av1-oracle-pgo $1 $c); { [ -z "$t" ] || [ "$x" -lt "$t" ]; } && t=$x
+    done
+    sb=$((sb + b)) st=$((st + t))
+    echo "| $c | $b | $t | $(permille $t $b) |"
+  done
+  echo "| all | $sb | $st | $(permille $st $sb) |"
+}
+
 # tiers: av1-rs with each SIMD tier forced (AV1_SIMD), one thread; which tier wins per class.
 tiers() {
   echo "| class | scalar ms | avx2 ms | avx512 ms (best) | avx2 / scalar | avx512 / avx2 |"
@@ -134,6 +152,18 @@ neon() {
     echo "default threads ($NT):"
     echo
     ab $NT
+    echo
+  fi
+  if command -v av1-oracle-pgo >/dev/null; then
+    echo "### PGO: this commit built with -Cprofile-use (trained on these classes) against its default build (best of 7 rounds)"
+    echo
+    echo "1 thread:"
+    echo
+    pgo 1
+    echo
+    echo "default threads ($NT):"
+    echo
+    pgo $NT
     echo
   fi
   if [ "$ARCH" = aarch64 ]; then
