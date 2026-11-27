@@ -46,6 +46,13 @@ for c in all $CLASSES; do
       # on its own, instead of folded into its caller (the absolute times are higher).
       $PERF record -q --all-user -F 1999 -o $W/noinline.data -- sh -c "for i in 1 2 3; do av1-oracle-noinline --null --threads 1 $d $W/o; done" >/dev/null 2>&1
       $PERF report -i $W/noinline.data --stdio --no-children --sort symbol --percent-limit 0.1 -g none > "$REP/all.noinline.symbol.txt" 2>/dev/null
+      # The instructions of the hottest functions of the inlined build, with their share of the
+      # samples (all.annotate.<n>.txt): the top 6 symbols of all.symbol.txt.
+      n=0
+      grep -v '^#' "$REP/all.symbol.txt" | sed -n 's/.*\[\.\] \(.*[^ ]\) *- *- *$/\1/p' | head -n 6 | while IFS= read -r s; do
+        n=$((n + 1))
+        $PERF annotate -i $W/$c.data --stdio --no-source -s "$s" > "$REP/all.annotate.$n.txt" 2>/dev/null
+      done
       {
         echo "### all, inlining off"
         echo
