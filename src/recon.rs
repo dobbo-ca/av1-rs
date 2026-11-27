@@ -31,11 +31,13 @@ pub(crate) struct ReconParams {
 }
 
 /// Working buffers of [`reconstruct`], kept by the tile decoder so that no block zeroes them
-/// (every entry is written before it is read).
+/// whole.
 #[derive(Debug)]
 pub(crate) struct ItxScratch {
-    /// `Dequant` of the coded region, layout `transform::DQ_STRIDE`.
-    dq: [i32; DQ_LEN],
+    /// `Dequant` of the coded region, layout `transform::DQ_STRIDE`. All zero between blocks:
+    /// [`transform_dq`] clears the region it used, and the coefficient reader writes only the
+    /// nonzero coefficients of the next block.
+    pub(crate) dq: [i32; DQ_LEN],
     /// The row pass output.
     mid: [i32; MID_LEN],
     /// The chroma-from-luma AC values of one block (`predict_cfl`), not cleared between uses.
@@ -120,34 +122,114 @@ pub(crate) fn reconstruct_region(
     {
         return;
     }
+    let Some(d) = Dequant::new(p) else {
+        return;
+    };
+    for i in 0..rows {
+        for j in 0..cols {
+            scratch.dq[j * DQ_STRIDE + i] = d.coef(quant[i * tw + j], i * tw + j);
+        }
+    }
+    transform_dq(px, stride, x, y, p, (rows, cols), scratch, simd);
+}
+
+/// The dequantization of spec 7.12.3 for one transform block: `Dequant[ i ][ j ]` from
+/// `Quant[ i * tw + j ]`, with `get_dc_quant`, `get_ac_quant`, the quantizer matrix and the
+/// `dqDenom` shift of [`ReconParams`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Dequant {
+    dc_q: i64,
+    ac_q: i64,
+    /// The quantizer matrix of the block from its first entry, when it applies.
+    qm: Option<&'static [u8]>,
+    dq_shift: u32,
+    lim: i64,
+}
+
+impl Dequant {
+    /// `None` when `p` breaks the rules of [`reconstruct`] (`tx_sz`, `tx_type`, `qm_level`).
+    pub(crate) fn new(p: &ReconParams) -> Option<Dequant> {
+        let &qm_offset = QM_OFFSET.get(p.tx_sz)?;
+        if p.tx_type >= 16 || p.qm_level > 15 || !(8..=12).contains(&p.bit_depth) {
+            return None;
+        }
+        let dq_shift: u32 = match p.tx_sz {
+            3 | 9 | 10 | 17 | 18 => 1, // TX_32X32, TX_16X32, TX_32X16, TX_16X64, TX_64X16
+            4 | 11 | 12 => 2,          // TX_64X64, TX_32X64, TX_64X32
+            _ => 0,
+        };
+        let qm = if p.qm_level < 15 && p.tx_type < IDTX {
+            Some(QUANTIZER_MATRIX[p.qm_level.min(14)][usize::from(p.plane > 0)].get(qm_offset..)?)
+        } else {
+            None
+        };
+        Some(Dequant {
+            dc_q: i64::from(p.dc_q),
+            ac_q: i64::from(p.ac_q),
+            qm,
+            dq_shift,
+            lim: 1i64 << (7 + p.bit_depth),
+        })
+    }
+
+    /// `Dequant[ i ][ j ]` for `Quant[ pos ] = quant`, `pos = i * tw + j` (`tw = Min( 32, w )`).
+    #[inline(always)]
+    pub(crate) fn coef(&self, quant: i32, pos: usize) -> i32 {
+        let q = if pos == 0 { self.dc_q } else { self.ac_q };
+        let q2 = match self.qm {
+            // Every position of the block lies in its matrix; 32 (a flat weight) is not reached.
+            Some(qm) => (q * i64::from(qm.get(pos).copied().unwrap_or(32)) + 16) >> 5,
+            None => q,
+        };
+        let dq = i64::from(quant) * q2;
+        let mag = (dq.unsigned_abs() & 0xFF_FFFF) as i64 >> self.dq_shift;
+        let dq2 = if dq < 0 { -mag } else { mag };
+        dq2.clamp(-self.lim, self.lim - 1) as i32
+    }
+}
+
+/// The inverse transform and the sample update of [`reconstruct_region`] on the `Dequant`
+/// values already in `scratch` (the coded region `rows` x `cols`, layout `DQ_STRIDE`; every
+/// other entry is 0). Sets that region of `scratch` back to 0 on every path, so the entries
+/// outside the next block's nonzero coefficients are 0 when its `Dequant` values are written.
+pub(crate) fn transform_dq(
+    px: &mut [u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    p: &ReconParams,
+    (rows, cols): (usize, usize),
+    scratch: &mut ItxScratch,
+    simd: Simd,
+) {
+    transform_dq_kept(px, stride, x, y, p, (rows, cols), scratch, simd);
+    for j in 0..cols.min(DQ_LEN / DQ_STRIDE) {
+        scratch.dq[j * DQ_STRIDE..j * DQ_STRIDE + rows.min(DQ_STRIDE)].fill(0);
+    }
+}
+
+/// [`transform_dq`] without the clearing.
+fn transform_dq_kept(
+    px: &mut [u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    p: &ReconParams,
+    (rows, cols): (usize, usize),
+    scratch: &mut ItxScratch,
+    simd: Simd,
+) {
+    let (Some(&log2_w), Some(&log2_h)) = (TX_WIDTH_LOG2.get(p.tx_sz), TX_HEIGHT_LOG2.get(p.tx_sz))
+    else {
+        return;
+    };
+    let (w, h) = (1usize << log2_w, 1usize << log2_h);
+    if p.tx_type >= 16 || p.qm_level > 15 || (y + h - 1) * stride + x + w > px.len() {
+        return;
+    }
     let Some(plan) = Plan::new(p.tx_sz, p.tx_type, p.lossless, p.bit_depth, rows, cols) else {
         return;
     };
-
-    let dq_shift: u32 = match p.tx_sz {
-        3 | 9 | 10 | 17 | 18 => 1, // TX_32X32, TX_16X32, TX_32X16, TX_16X64, TX_64X16
-        4 | 11 | 12 => 2,          // TX_64X64, TX_32X64, TX_64X32
-        _ => 0,
-    };
-    let use_qm = p.qm_level < 15 && p.tx_type < IDTX;
-    let qm = &QUANTIZER_MATRIX[p.qm_level.min(14)][usize::from(p.plane > 0)];
-    let qm_offset = QM_OFFSET[p.tx_sz];
-    let lim = 1i64 << (7 + p.bit_depth);
-
-    for i in 0..rows {
-        for j in 0..cols {
-            let q = if i == 0 && j == 0 { p.dc_q } else { p.ac_q };
-            let q2 = if use_qm {
-                (i64::from(q) * i64::from(qm[qm_offset + i * tw + j]) + 16) >> 5
-            } else {
-                i64::from(q)
-            };
-            let dq = i64::from(quant[i * tw + j]) * q2;
-            let mag = (dq.unsigned_abs() & 0xFF_FFFF) as i64 >> dq_shift;
-            let dq2 = if dq < 0 { -mag } else { mag };
-            scratch.dq[j * DQ_STRIDE + i] = dq2.clamp(-lim, lim - 1) as i32;
-        }
-    }
 
     let blk = &mut px[y * stride + x..];
     if rows == 1 && cols == 1 && p.tx_type == DCT_DCT && !p.lossless {
@@ -383,6 +465,11 @@ mod tests {
                     simd::best(),
                 );
                 assert_eq!(a, b, "tx_sz {tx_sz} type {tx_type}");
+                // The coefficient reader writes only the nonzero `Dequant` values.
+                assert!(
+                    scratch.dq.iter().all(|&v| v == 0),
+                    "tx_sz {tx_sz} type {tx_type}"
+                );
             }
         }
     }
