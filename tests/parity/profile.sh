@@ -4,7 +4,9 @@
 #   run:  where av1-oracle-prof (debug line tables, frame pointers) spends its time with one
 #         thread, per class and over all classes: perf when the container may use it, else
 #         callgrind. Reports: <class>.srcfile.txt (self time by source file),
-#         <class>.symbol.txt, all.srcline.txt, all.memcallers.txt (callers of mem*), summary.md.
+#         <class>.symbol.txt, all.srcline.txt, all.memcallers.txt (callers of mem*),
+#         all.annotate.<n>.txt and all.noinline.annotate.<n>.txt (instructions of the hottest
+#         functions), summary.md.
 set -u
 W=/work
 B=/bench
@@ -46,6 +48,20 @@ for c in all $CLASSES; do
       # on its own, instead of folded into its caller (the absolute times are higher).
       $PERF record -q --all-user -F 1999 -o $W/noinline.data -- sh -c "for i in 1 2 3; do av1-oracle-noinline --null --threads 1 $d $W/o; done" >/dev/null 2>&1
       $PERF report -i $W/noinline.data --stdio --no-children --sort symbol --percent-limit 0.1 -g none > "$REP/all.noinline.symbol.txt" 2>/dev/null
+      # The instructions of the hottest functions, with their share of the samples: the top 6
+      # symbols of the inlined build (all.annotate.<n>.txt) and the top 10 of the build with
+      # inlining off, interleaved with the source lines (all.noinline.annotate.<n>.txt).
+      top_syms() { grep -v '^#' "$1" | sed -n 's/.*\[\.\] //p' | sed 's/ *- *- *$//; s/ *$//' | head -n "$2"; }
+      n=0
+      top_syms "$REP/all.symbol.txt" 6 | while IFS= read -r s; do
+        n=$((n + 1))
+        { echo "# $s"; $PERF annotate -i $W/$c.data --stdio --no-source -s "$s"; } > "$REP/all.annotate.$n.txt" 2>&1
+      done
+      n=0
+      top_syms "$REP/all.noinline.symbol.txt" 10 | while IFS= read -r s; do
+        n=$((n + 1))
+        { echo "# $s"; $PERF annotate -i $W/noinline.data --stdio -s "$s"; } > "$REP/all.noinline.annotate.$n.txt" 2>&1
+      done
       {
         echo "### all, inlining off"
         echo

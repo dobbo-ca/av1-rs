@@ -294,6 +294,109 @@ coefficient and symbol decoding in `coeffs` and `read_levels`; the symbol decode
 here (dav1d's branchless search, inline vector adaptation, the non-inverted window) did not
 make it faster.
 
+## Speed work, round 3 (codegen and bounds checks)
+
+Start: main 5b0f0d1, bench run 46017403904. av1-rs / dav1d, all classes: x86_64 AMD EPYC 9V45
+941 / 492 ms with 1 thread (1.91x), 573 / 406 ms with 4 threads (1.41x); aarch64 Neoverse-N2
+1153 / 754 ms (1.53x) and 567 / 501 ms (1.13x).
+
+### Where the cycles of the hot functions go
+
+Profile run 46032212917 (main 5b0f0d1 plus `perf annotate` of the 10 hottest functions of the
+build with inlining off, `all.noinline.annotate.<n>.txt`; AMD EPYC 7763, no AVX-512, one
+thread). Self time: `coeffs` 34.4%, `transform_block` 12.8%, `itx::avx2::inverse_transform_add`
+6.5%, `read_levels` br closure 4.9%, `cdef::avx2::filter` 3.9%, `memmove` 3.5%, `decode_block`
+3.3%, `lf::Lines::line` 2.5%, `intra_frame_mode_info` 2.4%. dav1d on the same frames:
+`decode_coefs` 16.2%, the `msac_decode_symbol_adapt4` entry and its renorm labels 22.8%,
+`decode_b` 3.9%, `recon_b_intra` 4.4%.
+
+The instructions of `coeffs` (with `read_levels`, `read_cdf`, `norm` and `refill` inlined), by
+kind, as a share of its samples:
+
+| kind | share | what it is |
+|---|---|---|
+| ALU (the `cur` products, the adaptation, the context sums) | 50% | the work itself |
+| loads and stores of the stack frame | 10% | spilled locals and the reload of the `SymbolDecoder` pointer |
+| other loads and stores | 10% | levels, CDFs, and `dif`, `rng`, `cnt` of the `SymbolDecoder` (offsets 0x168 to 0x178 from its pointer) |
+| compares and branches | 19% | the search, the loop, the bounds checks |
+| shifts | 9% | `shl %cl` of the renorm (`dif`, `rng`) and the class shifts of `row`, `col` |
+| `bsr` + `xor $0x1f` (`leading_zeros`) | 0.5% | the renorm count; one more instruction than `lzcnt` |
+
+- Decoder state: every symbol loads `dif` and `rng` from memory, and stores `dif`,
+  `rng` and `cnt` back, and reloads `disable_cdf_update`, because the br closure is a call
+  (`read_levels::<0>::{closure#0}`, 4.9% on its own) that takes the decoder by reference. The
+  store of `dif` and the load of the next symbol are on the loop-carried chain.
+- Bounds checks: per coefficient, five compares against the levels length (`cmp $0x510`, one for
+  each neighbour), one against the 42 base CDFs and one for the level store. They are well
+  predicted and off the dependency chain: about 3% of the `coeffs` samples, so about 1% of the
+  run. No panic path is hot.
+- The hottest single instructions follow the load of the CDF value whose address comes from the
+  context (neighbours, sum, context, CDF load, `cur`, compare): the load latency, not the check.
+- Renorm: `leading_zeros` compiles to `bsr` + `xor` and the shifts by a variable count to
+  `shl %cl` (three micro-ops on Intel, one with BMI2 `shlx`) in the baseline x86-64 build.
+- `transform_block`: 22% of its samples are stack loads and stores; the rest is the scalar parts
+  of the intra prediction (edge preparation, the directional interpolation `edge[ix(base)]`,
+  filter intra, `cfl_ac`), spread over many lines, with no single hot spot.
+
+### The v4 build against the default build
+
+Bench run 46017403904 (main 5b0f0d1, AMD EPYC 9V45 with AVX-512), 1 thread, default / v4
+(`-C target-cpu=x86-64-v4`, fat LTO, panic=abort): q8 19 / 19 ms, q10 45 / 45, allintra
+392 / 385, size 13 / 18, grain 8 / 9, avif8 56 / 55, avifhi 140 / 137, tiles8 132 / 130,
+tiles10 136 / 133, all 941 / 931 ms (98.9%). The coefficient-heavy classes (allintra, avif,
+tiles) gain 1.5 to 2.2%; the v4 build is slower on the small `size` and `grain` classes. On
+Intel hosts the v4 build gains more, default / v4, 1 thread, all classes: 1108 / 1047 ms
+(94.5%) on a Xeon 6973P-C (run 46035612706, the build of change A below) and 1064 / 1035 ms
+(97.3%) on a Xeon 6975P-C (run 46040173047, the build of change C below, whose default build
+already has the v3 twins), where `shl %cl` costs more micro-ops than on AMD. The v4 build
+changes every function (and adds fat LTO and panic=abort), so these are upper bounds for a v3
+build of the tile decode loop only.
+
+### Changes tried
+
+Each change was measured with the A/B table (bench input `base` = main 5b0f0d1, full SHA)
+against the change before it, one thread, all classes; the rule was the same as in the round
+before (about 1% or more on x86_64, or faster on both runners). The A/B runs of A and B ran from
+their branches without a PR (to keep within two CI runs at a time); C had PR #77.
+
+| change | branch, head | A/B run | x86_64 CPU | x86_64 1 thread | aarch64 1 thread | result |
+|---|---|---|---|---|---|---|
+| A: the `SymbolDecoder` as a local copy in `read_levels` and the sign pass, the br reads inlined (no call, so `dif`, `rng`, `cnt` can stay in registers) | `speed3-sdloc-2b8e`, 6ba88ee | 46035612706 | Xeon 6973P-C | 1095 / 1095 ms, 100.0% | 1129 / 1138 ms, 100.7% | dropped |
+| B: levels and `Quant[ ]` indexed masked (levels buffer of 2048 bytes, a power of two), no bounds checks on them | `speed3-bchk-9e1a`, 5fd4bf9 | 46037506121 | Xeon 6975P-C | 1072 / 1090 ms, 101.6% | 1160 / 1162 ms, 100.1% | dropped |
+| C: `coeffs` and `intra_frame_mode_info` built a second time for x86-64-v3 (`avx2,bmi1,bmi2,lzcnt,popcnt,fma`), chosen by the tier (`simd::codegen`) | `speed3-v3-5f1c`, b34db13 | 46038594929 | EPYC 7763 | 1459 / 1455 ms, 99.7% | 1148 / 1147 ms, 99.9% | dropped |
+| C again, a second x86_64 host | same | 46040173047 | Xeon 6975P-C | 1073 / 1066 ms, 99.3% | 1140 / 1139 ms, 99.9% | dropped |
+
+- A: the copy did not make the loop faster. Either LLVM keeps the window in memory anyway
+  (the `refill` path), or the store and load forward fast enough that they are not the limit.
+- B: slower. The `and` of the mask sits on the context path (neighbour loads, context, CDF
+  load), which is the dependency chain of the loop, while the bounds checks it replaces are
+  predicted branches off that chain. So the bounds checks cost less than a mask.
+- C: below 1% on both x86_64 hosts. The "faster on both runners" part of the rule does not
+  apply: C changes no aarch64 code (`simd::codegen` runs the baseline build there), so the
+  aarch64 99.9% (1 ms) is noise, not a gain.
+
+The work stopped after these three changes in a row below 1% on x86_64. The decoder did not
+change in this round, so the ratios to dav1d stay where they were; they move with the host.
+Bench run 46041900099 (main after PR #78), av1-rs / dav1d, all classes: x86_64 Intel Xeon
+6975P-C 1051 / 556 ms (1.89x) with 1 thread, 633 / 424 ms (1.49x) with 4 threads; aarch64
+Neoverse-N2 1178 / 749 ms (1.57x) and 594 / 505 ms (1.18x). The goal of 1.5x at 1 thread on
+x86_64 is not met.
+
+PGO (bench column from PR #78, CI only; the crate does not change; trained on the bench
+classes, so this is the best case), default / PGO build, all classes, bench run 46035159115
+(the percent is PGO / default): x86_64 AMD EPYC 7763 1497 / 1493 ms (99.7%) with 1 thread,
+936 / 921 ms (98.3%) with 4 threads; aarch64 Neoverse-N2 1166 / 1148 ms (98.4%) and
+619 / 614 ms (99.1%). Bench run 46041900099 (main after PR #78): x86_64 Intel Xeon 6975P-C
+1050 / 1023 ms (97.4%) with 1 thread, 635 / 613 ms (96.5%) with 4 threads; aarch64 1143 / 1124
+ms (98.3%) and 596 / 594 ms (99.6%). A user who builds
+with PGO gets 0 to 3% (most on Intel x86_64, least on AMD); the small `size` and `grain` classes get slower (up to 26% on `size` on
+aarch64), tiles8 and tiles10 get slower on the EPYC.
+
+Unsafe (owner rule of this round: allowed in the entropy and coefficient code only where a
+bounds check costs time and safe Rust cannot remove it): not tried. The bounds checks of the
+coefficient loop take about 3% of the `coeffs` samples (about 1% of the run) and sit off the
+dependency chain, so unchecked indexing can give at most about 1%; the stop rule came first.
+
 ## Earlier runs
 
 2026-11-23, main 49f2864 (old bench, 24 streams, 100 frames, `.yuv` written by av1-rs only):
