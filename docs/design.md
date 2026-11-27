@@ -62,7 +62,7 @@ superres.rs   upscaling (7.16)
 lr.rs         loop restoration (7.17): Wiener, self-guided
 grain.rs      film grain synthesis (7.18.3), applied to a copy at output when enabled
 frame.rs      FrameState: the spec's frame-level arrays; Plane buffers; tile-sized states
-parallel.rs   run_parallel: the one-scope work scheduler (tiles of a frame, tiles of a grid)
+parallel.rs   run_each, run_parallel, with_team: the one-scope work schedulers
 decoder.rs    the frame decode process (7.x "decode frame wrapup"), reference slots (7.20/7.21),
               show_existing_frame, output (7.18), operating point / layer selection
 ```

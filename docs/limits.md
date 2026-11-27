@@ -48,7 +48,8 @@ from when they are built until the
 temporal unit returns; `decode` keeps every frame it collects charged (for the capacity of its
 planes, which may be pooled buffers larger than the samples, plus a fixed per-frame overhead for
 the `Frame`, its plane list and allocator chunks) until it returns. AVIF: one
-ledger per `decode_avif` call covers every item decoder, the grid canvas, the item copy, every
+ledger per `decode_avif` call covers every item decoder, the grid canvas and its tile id list
+(4 bytes a tile; the tiles are scheduled with no per-tile state), the item copy, every
 decoded tile until it is pasted, the transforms (output and scratch, booked before they run) and
 the primary image (docs/threading.md); it gets three quarters of `max_alloc`, and the `isobmff`
 parse and item reads an eighth each, so the three sum to `max_alloc`, not twice it

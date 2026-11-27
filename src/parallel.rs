@@ -1,6 +1,7 @@
 //! The work schedulers of one call, both from one `std::thread::scope` and within
-//! `max_threads` threads, the calling thread included: [`run_parallel`] runs `n` independent
-//! items (the AVIF grid, `avif.rs`); [`with_team`] keeps a team of threads for a sequence of
+//! `max_threads` threads, the calling thread included: [`run_each`] runs `n` independent
+//! items (the AVIF grid, `avif.rs`, and the film grain bands, `grain.rs`), [`run_parallel`] the
+//! same with a result per item (the frames of a batch, `decoder.rs`); [`with_team`] keeps a team of threads for a sequence of
 //! stages, each a set of independent items (the tiles and the in-loop filters of a frame,
 //! `decoder.rs`).
 
@@ -8,41 +9,44 @@ use crate::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 
-/// Runs `f( 0 )` .. `f( n - 1 )` on `min( max_threads, n )` threads (0 counts as 1) and returns
-/// the results in item order. With one thread (`max_threads == 1` or `n <= 1`) nothing is
-/// spawned and the items run in order on the calling thread.
+/// Runs `f( 0 )` .. `f( n - 1 )` on `min( max_threads, n )` threads (0 counts as 1). With one
+/// thread (`max_threads == 1` or `n <= 1`) nothing is spawned and the items run in order on the
+/// calling thread.
 ///
 /// Items are taken in increasing order from a shared counter. After a failure at index `k` no item
 /// above `k` is started, but every item below it still runs, so the error returned is always the
 /// one of the lowest failing index, whatever the timing.
 ///
+/// Only that error is kept, so the heap used does not grow with `n` (an AVIF grid can list
+/// 65536 tiles, all references to one small item) and does not depend on the thread count.
+///
 /// # Errors
 /// The error of the lowest failing item.
-pub(crate) fn run_parallel<T: Send>(
+pub(crate) fn run_each(
     n: usize,
     max_threads: usize,
-    f: impl Fn(usize) -> Result<T, Error> + Sync,
-) -> Result<Vec<T>, Error> {
+    f: impl Fn(usize) -> Result<(), Error> + Sync,
+) -> Result<(), Error> {
     let workers = max_threads.max(1).min(n);
     if workers <= 1 {
-        return (0..n).map(&f).collect();
+        return (0..n).try_for_each(&f);
     }
     let next = AtomicUsize::new(0);
-    // The lowest index that failed so far.
+    // The lowest index that failed so far, and its error.
     let failed = AtomicUsize::new(usize::MAX);
-    let slots: Vec<Mutex<Option<Result<T, Error>>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let first: Mutex<Option<(usize, Error)>> = Mutex::new(None);
     let work = || {
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= n || i > failed.load(Ordering::Relaxed) {
                 break;
             }
-            let r = f(i);
-            if r.is_err() {
+            if let Err(e) = f(i) {
                 failed.fetch_min(i, Ordering::Relaxed);
-            }
-            if let Some(slot) = slots.get(i) {
-                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+                let mut g = first.lock().unwrap_or_else(|e| e.into_inner());
+                if g.as_ref().is_none_or(|&(j, _)| i < j) {
+                    *g = Some((i, e));
+                }
             }
         }
     };
@@ -53,15 +57,41 @@ pub(crate) fn run_parallel<T: Send>(
         }
         work();
     });
-    let mut out = Vec::with_capacity(n);
-    for slot in slots {
-        match slot.into_inner().unwrap_or_else(|e| e.into_inner()) {
-            Some(Ok(v)) => out.push(v),
-            Some(Err(e)) => return Err(e),
-            None => return Err(Error::Invalid("work item skipped")),
-        }
+    match first.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        Some((_, e)) => Err(e),
+        None => Ok(()),
     }
-    Ok(out)
+}
+
+/// [`run_each`] that returns the results in item order. It keeps one slot per item, so it is
+/// for a short list of items: the frames of one batch, at most `max_threads` (`decoder.rs`).
+///
+/// # Errors
+/// The error of the lowest failing item.
+pub(crate) fn run_parallel<T: Send>(
+    n: usize,
+    max_threads: usize,
+    f: impl Fn(usize) -> Result<T, Error> + Sync,
+) -> Result<Vec<T>, Error> {
+    if max_threads.max(1).min(n) <= 1 {
+        return (0..n).map(&f).collect();
+    }
+    let slots: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    run_each(n, max_threads, |i| {
+        let v = f(i)?;
+        if let Some(slot) = slots.get(i) {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(v);
+        }
+        Ok(())
+    })?;
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .ok_or(Error::Invalid("work item skipped"))
+        })
+        .collect()
 }
 
 /// The threads of one call, shared by its stages (docs/threading.md): made by [`with_team`],
@@ -323,6 +353,28 @@ mod tests {
                 _ => Ok(i),
             });
             assert_eq!(r.unwrap_err(), Error::Invalid("two"));
+            let r = run_each(8, max_threads, |i| match i {
+                2 => {
+                    std::thread::sleep(Duration::from_millis(30));
+                    Err(Error::Invalid("two"))
+                }
+                5 => Err(Error::Truncated),
+                _ => Ok(()),
+            });
+            assert_eq!(r.unwrap_err(), Error::Invalid("two"));
+        }
+    }
+
+    #[test]
+    fn run_each_runs_every_item_once() {
+        for max_threads in [1, 2, 3, 8] {
+            let seen: Vec<AtomicUsize> = (0..50).map(|_| AtomicUsize::new(0)).collect();
+            run_each(50, max_threads, |i| {
+                seen[i].fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+            assert!(seen.iter().all(|s| s.load(Ordering::SeqCst) == 1));
         }
     }
 
