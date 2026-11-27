@@ -307,7 +307,7 @@ build with inlining off, `all.noinline.annotate.<n>.txt`; AMD EPYC 7763, no AVX-
 thread). Self time: `coeffs` 34.4%, `transform_block` 12.8%, `itx::avx2::inverse_transform_add`
 6.5%, `read_levels` br closure 4.9%, `cdef::avx2::filter` 3.9%, `memmove` 3.5%, `decode_block`
 3.3%, `lf::Lines::line` 2.5%, `intra_frame_mode_info` 2.4%. dav1d on the same frames:
-`decode_coefs` 16.2%, the `msac_decode_symbol_adapt4` entry and its renorm labels 21.4%,
+`decode_coefs` 16.2%, the `msac_decode_symbol_adapt4` entry and its renorm labels 22.8%,
 `decode_b` 3.9%, `recon_b_intra` 4.4%.
 
 The instructions of `coeffs` (with `read_levels`, `read_cdf`, `norm` and `refill` inlined), by
@@ -344,11 +344,13 @@ Bench run 46017403904 (main 5b0f0d1, AMD EPYC 9V45 with AVX-512), 1 thread, defa
 (`-C target-cpu=x86-64-v4`, fat LTO, panic=abort): q8 19 / 19 ms, q10 45 / 45, allintra
 392 / 385, size 13 / 18, grain 8 / 9, avif8 56 / 55, avifhi 140 / 137, tiles8 132 / 130,
 tiles10 136 / 133, all 941 / 931 ms (98.9%). The coefficient-heavy classes (allintra, avif,
-tiles) gain 1 to 2%; the v4 build is slower on the small `size` class. On Intel hosts the v4
-build gains more: 1047 / 1108 ms (94.5%) on a Xeon 6973P-C (run 46035612706) and 1035 / 1064 ms
-(97.3%) on a Xeon 6975P-C (run 46040173047), where `shl %cl` costs more micro-ops than on AMD.
-The v4 build changes every function (and adds fat LTO and panic=abort), so these are upper
-bounds for a v3 build of the tile decode loop only.
+tiles) gain 1.5 to 2.2%; the v4 build is slower on the small `size` and `grain` classes. On
+Intel hosts the v4 build gains more, default / v4, 1 thread, all classes: 1108 / 1047 ms
+(94.5%) on a Xeon 6973P-C (run 46035612706, the build of change A below) and 1064 / 1035 ms
+(97.3%) on a Xeon 6975P-C (run 46040173047, the build of change C below, whose default build
+already has the v3 twins), where `shl %cl` costs more micro-ops than on AMD. The v4 build
+changes every function (and adds fat LTO and panic=abort), so these are upper bounds for a v3
+build of the tile decode loop only.
 
 ### Changes tried
 
@@ -369,14 +371,17 @@ their branches without a PR (to keep within two CI runs at a time); C had PR #77
 - B: slower. The `and` of the mask sits on the context path (neighbour loads, context, CDF
   load), which is the dependency chain of the loop, while the bounds checks it replaces are
   predicted branches off that chain. So the bounds checks cost less than a mask.
-- C: below 1% on both x86_64 hosts. The aarch64 code does not change (its 99.9% is noise).
+- C: below 1% on both x86_64 hosts. The "faster on both runners" part of the rule does not
+  apply: C changes no aarch64 code (`simd::codegen` runs the baseline build there), so the
+  aarch64 99.9% (1 ms) is noise, not a gain.
 
 The work stopped after these three changes in a row below 1% on x86_64.
 
 PGO (bench column from PR #78, CI only; the crate does not change; trained on the bench
-classes, so this is the best case), PGO / default build, all classes, bench run 46035159115:
-x86_64 AMD EPYC 7763 1497 / 1493 ms (99.7%) with 1 thread, 936 / 921 ms (98.3%) with 4
-threads; aarch64 Neoverse-N2 1166 / 1148 ms (98.4%) and 619 / 614 ms (99.1%). A user who builds
+classes, so this is the best case), default / PGO build, all classes, bench run 46035159115
+(the percent is PGO / default): x86_64 AMD EPYC 7763 1497 / 1493 ms (99.7%) with 1 thread,
+936 / 921 ms (98.3%) with 4 threads; aarch64 Neoverse-N2 1166 / 1148 ms (98.4%) and
+619 / 614 ms (99.1%). A user who builds
 with PGO gets 0 to 2%; the small `size` and `grain` classes get slower (up to 26% on `size` on
 aarch64), tiles8 and tiles10 get slower on the EPYC.
 
