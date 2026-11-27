@@ -44,8 +44,9 @@ exited guest thread (fuzz runs 45490215220 and 45519136759). Native runs need ne
 
 ## Runs on main
 
-| Date | Commit | max_total_time | Targets | Fuzz hours | Crashes | Runs (probe / decode / avif) |
+| Date | Commit | max_total_time | Targets | Fuzz hours | Crashes | Runs |
 |---|---|---|---|---|---|---|
-| 2026-11-23 | a5cb385 | 900 s | 3 | 0.75 | 0 | 9,965,781 / 7,930 / 4,341 |
+| 2026-11-23 | a5cb385 | 900 s | 3 | 0.75 | 0 | probe 9,965,781 / decode 7,930 / avif 4,341 |
+| 2026-11-26 | 70a9212 | 900 s | 2, x86_64 and arm64 | 1.0 | 0 | simd_cdef 4.6M x86_64 / 4.4M arm64, simd_lf 15.5M x86_64 / 18.7M arm64 (runs 45907052285, 45907055157) |
 
 `decode` and `avif` run whole frames under ASan, so they do few runs per second.
