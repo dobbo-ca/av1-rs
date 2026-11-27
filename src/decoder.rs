@@ -2594,6 +2594,24 @@ mod tests {
         assert!(decoded > 0);
     }
 
+    /// What a frame of several tiles leaves booked (its state, without the pool) is the same at
+    /// every thread count, so a booking after the frame, such as the output planes, fits or is
+    /// refused the same way as at one thread.
+    #[test]
+    fn a_frame_of_tiles_leaves_the_same_booked_for_every_thread_count() {
+        let (serial, one) = run_tiles(1, 1, 64 << 20);
+        let serial = serial.unwrap();
+        let _ = one.evict();
+        for threads in [2, 3, 6] {
+            let (par, ledger) = run_tiles(1, threads, 64 << 20);
+            let par = par.unwrap();
+            let _ = ledger.evict();
+            assert_eq!(ledger.left(), one.left(), "{threads} threads");
+            drop(par);
+        }
+        drop(serial);
+    }
+
     #[test]
     fn tile_threads_stay_within_max_alloc() {
         for max_alloc in [1024, 100 << 10, 120 << 10, 400 << 10, 1 << 20] {
