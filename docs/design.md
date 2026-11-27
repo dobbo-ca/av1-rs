@@ -105,8 +105,8 @@ end update, and no intra frame does. The wrapup (`decoder.rs`) runs `loop_filter
 `CurrFrame` in place, `cdef_alloc` into `CdefFrame`, then, with `use_superres`, `upscale` of
 `CdefFrame` (and of the deblocked `CurrFrame` when `UsesLr`), then `lr_frame`. `LrFrame` is
 allocated exactly `UpscaledWidth` x `FrameHeight` (chroma `(size + ss) >> ss`) and is what the
-reference slots store and the output reads; film grain runs at output on a copy. Intra block
-copy and large scale tile are `Error::Unsupported`.
+reference slots store and the output reads; film grain runs at output on a copy. Large scale
+tile is `Error::Unsupported`; intra block copy is decoded (`intrabc.rs`).
 
 Frames that are not KEY_FRAME or INTRA_ONLY_FRAME stop the decode with `Error::InterFrame`;
 frames decoded before it are returned by the streaming `Decoder`.
