@@ -2,7 +2,7 @@
 
 A pure-Rust AV1 **intra-only** decoder for AVIF stills and AV1 key frames, bit-exact to the AV1
 Bitstream & Decoding Process Specification. Inter frames are refused with `Error::InterFrame`
-(the frames before them are kept). No C code, no `unsafe` outside the SIMD load/store helpers and
+(a `Decoder` keeps the frames before them; `av1::decode` returns only the error). No C code, no `unsafe` outside the SIMD load/store helpers and
 dispatch fns (docs/safety.md), every allocation bounded by `Limits`.
 
 ## Quick start
@@ -42,8 +42,8 @@ What is and is not counted: [docs/limits.md](docs/limits.md).
 `av1::decode_avif` decodes the primary image and its alpha image (grids assembled);
 `av1::decode_avif_item` decodes any image item of a parsed file. `clap`, `irot` and `imir` come
 back raw in `AvifImage::transforms`; `Options { apply_transforms: true, .. }` applies them
-(docs/design.md). Metadata OBUs and the colour configuration are kept raw (`Frame::metadata`,
-`Frame::color`) unless `Options::keep_metadata = false`.
+(docs/design.md). Metadata OBUs are kept raw in `Frame::metadata` unless
+`Options::keep_metadata = false`; the parsed colour configuration is always in `Frame::color`.
 
 ## Docs
 
