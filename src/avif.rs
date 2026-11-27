@@ -898,6 +898,53 @@ mod tests {
         }
     }
 
+    /// A crop with an odd origin on 4:2:0 through the glue (`transform_frame`): the luma is the
+    /// rectangle, the chroma starts at `floor(x / 2), floor(y / 2)` with `ceil(w / 2) x
+    /// ceil(h / 2)` samples, and the frame stays 4:2:0 (the rule of `isobmff::apply_transforms`).
+    #[test]
+    fn odd_crop_keeps_420_and_takes_the_chroma_rectangle() {
+        let mut f = frame(9, 7, 0, 0);
+        for (k, p) in f.planes.iter_mut().enumerate() {
+            let n = (p.width * p.height) as u8;
+            p.data = PlaneData::U8((0..n).map(|i| i + 80 * k as u8).collect());
+        }
+        let c = isobmff::Clap {
+            width_n: 3,
+            width_d: 1,
+            height_n: 3,
+            height_d: 1,
+            horiz_off_n: 0,
+            horiz_off_d: 1,
+            vert_off_n: 1,
+            vert_off_d: 1,
+        };
+        let r = c.crop_rounded(9, 7).unwrap();
+        assert_eq!((r.x % 2, r.y % 2), (1, 1), "the origin is odd: {r:?}");
+        let want: Vec<Vec<u8>> = f
+            .planes
+            .iter()
+            .enumerate()
+            .map(|(k, p)| {
+                let s = if k == 0 { 1 } else { 2 };
+                let (x0, y0) = (r.x / s, r.y / s);
+                let (w, h) = (r.width.div_ceil(s), r.height.div_ceil(s));
+                let v = bytes(p);
+                (y0..y0 + h)
+                    .flat_map(|y| (x0..x0 + w).map(move |x| v[(y * p.width + x) as usize]))
+                    .collect()
+            })
+            .collect();
+        let ledger = led(&Limits::default());
+        ledger.reserve(frame_bytes(&f)).unwrap();
+        let cancel = AtomicBool::new(false);
+        let ts = [Transform::Clap(c)];
+        let out = transform_frame(&ON, &Limits::default(), &ledger, &cancel, &ts, f).unwrap();
+        assert_eq!((out.width, out.height), (r.width, r.height));
+        assert!(out.subsampling_x && out.subsampling_y);
+        let got: Vec<Vec<u8>> = out.planes.iter().map(|p| bytes(p).to_vec()).collect();
+        assert_eq!(got, want);
+    }
+
     // A grid tile comes booked with its metadata: a refused transform gives all of it back, so a
     // refused tile leaves nothing booked for the serial retry.
     #[test]
