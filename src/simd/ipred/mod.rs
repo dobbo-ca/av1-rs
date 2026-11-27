@@ -380,7 +380,9 @@ pub(crate) mod check {
         [8, 10, 12][(next() % 3) as usize]
     }
 
-    /// One `predict_intra` call on every tier, bit-exact with scalar over the whole plane.
+    /// One `predict_intra` call on every tier, bit-exact with scalar over the whole plane, with
+    /// a zeroed and with a garbage edge scratch (the edge build must write every entry the mode
+    /// reads, as the decoder does not clear the scratch between blocks).
     pub(crate) fn intra_case(
         px: &[u16],
         stride: usize,
@@ -390,11 +392,19 @@ pub(crate) mod check {
         p: &IntraParams,
     ) {
         let mut want = px.to_vec();
-        predict::predict_intra_simd(Simd::scalar(), &mut want, stride, x, y, e, p);
+        let mut edges: [Edge; 2] = [[0; EDGE_LEN]; 2];
+        predict::predict_intra_simd(Simd::scalar(), &mut want, stride, x, y, e, p, &mut edges);
         for simd in available() {
-            let mut got = px.to_vec();
-            predict::predict_intra_simd(simd, &mut got, stride, x, y, e, p);
-            assert!(got == want, "{:?} x {x} y {y} {e:?} {p:?}", simd.tier());
+            for fill in [0, -77_777] {
+                let mut got = px.to_vec();
+                let mut edges: [Edge; 2] = [[fill; EDGE_LEN]; 2];
+                predict::predict_intra_simd(simd, &mut got, stride, x, y, e, p, &mut edges);
+                assert!(
+                    got == want,
+                    "{:?} fill {fill} x {x} y {y} {e:?} {p:?}",
+                    simd.tier()
+                );
+            }
         }
     }
 

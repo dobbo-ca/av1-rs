@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use crate::consts::{DCT_DCT, IDTX};
+use crate::predict::{EDGE_LEN, Edge};
 use crate::quant::{QM_OFFSET, QUANTIZER_MATRIX};
 use crate::simd::{self, Simd};
 use crate::tables::{TX_HEIGHT_LOG2, TX_WIDTH_LOG2};
@@ -40,6 +41,9 @@ pub(crate) struct ItxScratch {
     mid: [i32; MID_LEN],
     /// The chroma-from-luma AC values of one block (`predict_cfl`), not cleared between uses.
     pub(crate) ac: [i32; 1024],
+    /// The `AboveRow` and `LeftCol` of one intra prediction (`predict_intra_simd`), not
+    /// cleared between uses.
+    pub(crate) edges: [Edge; 2],
 }
 
 impl ItxScratch {
@@ -48,6 +52,7 @@ impl ItxScratch {
             dq: [0; DQ_LEN],
             mid: [0; MID_LEN],
             ac: [0; 1024],
+            edges: [[0; EDGE_LEN]; 2],
         })
     }
 }
