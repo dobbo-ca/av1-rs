@@ -195,6 +195,11 @@ most one tile state at a time, so the extra memory is at most `workers` tile-siz
 the frame state. That is below the peak of the wrapup (`CurrFrame` + `CdefFrame` + ...) for frames
 with more tiles than threads; a frame that does not fit fails with `AllocLimit`, exactly like one
 that does not fit the wrapup. `max_threads = 1` and single-tile frames allocate nothing extra.
+After a frame whose tiles the team decodes (several tiles, no intra block copy) the whole-frame
+tile decoder buffers (`FrameState::tile_scratch`) are dropped at every thread count, so what
+stays booked for the output and the next frame is the same as at one thread
+(`a_frame_of_tiles_leaves_the_same_booked_for_every_thread_count`). Such a frame decoded
+serially allocates those buffers again for the next frame.
 
 The wrapup allocates its frame buffers in the same order as the serial path. On top, each
 wrapup item holds its private band while it runs, charged to the same ledger: 64 rows of one
@@ -213,7 +218,8 @@ the peak argument above is unchanged. What a call with more than one thread allo
 and its result slots, the wrapup's shared buffer lists, the private band of every wrapup item, and
 per tile the mode-info arrays and tile decoder buffers of its tile-sized state (the bands' sample
 buffers and the tile states' planes come from the pool when it holds one of the size). So only a
-`max_threads = 1` call of the same shape as the previous one allocates nothing (`tests/alloc.rs`).
+`max_threads = 1` call of single-tile frames of the same shape as the previous one allocates
+nothing (`tests/alloc.rs`; docs/limits.md lists what still allocates).
 
 ## Tried and not kept: a rayon pool (2026-11-25)
 

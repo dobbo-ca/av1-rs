@@ -758,7 +758,8 @@ impl Decoder {
     /// lists and the `Vec` itself. The next frames this decoder outputs are built in them, so with
     /// the frame buffers the decoder keeps from one frame to the next (`docs/limits.md`), a
     /// [`Decoder::decode_temporal_unit`] of the same shape as the previous one, with
-    /// `Limits::max_threads` 1, allocates nothing once its frames were recycled.
+    /// `Limits::max_threads` 1, allocates nothing once its frames were recycled, for single-tile
+    /// frames (a frame of several tiles makes its tile decoder buffers again, docs/limits.md).
     ///
     /// The buffers count against `Limits::max_alloc` while the decoder keeps them; a buffer that
     /// does not fit is dropped, and kept buffers are dropped when a later allocation needs their
@@ -1321,6 +1322,9 @@ fn decode_frame(
             let (row, col) = (t.tile_num / tile_cols, t.tile_num % tile_cols);
             decode_tile(&mut fs, &frame_cdf, data, t, row, col, h, seq, cancel)?;
         }
+        if splits(h, tiles) {
+            fs.tile_scratch = None;
+        }
         fs.lr_frame = wrapup(&mut fs, seq, h, cancel)?;
         fs.frame_cdf = Some(frame_cdf);
         return Ok(fs);
@@ -1398,6 +1402,16 @@ fn decode_job(
     )
 }
 
+/// True when a threaded decode runs the tiles of the frame on the team, each into a tile-sized
+/// state freed after it is merged: several tiles and no intra block copy. Such a frame keeps no
+/// whole-frame tile scratch (`FrameState::tile_scratch`) after it at any thread count, so what
+/// stays booked after the frame, and whether a later booking fits, does not depend on
+/// `max_threads`. A frame of one tile keeps it at every thread count (a decoder reused for the
+/// next unit allocates nothing for it).
+fn splits(h: &FrameHeader, tiles: &[TileRange]) -> bool {
+    !h.allow_intrabc && tiles.len() > 1
+}
+
 /// The threads of a frame decode: `max_threads` (0 counts as 1), but no more than its largest
 /// stage has items (the tiles, or the 64-row bands of all planes).
 fn team_size(max_threads: usize, fs: &FrameState, tiles: usize) -> usize {
@@ -1471,7 +1485,7 @@ impl Wrap<'_> {
     /// private bands of the items come on top). Returns `LrFrame`.
     fn lead(&self, team: &Team<'_, Job>) -> Result<Vec<WorkPlane>, Error> {
         let (h, seq, cancel) = (self.h, self.seq, self.cancel);
-        if h.allow_intrabc || self.tiles.len() <= 1 {
+        if !splits(h, self.tiles) {
             let mut g = lock(&self.tiles_fs);
             let fs = g
                 .as_mut()
@@ -1487,6 +1501,10 @@ impl Wrap<'_> {
         let mut fs = lock(&self.tiles_fs)
             .take()
             .ok_or(Error::Invalid("frame decode without a frame state"))?;
+        if splits(h, self.tiles) {
+            // A scratch left by an earlier frame, as the serial path drops it.
+            fs.tile_scratch = None;
+        }
         *write_lock(&self.curr) = std::mem::take(&mut fs.curr_frame);
         let fs = self.fs.get_or_init(|| fs);
         let bands = fs.mi_rows.div_ceil(16);
@@ -2592,6 +2610,24 @@ mod tests {
         }
         // Most random tile data is valid syntax; this guards against a test that compares nothing.
         assert!(decoded > 0);
+    }
+
+    /// What a frame of several tiles leaves booked (its state, without the pool) is the same at
+    /// every thread count, so a booking after the frame, such as the output planes, fits or is
+    /// refused the same way as at one thread.
+    #[test]
+    fn a_frame_of_tiles_leaves_the_same_booked_for_every_thread_count() {
+        let (serial, one) = run_tiles(1, 1, 64 << 20);
+        let serial = serial.unwrap();
+        let _ = one.evict();
+        for threads in [2, 3, 6] {
+            let (par, ledger) = run_tiles(1, threads, 64 << 20);
+            let par = par.unwrap();
+            let _ = ledger.evict();
+            assert_eq!(ledger.left(), one.left(), "{threads} threads");
+            drop(par);
+        }
+        drop(serial);
     }
 
     #[test]

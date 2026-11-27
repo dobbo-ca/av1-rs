@@ -277,7 +277,8 @@ pub(crate) struct FrameState {
     /// then stores and outputs it.
     pub lr_frame: Vec<Plane>,
     /// The buffers of a tile decode, kept between the tiles and frames this state decodes
-    /// (see [`TileScratch`]).
+    /// (see [`TileScratch`]); dropped after a frame whose tiles a threaded decode would split
+    /// (`decoder::splits`), at every thread count.
     pub tile_scratch: Option<TileScratch>,
     /// The frame CDFs of the last frame decoded on this state, reused by the next.
     pub frame_cdf: Option<Box<CdfContext>>,

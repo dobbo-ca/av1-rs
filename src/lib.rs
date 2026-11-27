@@ -38,8 +38,8 @@
 //!
 //! A [`Decoder`] reuses its frame buffers from one frame to the next, and
 //! [`Decoder::recycle`] hands returned frames back, so with `max_threads = 1` a temporal unit of
-//! the same shape as the previous one allocates nothing; the kept buffers stay charged to
-//! `max_alloc` (docs/limits.md).
+//! single-tile frames of the same shape as the previous one allocates nothing; the kept buffers
+//! stay charged to `max_alloc` (docs/limits.md lists what still allocates).
 //!
 //! # Cancelling
 //!
