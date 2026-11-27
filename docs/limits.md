@@ -42,7 +42,7 @@ running filter items); a frame over `max_alloc` fails with `AllocLimit` before t
 tile decode starts or at the wrapup, never after exceeding it. Film grain charges, per band of 32
 luma rows while the band runs, its noise stripe and the one above it (34 rows of about `width + 34`
 `i32` per plane each) plus one row: at most one band per worker. Fixed-size tile state (the CDF
-copy, the colour maps, the coefficient and level buffers, about 27 KB per tile decoder) is not
+copy, the colour maps, the coefficient and level buffers, about 28 KB per tile decoder) is not
 charged. The output planes are charged
 from when they are built until the
 temporal unit returns; `decode` keeps every frame it collects charged (for the capacity of its
@@ -62,7 +62,8 @@ checks `Decoder::decode_temporal_units` at 2 and 4 threads against `max_alloc` p
 buffers).
 
 Not charged, because their size does not depend on the input: per tile decoder, the colour map
-buffers and the 16 KiB reconstruction scratch (`recon::ItxScratch`). The loop restoration source
+buffers and the 17.25 KiB reconstruction scratch (`recon::ItxScratch`, with the intra edge
+arrays). The loop restoration source
 window and the kernels' working arrays (about 100 KB, `lr::LrScratch`) are charged: one set per
 `lr_frame` call, or per stripe item when threaded, taken from the ledger pool and not cleared
 between blocks.

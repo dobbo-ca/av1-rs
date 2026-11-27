@@ -21,7 +21,7 @@
 
 use crate::consts::*;
 use crate::error::Error;
-use crate::predict::{IntraEdges, IntraParams, predict_cfl, predict_intra, predict_palette};
+use crate::predict::{IntraEdges, IntraParams, predict_cfl, predict_intra_simd, predict_palette};
 use crate::quant::{ac_q, dc_q};
 use crate::recon::{ReconParams, reconstruct_region};
 use crate::scan::get_scan;
@@ -734,35 +734,52 @@ impl TileDecoder<'_> {
             } else {
                 (self.avail_l_chroma, self.avail_u_chroma)
             };
+            let use_filter_intra = plane == 0 && self.use_filter_intra;
+            // Only the directional modes read haveAboveRt and haveBelowLft (through the edge
+            // entries past w and h) and the filter type, so the others skip computing them.
+            let dir = !use_filter_intra && (V_PRED..=D67_PRED).contains(&mode);
             let edges = IntraEdges {
                 have_left: avail_l || x > 0,
                 have_above: avail_u || y > 0,
-                have_above_right: self.block_decoded_at(
-                    plane,
-                    sub_block_mi_row - 1,
-                    sub_block_mi_col + step_x as i32,
-                ),
-                have_below_left: self.block_decoded_at(
-                    plane,
-                    sub_block_mi_row + step_y as i32,
-                    sub_block_mi_col - 1,
-                ),
+                have_above_right: dir
+                    && self.block_decoded_at(
+                        plane,
+                        sub_block_mi_row - 1,
+                        sub_block_mi_col + step_x as i32,
+                    ),
+                have_below_left: dir
+                    && self.block_decoded_at(
+                        plane,
+                        sub_block_mi_row + step_y as i32,
+                        sub_block_mi_col - 1,
+                    ),
             };
             let params = IntraParams {
                 mode,
                 angle_delta,
                 log2w: TX_WIDTH_LOG2[tx_sz],
                 log2h: TX_HEIGHT_LOG2[tx_sz],
-                use_filter_intra: plane == 0 && self.use_filter_intra,
+                use_filter_intra,
                 filter_intra_mode: self.filter_intra_mode,
                 enable_intra_edge_filter: self.seq.enable_intra_edge_filter,
-                smooth_neighbor: self.get_filter_type(plane),
+                smooth_neighbor: dir
+                    && self.seq.enable_intra_edge_filter
+                    && self.get_filter_type(plane),
                 max_x: max_x - 1,
                 max_y: max_y - 1,
                 bit_depth,
             };
             let fp = &mut self.fs.curr_frame[plane];
-            predict_intra(&mut fp.px, fp.stride, start_x, start_y, edges, &params);
+            predict_intra_simd(
+                crate::simd::best(),
+                &mut fp.px,
+                fp.stride,
+                start_x,
+                start_y,
+                edges,
+                &params,
+                &mut self.itx.edges,
+            );
             if is_cfl {
                 let alpha = if plane == 1 {
                     self.cfl_alpha_u
