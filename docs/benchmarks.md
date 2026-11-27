@@ -294,6 +294,60 @@ coefficient and symbol decoding in `coeffs` and `read_levels`; the symbol decode
 here (dav1d's branchless search, inline vector adaptation, the non-inverted window) did not
 make it faster.
 
+## Speed work, round 3 (codegen and bounds checks)
+
+Start: main 5b0f0d1, bench run 46017403904. av1-rs / dav1d, all classes: x86_64 AMD EPYC 9V45
+941 / 492 ms with 1 thread (1.91x), 573 / 406 ms with 4 threads (1.41x); aarch64 Neoverse-N2
+1153 / 754 ms (1.53x) and 567 / 501 ms (1.13x).
+
+### Where the cycles of the hot functions go
+
+Profile run 46032212917 (main 5b0f0d1 plus `perf annotate` of the 10 hottest functions of the
+build with inlining off, `all.noinline.annotate.<n>.txt`; AMD EPYC 7763, no AVX-512, one
+thread). Self time: `coeffs` 34.4%, `transform_block` 12.8%, `itx::avx2::inverse_transform_add`
+6.5%, `read_levels` br closure 4.9%, `cdef::avx2::filter` 3.9%, `memmove` 3.5%, `decode_block`
+3.3%, `lf::Lines::line` 2.5%, `intra_frame_mode_info` 2.4%. dav1d on the same frames:
+`decode_coefs` 16.2%, the `msac_decode_symbol_adapt4` entry and its renorm labels 21.4%,
+`decode_b` 3.9%, `recon_b_intra` 4.4%.
+
+The instructions of `coeffs` (with `read_levels`, `read_cdf`, `norm` and `refill` inlined), by
+kind, as a share of its samples:
+
+| kind | share | what it is |
+|---|---|---|
+| ALU (the `cur` products, the adaptation, the context sums) | 50% | the work itself |
+| loads and stores of the stack frame | 10% | spilled locals and the reload of the `SymbolDecoder` pointer |
+| other loads and stores | 10% | levels, CDFs, and `dif`, `rng`, `cnt` of the `SymbolDecoder` (offsets 0x168 to 0x178 from its pointer) |
+| compares and branches | 19% | the search, the loop, the bounds checks |
+| shifts | 9% | `shl %cl` of the renorm (`dif`, `rng`) and the class shifts of `row`, `col` |
+| `bsr` + `xor $0x1f` (`leading_zeros`) | 0.5% | the renorm count; one more instruction than `lzcnt` |
+
+- Decoder state: every symbol loads `dif` and `rng` from memory, and stores `dif`,
+  `rng` and `cnt` back, and reloads `disable_cdf_update`, because the br closure is a call
+  (`read_levels::<0>::{closure#0}`, 4.9% on its own) that takes the decoder by reference. The
+  store of `dif` and the load of the next symbol are on the loop-carried chain.
+- Bounds checks: per coefficient, five compares against the levels length (`cmp $0x510`, one for
+  each neighbour), one against the 42 base CDFs and one for the level store. They are well
+  predicted and off the dependency chain: about 3% of the `coeffs` samples, so about 1% of the
+  run. No panic path is hot.
+- The hottest single instructions follow the load of the CDF value whose address comes from the
+  context (neighbours, sum, context, CDF load, `cur`, compare): the load latency, not the check.
+- Renorm: `leading_zeros` compiles to `bsr` + `xor` and the shifts by a variable count to
+  `shl %cl` (three micro-ops on Intel, one with BMI2 `shlx`) in the baseline x86-64 build.
+- `transform_block`: 22% of its samples are stack loads and stores; the rest is the scalar parts
+  of the intra prediction (edge preparation, the directional interpolation `edge[ix(base)]`,
+  filter intra, `cfl_ac`), spread over many lines, with no single hot spot.
+
+### The v4 build against the default build
+
+Bench run 46017403904 (main 5b0f0d1, AMD EPYC 9V45 with AVX-512), 1 thread, default / v4
+(`-C target-cpu=x86-64-v4`, fat LTO, panic=abort): q8 19 / 19 ms, q10 45 / 45, allintra
+392 / 385, size 13 / 18, grain 8 / 9, avif8 56 / 55, avifhi 140 / 137, tiles8 132 / 130,
+tiles10 136 / 133, all 941 / 931 ms (98.9%). The coefficient-heavy classes (allintra, avif,
+tiles) gain 1 to 2%; the v4 build is slower on the small `size` class. So the BMI2 and LZCNT
+forms of the renorm give at most about 1% on the whole run, which is the ceiling of a v3 build
+of the tile decode loop.
+
 ## Earlier runs
 
 2026-11-23, main 49f2864 (old bench, 24 streams, 100 frames, `.yuv` written by av1-rs only):

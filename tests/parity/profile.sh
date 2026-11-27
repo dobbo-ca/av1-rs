@@ -4,7 +4,9 @@
 #   run:  where av1-oracle-prof (debug line tables, frame pointers) spends its time with one
 #         thread, per class and over all classes: perf when the container may use it, else
 #         callgrind. Reports: <class>.srcfile.txt (self time by source file),
-#         <class>.symbol.txt, all.srcline.txt, all.memcallers.txt (callers of mem*), summary.md.
+#         <class>.symbol.txt, all.srcline.txt, all.memcallers.txt (callers of mem*),
+#         all.annotate.<n>.txt and all.noinline.annotate.<n>.txt (instructions of the hottest
+#         functions), summary.md.
 set -u
 W=/work
 B=/bench
