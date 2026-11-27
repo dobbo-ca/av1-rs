@@ -16,6 +16,7 @@
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod arm;
 pub(crate) mod cdef;
+pub(crate) mod codegen;
 pub(crate) mod entropy;
 pub(crate) mod grain;
 pub(crate) mod ipred;
@@ -32,7 +33,8 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Tier {
     Scalar,
-    /// x86_64 AVX2 with FMA, BMI1 and BMI2.
+    /// x86_64 AVX2 with FMA, BMI1, BMI2, LZCNT and POPCNT (x86-64-v3; `codegen` needs the
+    /// last two, which every AVX2 CPU has).
     Avx2,
     /// x86_64 AVX-512 F, BW, VL, DQ, CD (Skylake-X, Zen 4 and later), on top of `Avx2`.
     Avx512,
@@ -66,7 +68,13 @@ fn detect() -> Vec<Simd> {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::is_x86_feature_detected as has;
-        if has!("avx2") && has!("fma") && has!("bmi1") && has!("bmi2") {
+        if has!("avx2")
+            && has!("fma")
+            && has!("bmi1")
+            && has!("bmi2")
+            && has!("lzcnt")
+            && has!("popcnt")
+        {
             v.push(Simd(Tier::Avx2));
             if has!("avx512f")
                 && has!("avx512bw")

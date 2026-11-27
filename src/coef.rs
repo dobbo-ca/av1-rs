@@ -1174,6 +1174,18 @@ impl TileDecoder<'_> {
         start_y: usize,
         tx_sz: usize,
     ) -> Result<(usize, usize, (usize, usize)), Error> {
+        crate::simd::codegen::coeffs(crate::simd::best(), self, plane, start_x, start_y, tx_sz)
+    }
+
+    /// The body of [`TileDecoder::coeffs`], inlined into each build of `simd::codegen`.
+    #[inline(always)]
+    pub(crate) fn coeffs_body(
+        &mut self,
+        plane: usize,
+        start_x: usize,
+        start_y: usize,
+        tx_sz: usize,
+    ) -> Result<(usize, usize, (usize, usize)), Error> {
         let x4 = start_x >> 2;
         let y4 = start_y >> 2;
         let w4 = TX_WIDTH[tx_sz] >> 2;

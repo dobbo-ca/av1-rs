@@ -1105,6 +1105,13 @@ impl<'a> TileDecoder<'a> {
 
     /// Spec 5.11.7 `intra_frame_mode_info( )`.
     fn intra_frame_mode_info(&mut self) -> Result<(), Error> {
+        crate::simd::codegen::intra_frame_mode_info(crate::simd::best(), self)
+    }
+
+    /// The body of [`TileDecoder::intra_frame_mode_info`], inlined into each build of
+    /// `simd::codegen`.
+    #[inline(always)]
+    pub(crate) fn intra_frame_mode_info_body(&mut self) -> Result<(), Error> {
         self.skip = false;
         if self.fh.seg_id_pre_skip {
             self.intra_segment_id()?;

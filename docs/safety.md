@@ -68,6 +68,7 @@ Production code passes `simd::best()`; tests loop over `simd::available()`.
 | `ipred` | `src/predict.rs` | Paeth; Smooth, Smooth_V, Smooth_H; directional zone 1 without upsampling; intra edge filter; palette (rows of 8); CFL alpha step | AVX2 (8 x i32), NEON (4 x i32); AVX-512 runs the AVX2 kernels |
 | `itx` | `transform::inverse_transform_add` | 2D inverse transform + add/clip into the samples: DCT 4..64, ADST 4/8/16, identity 4..32, flips, rect scaling, row/column shifts and clamps | AVX2 (8 x i32), NEON (4 x i32); AVX-512 runs the AVX2 kernel (the 16-lane kernel was dropped, see below) |
 | `entropy` | `symbol::search`, `symbol::adapt_cdf` | `adapt_cdf`: the CDF update of `read_symbol` for 5 to 16 symbols (`read_cdf` adapts rows of up to 4 symbols inline), after the scalar `symbol::search` (`decode_symbol`) | AVX2, NEON; AVX-512 runs the AVX2 kernel (at most 16 lanes of `u16`, nothing for wider vectors to do) |
+| `codegen` | the baseline build of the same functions | `coeffs`, `intra_frame_mode_info`: the same safe Rust (`TileDecoder::coeffs_body`, `intra_frame_mode_info_body`, `#[inline(always)]`) compiled inside a `#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt,fma")]` fn, so the symbol decoder's renormalisation uses `lzcnt` and `shlx` | x86-64-v3 on the AVX2 and AVX-512 tiers (the AVX2 tier's detection includes LZCNT and POPCNT); baseline on scalar, NEON |
 
 Tiers not written:
 
