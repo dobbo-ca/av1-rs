@@ -381,8 +381,10 @@ PGO (bench column from PR #78, CI only; the crate does not change; trained on th
 classes, so this is the best case), default / PGO build, all classes, bench run 46035159115
 (the percent is PGO / default): x86_64 AMD EPYC 7763 1497 / 1493 ms (99.7%) with 1 thread,
 936 / 921 ms (98.3%) with 4 threads; aarch64 Neoverse-N2 1166 / 1148 ms (98.4%) and
-619 / 614 ms (99.1%). A user who builds
-with PGO gets 0 to 2%; the small `size` and `grain` classes get slower (up to 26% on `size` on
+619 / 614 ms (99.1%). Bench run 46041900099 (main after PR #78): x86_64 Intel Xeon 6975P-C
+1050 / 1023 ms (97.4%) with 1 thread, 635 / 613 ms (96.5%) with 4 threads; aarch64 1143 / 1124
+ms (98.3%) and 596 / 594 ms (99.6%). A user who builds
+with PGO gets 0 to 3% (most on Intel x86_64, least on AMD); the small `size` and `grain` classes get slower (up to 26% on `size` on
 aarch64), tiles8 and tiles10 get slower on the EPYC.
 
 Unsafe (owner rule of this round: allowed in the entropy and coefficient code only where a
