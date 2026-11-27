@@ -28,12 +28,17 @@ CHROMA_CAP=${TRANSFORM_CHROMA_CAP:-3}
 # checks cannot shrink to nothing.
 MIN_CHROMA=${TRANSFORM_MIN_CHROMA:-20}
 MIN_CROP=${TRANSFORM_MIN_CROP:-4}
+# The least number of files where the self-check (raw chroma with transformed luma) fails
+# chrompos, as it must.
+MIN_MUT=${TRANSFORM_MIN_MUT:-4}
 
 # gen <dst>: 4:2:0, 4:2:2 and 4:4:4 images of three sizes written by avifenc with every
 # combination of clap, irot and imir below. Luma is a gradient with some noise inside the RGB
 # gamut, so a wrong row or column shows. Chroma is smooth, with a different slope across and down
 # and per plane, so that a chroma plane mirrored, rotated or cropped the wrong way is far from
-# libheif's samples in its window (chrompos). A combination that avifenc refuses (a crop that
+# libheif's samples in its window (chrompos); it stays within 120..135, near grey, because
+# libheif goes through RGB for odd geometry and a colour outside the gamut clips and moves the
+# luma (88..168 failed the luma check on 25 files). A combination that avifenc refuses (a crop that
 # 4:2:0 or 4:2:2 cannot hold) is skipped.
 gen() {
   mkdir -p $W/gen
@@ -50,7 +55,7 @@ gen() {
       perl -e '($w, $h, $c, $t) = @ARGV; print "YUV4MPEG2 W$w H$h F30:1 Ip A1:1 $t\nFRAME\n";
         ($cw, $ch) = $c == 444 ? ($w, $h) : $c == 422 ? (int(($w + 1) / 2), $h) : (int(($w + 1) / 2), int(($h + 1) / 2));
         for $y (0 .. $h - 1) { print pack("C*", map { 40 + ($_ * 7 + $y * 13 + ($_ * $y) % 31) % 176 } 0 .. $w - 1) }
-        for $p (1, 2) { for $y (0 .. $ch - 1) { print pack("C*", map { $p == 1 ? 88 + int($_ * 64 / $cw) + int($y * 16 / $ch) : 88 + int($y * 64 / $ch) + int($_ * 16 / $cw) } 0 .. $cw - 1) } }' \
+        for $p (1, 2) { for $y (0 .. $ch - 1) { print pack("C*", map { $p == 1 ? 120 + int($_ * 12 / $cw) + int($y * 4 / $ch) : 120 + int($y * 12 / $ch) + int($_ * 4 / $cw) } 0 .. $cw - 1) } }' \
         $w $h $c $tag > $W/gen/src.y4m
       i=0
       while IFS= read -r opts; do
@@ -187,7 +192,7 @@ full() {
   av1-oracle --transforms $W/in $W/ours || bad=1
   heif-transform-oracle $W/in $W/lh 2> $W/lh.err || bad=1
   : > $W/transform.diff; : > $W/files.txt
-  crops=0 c_cx=0 c_cc=0 g_cx=0 g_cc=0 c_exact=0 c_doc=0 c_rgb=0 c_skip=0 c_tr=0 c_cmp=0 g_exact=0 g_doc=0 g_rgb=0 g_skip=0 g_cmp=0 g_tr=0
+  mut=0 crops=0 c_cx=0 c_cc=0 g_cx=0 g_cc=0 c_exact=0 c_doc=0 c_rgb=0 c_skip=0 c_tr=0 c_cmp=0 g_exact=0 g_doc=0 g_rgb=0 g_skip=0 g_cmp=0 g_tr=0
   for p in $W/in/*; do
     f=${p##*/}; s=${f%.*}
     case $f in gen_*) k=g ;; *) k=c ;; esac
@@ -239,6 +244,18 @@ full() {
           cp=$(chrompos $W/ours/$s.yuv $W/lh/$s.yuv $ow $oh $b "$olay" "$llay" "$obd" "$how") ||
             { echo "$f: av1-rs chroma differs from libheif by position ($cp, cap $CHROMA_CAP; raw $rlay, av1-rs $olay, libheif $llay, ${ow}x$oh, $obd-bit, $ntr transforms)" >> $W/transform.diff; continue; }
         fi
+        # Self-check of chrompos: the same luma with av1-rs's raw (untransformed) chroma, as a
+        # decoder that mirrors or rotates the luma only would give, must fail it. Only for an
+        # output of the raw size and layout whose chroma the transform changed.
+        if [ "$cp" != none ] && [ "$olay" = "$rlay" ] &&
+          [ "$(wc -c < $W/ours/$s.yuv)" -eq "$(wc -c < $W/raw/$s.yuv)" ]; then
+          lb=$((ow * oh * b))
+          { head -c $lb $W/ours/$s.yuv; tail -c +$((lb + 1)) $W/raw/$s.yuv; } > $W/mut.yuv
+          if cmp -s $W/mut.yuv $W/ours/$s.yuv; then :
+          elif chrompos $W/mut.yuv $W/lh/$s.yuv $ow $oh $b "$olay" "$llay" "$obd" "$how" > /dev/null; then
+            echo "$f: chrompos also passes the untransformed raw chroma, so it cannot see a wrong chroma transform here" >> $W/transform.diff
+          else mut=$((mut + 1)); fi
+        fi
         case $cp in none) ;; exact) eval "${k}_cx=\$((${k}_cx + 1))" ;; *) eval "${k}_cc=\$((${k}_cc + 1))" ;; esac
         case $how in
           exact) eval "${k}_doc=\$((${k}_doc + 1))" ;;
@@ -259,13 +276,14 @@ full() {
   [ $((c_rgb + g_rgb)) -le "$MAX_RGB" ] || echo "$((c_rgb + g_rgb)) images pass on luma within 2 via RGB, want at most $MAX_RGB" >> $W/d-cover
   [ $((c_cx + c_cc + g_cx + g_cc)) -ge "$MIN_CHROMA" ] || echo "only $((c_cx + c_cc + g_cx + g_cc)) images had their chroma compared by position, want at least $MIN_CHROMA" >> $W/d-cover
   [ "$crops" -ge "$MIN_CROP" ] || echo "only $crops crops compared with the raw decode, want at least $MIN_CROP" >> $W/d-cover
+  [ "$mut" -ge "$MIN_MUT" ] || echo "only $mut untransformed-chroma self-checks failed chrompos as they must, want at least $MIN_MUT" >> $W/d-cover
   {
     echo "## av1-rs transform parity (libheif 1.23.7 with dav1d)"; echo
     echo "| set | files | compared | with transform properties | exact | luma exact, chroma format differs (documented) | luma within 2 via RGB (documented) | of those, chroma by position equal | of those, chroma by position within the cap | not compared (both fail, or libheif refuses) |"
     echo "|---|---|---|---|---|---|---|---|---|---|"
     echo "| corpus | $cn | $c_cmp | $c_tr | $c_exact | $c_doc | $c_rgb | $c_cx | $c_cc | $c_skip |"
     echo "| generated (avifenc) | $gn | $g_cmp | $g_tr | $g_exact | $g_doc | $g_rgb | $g_cx | $g_cc | $g_skip |"
-    echo; echo "Crops (one \`clap\`, no other transform) equal to the rectangle of the raw decode, sample by sample: $crops."
+    echo; echo "Crops (one \`clap\`, no other transform) equal to the rectangle of the raw decode, sample by sample: $crops. Self-checks (transformed luma, raw chroma) that chrompos refused, as it must: $mut."
     echo; echo "| gate | result |"; echo "|---|---|"
   } > "$REP/summary.md"
   for g in transform.diff d-cover; do
