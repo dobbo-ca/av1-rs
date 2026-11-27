@@ -54,6 +54,28 @@ for c in all $CLASSES; do
         echo '```'
         echo
       } >> "$REP/summary.md"
+      # dav1d (bookworm's build, its asm on) on the same frames of the same files, one thread:
+      # the frame counts come from the av1-rs runs above (<stem>.frames in $W/o).
+      {
+        echo 'for i in 1 2 3 4 5; do'
+        for p in $W/all/*; do
+          s=$(basename "${p%.*}")
+          n=$(wc -l < "$W/o/$s.frames" 2>/dev/null || echo 0)
+          [ "$n" -gt 0 ] && echo "dav1d -q --threads 1 --limit $n -i $p -o /dev/null --muxer null"
+        done
+        echo 'done'
+      } > $W/dav1d.sh
+      $PERF record -q --all-user -F 1999 -o $W/dav1d.data -- sh $W/dav1d.sh >/dev/null 2>&1
+      $PERF report -i $W/dav1d.data --stdio --no-children --sort symbol --percent-limit 0.1 -g none > "$REP/all.dav1d.symbol.txt" 2>/dev/null
+      $PERF report -i $W/dav1d.data --stdio --no-children --sort dso --percent-limit 0.1 -g none > "$REP/all.dav1d.dso.txt" 2>/dev/null
+      {
+        echo "### dav1d, all"
+        echo
+        echo '```'
+        grep -v '^#' "$REP/all.dav1d.symbol.txt" | grep -v '^$' | head -n 40
+        echo '```'
+        echo
+      } >> "$REP/summary.md"
     fi
   else
     valgrind --tool=callgrind --callgrind-out-file=$W/$c.cg av1-oracle-prof --null --threads 1 $d $W/o >/dev/null 2>&1
