@@ -150,7 +150,8 @@ list and the asm, to recheck on a new rustc.
 
 Each decoder decodes the frames that av1-rs outputs (the leading intra frames of a stream).
 
-A dispatch with the input `base` (a commit or branch) also builds the default build of that
+A dispatch with the input `base` (a branch, a tag or a full commit SHA: `actions/checkout`
+cannot fetch a short SHA) also builds the default build of that
 commit in the same image and puts an A/B table first in the summary: the base and this commit,
 one run of each after the other in each of 7 rounds, best of the 7, with one thread and with the
 default threads, the ratio in tenths of a percent. Both builds run on the same machine minutes
@@ -214,6 +215,84 @@ frequency drop on these CPUs).
 
 Not tried (each below 1% of the time in the profile): ipred `smooth`, `cfl`, `filter_edge`,
 cdef `dir_costs`, entropy `adapt`.
+
+## Speed work of 2026-11-27 (entropy, coefficients and the filter drivers)
+
+Profile run 45968771362 (main 427b329 plus the dav1d profile, Intel Xeon 6975P-C, one thread, all
+classes): av1-rs and dav1d on the same frames. Self time, av1-rs with inlining off
+(`all.noinline.symbol.txt`) against dav1d (`all.dav1d.symbol.txt`; dav1d takes about 0.43 of
+the av1-rs time):
+
+| av1-rs | share | dav1d | share |
+|---|---|---|---|
+| `TileDecoder::coeffs` | 26.4% | `decode_coefs` (two copies) | 15.5% |
+| `TileDecoder::transform_block` (intra edges, prediction, dequant inlined) | 14.9% | `msac_decode_symbol_adapt4` with its renorm labels | 19.7% |
+| `simd::cdef::filter` (the driver) | 5.6% | `recon_b_intra` (8 and 16 bpc) | 6.1% |
+| `itx::avx2::inverse_transform_add` | 4.9% | `msac_decode_bool_equi` | 2.7% |
+| `coef::read_levels` br closure | 4.5% | `decode_b` | 3.0% |
+| `SymbolDecoder::read_symbol` | 4.0% | `prepare_intra_edges` (8 and 16 bpc) | 2.8% |
+| `lf::filter_run` | 3.0% | `msac_decode_symbol_adapt8`, `adapt16` | 3.8% |
+| `lf::edge_params` | 2.9% | `decode_sb` | 1.5% |
+| `cdef::avx512::filter` | 2.5% | `msac_decode_bool_adapt` | 1.3% |
+| `memmove` | 2.4% | `selfguided_filter` | 1.3% |
+| `decode_block` | 2.2% | `create_lf_mask_intra` | 1.2% |
+| `cdef::avx2::filter` | 2.0% | `cdef_filter_8x8_16bpc_avx2` | 1.0% |
+| `itx::avx2::transform_1d::<8>` | 1.9% | `memmove` | 0.9% |
+| `itx::avx2::transform_1d::<16>` | 1.5% | `msac_decode_hi_tok` | 0.7% |
+| `tile::fill_rows` | 1.4% | `cdef_filter_4x4_16bpc_avx2` | 0.6% |
+
+Where av1-rs spends time that dav1d does not: the coefficient and symbol decoding (about 53% of
+the av1-rs time against 43% of the dav1d time, so about 2.8 times the cycles), the CDEF driver
+(a padded copy of every 8x8 block and no skip of zero-strength work: the driver alone took about
+4.7 times all of dav1d's CDEF), the loop filter driver (`edge_params` at every 4x4 position) and
+the zeroed intra edge arrays.
+
+Each change was measured with the A/B table (bench input `base`) against the change before it,
+one thread, all classes; a change stayed only if it was faster on x86_64 by about 1% or more, or
+faster on both runners.
+
+| change | A/B run | x86_64 CPU | x86_64 1 thread | aarch64 1 thread | result |
+|---|---|---|---|---|---|
+| branchless search of rows of up to 4 symbols (`read_cdf`) | 45974090122 | Xeon 6975P-C | 99.7% | 99.9% | dropped |
+| dequantize in the sign pass, only the nonzero coefficients | 45978308736 | Xeon 6975P-C | 98.4% | 98.7% | kept (#67) |
+| `read_cdf` at every fixed-size CDF site | 45978313092 | Xeon 6975P-C | 99.2% | 100.0% | kept (#68) |
+| CDEF: skip zero-strength work, as dav1d | 45979960691 | Xeon 6975P-C | 93.9% | 91.3% | kept (#69) |
+| CDEF: interior blocks read straight from the plane | 45979964804 | Xeon 6975P-C | 99.5% | 98.7% | kept (#70) |
+| intra edges: persistent scratch, only the entries read | 45981476078 | Xeon Platinum 8573C | 99.1% | 97.7% | kept (#71) |
+| loop filter: transform block segment walk | 45982986040 | EPYC 7763 | 97.3% | 99.1% | kept (#72) |
+| symbol decoder: inline adaptation of every row, window not inverted | 45982990244 | Xeon 6973P-C | 100.5% | 99.5% | dropped |
+| coefficients: one context byte, branchless list link | 45984571106 | EPYC 9V74 | 100.0% | 100.3% | dropped |
+| CDEF: primary-only and secondary-only kernels | 45984575440 | EPYC 9V45 | 101.3% | 97.8% | dropped |
+| loop filter: vertical edges by transposed loads | 45986169840 | Xeon 6975P-C | 98.3% | 97.1% | kept (#73) |
+| ipred: AVX2/NEON directional zones 2 and 3 | 45986174416 | EPYC 7763 | 100.3% | 99.6% | dropped |
+
+The dropped symbol decoder changes confirm the earlier result: the scalar search with early exit
+and the inline adaptation of rows of up to 4 symbols are as fast as dav1d's shapes here. The
+work stopped after three changes in a row below 1% on x86_64 (the symbol decoder, the context
+byte and the CDEF kernel variants).
+
+All seven kept changes against main a4a1167, one machine (A/B run 46003957795, the base and
+main ac5e3c4 with the same dav1d times in one run):
+
+| runner | av1-rs, this / base, 1 thread | 4 threads | av1-rs / dav1d before, 1 thread | after | before, 4 threads | after |
+|---|---|---|---|---|---|---|
+| x86_64 Intel Xeon 6975P-C | 1232 / 1071 ms, 86.9% | 724 / 644 ms, 88.9% | 2.14x | 1.86x | 1.64x | 1.46x |
+| aarch64 Neoverse-N2 (NEON) | 1385 / 1166 ms, 84.1% | 677 / 610 ms, 90.1% | 1.81x | 1.55x | 1.27x | 1.15x |
+
+The largest single gain was the CDEF zero-strength skip (most bench streams code zero
+strengths for many blocks), then the loop filter segment walk and transposed loads, and the
+dequantization in the sign pass.
+
+After the changes (profile run 45998091759, main ac5e3c4, AMD EPYC 9V74, one thread, inlining
+off): `coeffs` 34.2%, `transform_block` 12.9%, `itx::avx2::inverse_transform_add` 6.4%,
+`read_levels` br closure 5.1%, `decode_block` 3.5%, `intra_frame_mode_info` 2.8%,
+`cdef::avx512::filter` 2.8%, `memmove` 2.7%, `lf::Lines::line` 2.4%,
+`itx::avx2::transform_1d::<8>` 1.9%, `<16>` 1.7%, `cdef::avx2::filter` 1.5%,
+`lf::avx2::kernel` 1.4%, `tile::fill_rows` 1.4%, `lf::avx2::filter_v` 1.3%. The CDEF driver
+(5.6% before) and `lf::edge_params` (2.9%) left the list. The gap to dav1d is now mostly the
+coefficient and symbol decoding in `coeffs` and `read_levels`; the symbol decoder shapes tried
+here (dav1d's branchless search, inline vector adaptation, the non-inverted window) did not
+make it faster.
 
 ## Earlier runs
 
