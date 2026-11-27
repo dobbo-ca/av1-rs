@@ -49,5 +49,6 @@ exited guest thread (fuzz runs 45490215220 and 45519136759). Native runs need ne
 | 2026-11-23 | a5cb385 | 900 s | 3 | 0.75 | 0 | probe 9,965,781 / decode 7,930 / avif 4,341 |
 | 2026-11-26 | 70a9212 | 900 s | 2, x86_64 and arm64 | 1.0 | 0 | simd_cdef 4.6M x86_64 / 4.4M arm64, simd_lf 15.5M x86_64 / 18.7M arm64 (runs 45907052285, 45907055157) |
 | 2026-11-27 | 028d393 | 900 s | all 13, 22 jobs (simd_* also arm64) | 5.5 | 0 | run 45956868631, x86_64 / arm64: probe 2.32M, decode 5,698, frames_threads 2,314, avif 2,878, simd_lf 10.9M / 18.8M, simd_grain 14.7M / 9.0M, simd_lr 490K / 581K, simd_cdef 5.29M / 4.55M, simd_ipred 5.53M / 6.30M, simd_itx 3.46M / 5.03M, simd_threads 23,785 / 30,323, simd_entropy 37,804 / 96,678, simd_alloc 197,728 / 189,529 |
+| 2026-11-27 | ac5e3c4 | 900 s | all 13, 22 jobs (simd_* also arm64), after the speed PRs #67-#73 | 5.5 | 0 | run 45998086602, x86_64 / arm64: probe 2.86M, decode 7,057, frames_threads 4,389, avif 3,664, simd_lf 14.3M / 16.3M, simd_grain 13.0M / 9.13M, simd_lr 539K / 595K, simd_cdef 5.18M / 4.37M, simd_ipred 4.18M / 4.45M, simd_itx 2.48M / 5.07M, simd_threads 11,321 / 33,194, simd_entropy 87,485 / 124,984, simd_alloc 173,188 / 185,551 |
 
 `decode` and `avif` run whole frames under ASan, so they do few runs per second.
