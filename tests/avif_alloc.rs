@@ -2,7 +2,7 @@
 //! global allocator over every thread. For AVIF: a plain item, an item with an alpha image, a
 //! 2x2 grid, the same grid and a 1x2 grid with each tile stored in two extents, and an item and
 //! a grid whose decoded frames are above the uncharged slack (rotated tiles, a mirrored grid, with
-//! `apply_transforms` on), and a hostile grid of 16384 references to one tiny tile, at many
+//! `apply_transforms` on), and a hostile grid of 65280 references to one tiny tile, at many
 //! `max_alloc` and `max_threads` values, the heap held at once
 //! (the parse, the item bytes, the item copy, the decoders, the transforms, the canvas and the
 //! output) stays within the ledger's three quarters of `max_alloc` plus what the parse and the
@@ -343,13 +343,15 @@ fn props() -> Vec<Vec<u8>> {
         ispe(2 * BIG_TILE, 2 * BIG_TILE),
         ispe(128, 32),
         ispe(TINY, TINY),
-        ispe(HOSTILE * TINY, HOSTILE * TINY),
+        ispe(HOSTILE_COLS * TINY, HOSTILE_ROWS * TINY),
     ]
 }
 
-/// The hostile grid has `HOSTILE` x `HOSTILE` tiles of `TINY` x `TINY`, every one a reference
-/// to the same item: a small file and a small canvas, but a work list as long as the tile count.
-const HOSTILE: u32 = 128;
+/// The hostile grid has `HOSTILE_ROWS` x `HOSTILE_COLS` (65280) tiles of `TINY` x `TINY`, every
+/// one a reference to the same item: a small file and a small canvas, but a work list and a tile
+/// id list (255 KiB, above the uncharged slack) as long as the tile count.
+const HOSTILE_ROWS: u32 = 255;
+const HOSTILE_COLS: u32 = 256;
 const TINY: u32 = 2;
 
 /// The large item and the tiles of the large grid are this square size: each decoded frame
@@ -451,19 +453,19 @@ fn files() -> Vec<(&'static str, Vec<u8>, usize)> {
         items.extend((2..=5).map(|id| av01(id, &tile, &[7, 0x82, 0x85])));
         build(&items, &props(), &[refs(b"dimg", 1, &[2, 3, 4, 5])])
     };
-    // 16384 references to one 2x2 tile (rotated, so each tile is transformed), mirrored after.
+    // 65280 references to one 2x2 tile (rotated, so each tile is transformed), mirrored after.
     let hostile = {
         let (tiny, _) = decodable_unit(0, (u64::from(TINY), u64::from(TINY)));
-        let side = (HOSTILE * TINY) as u16;
-        let n = (HOSTILE - 1) as u8;
+        let (w, h) = ((HOSTILE_COLS * TINY) as u16, (HOSTILE_ROWS * TINY) as u16);
+        let (r, c) = ((HOSTILE_ROWS - 1) as u8, (HOSTILE_COLS - 1) as u8);
         let grid = Item {
             id: 1,
             kind: b"grid",
-            data: [&[0, 0, n, n][..], &side.to_be_bytes(), &side.to_be_bytes()].concat(),
+            data: [&[0, 0, r, c][..], &w.to_be_bytes(), &h.to_be_bytes()].concat(),
             props: vec![11, 0x86],
             split: false,
         };
-        let tiles = vec![2; (HOSTILE * HOSTILE) as usize];
+        let tiles = vec![2; (HOSTILE_ROWS * HOSTILE_COLS) as usize];
         build(
             &[grid, av01(2, &tiny, &[10, 0x82, 0x85])],
             &props(),
@@ -532,7 +534,7 @@ fn decode_avif_keeps_the_heap_within_max_alloc(name: &str) {
     let want: AvifImage = want.unwrap_or_else(|e| panic!("{name}: reference decode: {e:?}"));
     let want_frames: Vec<&Frame> = std::iter::once(&want.image).chain(&want.alpha).collect();
     let (mut fitted, mut runs) = (0, 0);
-    // The hostile grid decodes 16384 tiles per run and fits well below 16 MiB.
+    // The hostile grid decodes 65280 tiles per run and fits well below 16 MiB.
     let top = if name == "hostile grid" {
         16 << 20
     } else {

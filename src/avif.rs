@@ -96,13 +96,13 @@ pub fn decode_avif(
         cancel,
     };
     let primary = heif.primary_image().map_err(container)?;
-    let _list = ctx.book_tile_list(&primary)?;
+    let _list = ctx.book_image(&primary)?;
     let image = decode_image(&ctx, &primary, false)?;
     let image = ctx.transformed_booked(&primary.transforms, image)?;
     let alpha = match primary.alpha {
         Some(id) => {
             let item = heif.image(id).map_err(container)?;
-            let _list = ctx.book_tile_list(&item)?;
+            let _list = ctx.book_image(&item)?;
             let alpha = decode_image(&ctx, &item, false)?;
             // The alpha image gets the transforms of its master.
             Some(ctx.transformed_booked(&primary.transforms, alpha)?)
@@ -158,19 +158,39 @@ pub fn decode_avif_item(
         cancel,
     };
     let image = heif.image(id).map_err(container)?;
-    let _list = ctx.book_tile_list(&image)?;
+    let _list = ctx.book_image(&image)?;
     let frame = decode_image(&ctx, &image, false)?;
     ctx.transformed_booked(&image.transforms, frame)
 }
 
 impl Ctx<'_> {
-    /// Books the tile id list of a grid image (4 bytes a tile, up to 65536 tiles, made by
-    /// `Heif::image` outside any budget) while the image is held.
-    fn book_tile_list(&self, image: &Image) -> Result<Held<'_>, Error> {
-        let n = match &image.kind {
-            ImageKind::Grid(g) => g.tiles.capacity().saturating_mul(size_of::<u32>()),
+    /// Books the lists an [`Image`] owns while it is held: `Heif::image` builds them outside any
+    /// budget, and their length comes from the file (a grid's tile ids, up to 65536; an overlay's
+    /// inputs; the thumbnail, Exif, XMP and auxiliary references; the transforms and colour
+    /// properties). Codec configs and ICC data are shared or are extents of the file, not copies.
+    fn book_image(&self, image: &Image) -> Result<Held<'_>, Error> {
+        fn bytes<T>(capacity: usize) -> usize {
+            capacity.saturating_mul(size_of::<T>())
+        }
+        let kind = match &image.kind {
+            ImageKind::Grid(g) => bytes::<u32>(g.tiles.capacity()),
+            ImageKind::Overlay(o) => bytes::<isobmff::OverlayInput>(o.inputs.capacity()),
             _ => 0,
         };
+        let ids = image.thumbnails.capacity()
+            + image.exif.capacity()
+            + image.xmp.capacity()
+            + image.gain_map.as_ref().map_or(0, |g| g.xmp.capacity());
+        let n = [
+            kind,
+            bytes::<u32>(ids),
+            bytes::<Transform>(image.transforms.capacity()),
+            bytes::<isobmff::Colour>(image.colour.capacity()),
+            bytes::<isobmff::Aux>(image.aux.capacity()),
+            image.pixi.as_ref().map_or(0, Vec::capacity),
+        ]
+        .into_iter()
+        .fold(0usize, usize::saturating_add);
         self.ledger.charge(n)
     }
 
@@ -348,7 +368,7 @@ fn decode_image(ctx: &Ctx<'_>, image: &Image, nested: bool) -> Result<Frame, Err
         // The input of an identity image is a coded image or a grid, not another identity.
         ImageKind::Identity { input } if !nested => {
             let inner = ctx.heif.image(*input).map_err(container)?;
-            let _list = ctx.book_tile_list(&inner)?;
+            let _list = ctx.book_image(&inner)?;
             // The input gets its own transforms before the identity image's.
             let frame = decode_image(ctx, &inner, true)?;
             ctx.transformed_booked(&inner.transforms, frame)
@@ -457,6 +477,7 @@ fn decode_grid(ctx: &Ctx<'_>, grid: &Grid) -> Result<Frame, Error> {
             .get(i)
             .ok_or(Error::Invalid("avif grid tile count"))?;
         let tile = ctx.heif.image(*id).map_err(container)?;
+        let _list = ctx.book_image(&tile)?;
         let decoder = Decoder::with_ledger(ctx.options.clone(), inner, Arc::clone(&ctx.ledger));
         let frame = decode_item(ctx, &tile, decoder)?;
         // Each tile gets its own transforms before it is pasted at its new size.
