@@ -8,11 +8,14 @@
 //! which every unavailable tap (outside `MiRows` x `MiCols` or the plane) holds the sentinel
 //! `0x8000`. A tap then needs no availability check: its constrained difference is 0 (the
 //! saturated difference is so large that `constrain` cuts it to 0), the signed max ignores it
-//! (-32768) and the unsigned min ignores it (32768).
+//! (-32768) and the unsigned min ignores it (32768). An interior block, whose every tap is
+//! available, skips the copy: the kernels read it straight from the source plane with its
+//! stride (dav1d's `edged == 0xf` path in `src/x86/cdef_avx2.asm`).
 //!
 //! Exactness: samples below 4096 (12 bits) keep every intermediate in 16 bits. The dispatch
-//! checks that, and every other premise of the kernels (block inside the frame, strengths,
-//! shifts, buffer bounds); a block that fails a check takes the scalar oracle.
+//! checks that (on the padded block, or for an interior block on the samples the kernel
+//! loads), and every other premise of the kernels (block inside the frame, strengths, shifts,
+//! buffer bounds); a block that fails a check takes the scalar oracle.
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;
@@ -55,12 +58,17 @@ fn at4(t: &[u16], s: usize) -> &[u16; 4] {
         .unwrap_or(&Z4)
 }
 
-/// The parameters of one filter call, in padded-block terms.
+/// The parameters of one filter call, in terms of the buffer the kernel reads (the padded
+/// block or the source plane).
 struct Filt {
     /// Block width and height: 8 or 4.
     w: usize,
     h: usize,
-    /// Start index in the padded block of each primary tap's block-sized window:
+    /// Row stride of the buffer (`TS` for the padded block).
+    stride: usize,
+    /// Index of the block's top-left sample in the buffer (`CENTER` for the padded block).
+    center: usize,
+    /// Start index in the buffer of each primary tap's block-sized window:
     /// `[k0 +, k0 -, k1 +, k1 -]`, weights `pri_tap[k]`.
     pri: [usize; 4],
     /// The secondary taps (directions `dir + 2` and `dir - 2`): four for k = 0 (weight 2), then
@@ -149,33 +157,43 @@ pub(crate) fn filter(
     if simd.tier() == Tier::Scalar {
         return cdef_filter(ctx, src, dst, plane, sub, r, c, strengths, damping, dir);
     }
-    let mut tmp = [SENTINEL; TMP];
+    // The padded block, filled by `prepare` unless the block is interior.
+    let mut tmp = None;
     let Some((f, x0, y0)) = prepare(
         ctx, src, dst, plane, sub, r, c, strengths, damping, dir, &mut tmp,
     ) else {
         return cdef_filter(ctx, src, dst, plane, sub, r, c, strengths, damping, dir);
     };
+    let t: &[u16] = match &tmp {
+        Some(t) => &t[..],
+        None => &src.px[..],
+    };
     let mut out = [0u16; 64];
-    match simd.tier() {
+    let low: bool = match simd.tier() {
         // A 4x4 block fills only half of a 512-bit vector.
         #[cfg(target_arch = "x86_64")]
         Tier::Avx512 if f.w * f.h >= 32 => {
             // SAFETY: `simd` is a detected tier (only `simd::available`/`best` make one), and
             // the AVX-512 tier includes AVX2 and AVX-512 BW (the kernel's features).
-            unsafe { avx512::filter(&tmp, &mut out, &f) }
+            unsafe { avx512::filter(t, &mut out, &f) }
         }
         #[cfg(target_arch = "x86_64")]
         Tier::Avx2 | Tier::Avx512 => {
             // SAFETY: `simd` is a detected tier (only `simd::available`/`best` make one), and
             // AVX-512 implies AVX2.
-            unsafe { avx2::filter(&tmp, &mut out, &f) }
+            unsafe { avx2::filter(t, &mut out, &f) }
         }
         #[cfg(target_arch = "aarch64")]
         Tier::Neon => {
             // SAFETY: `simd` is a detected tier (only `simd::available`/`best` make one).
-            unsafe { neon::filter(&tmp, &mut out, &f) }
+            unsafe { neon::filter(t, &mut out, &f) }
         }
         _ => return cdef_filter(ctx, src, dst, plane, sub, r, c, strengths, damping, dir),
+    };
+    // The 12-bit premise of an interior block, on the samples the kernel loaded (`prepare`
+    // checked the padded block, whose sentinels make `low` false).
+    if tmp.is_none() && !low {
+        return cdef_filter(ctx, src, dst, plane, sub, r, c, strengths, damping, dir);
     }
     // `prepare` checked that every row fits in `dst`.
     for (i, row) in out.chunks_exact(f.w).take(f.h).enumerate() {
@@ -203,9 +221,10 @@ fn copy_row(d: &mut [u16], s: &[u16]) {
     }
 }
 
-/// Fills `tmp` (all `SENTINEL` on entry) with the padded block and returns the kernel
-/// parameters, with the block's sample position (`x0`, `y0`); `None` when a premise of the
-/// kernels does not hold (the caller then runs the oracle).
+/// Returns the kernel parameters, with the block's sample position (`x0`, `y0`), for the
+/// source plane when the block is interior (`tmp` stays `None`), else for the padded block it
+/// puts in `tmp`; `None` when a premise of the kernels does not hold (the caller then runs the
+/// oracle).
 fn prepare(
     ctx: &FilterCtx,
     src: &Plane,
@@ -217,7 +236,7 @@ fn prepare(
     strengths: (i32, i32),
     damping: i32,
     dir: usize,
-    tmp: &mut [u16; TMP],
+    tmp: &mut Option<[u16; TMP]>,
 ) -> Option<(Filt, usize, usize)> {
     let (pri_str, sec_str) = strengths;
     let (sub_x, sub_y) = if plane > 0 { sub } else { (0, 0) };
@@ -254,38 +273,55 @@ fn prepare(
         }
     }
     let tap_set = ((pri_str >> ctx.coeff_shift) & 1) as usize;
-    // The padded block.
-    let mut or = 0u16;
-    let xa = x0.saturating_sub(2);
-    let xb = (x0 + w + 2).min(cols);
-    for yy in 0..h + 4 {
-        let Some(y) = (y0 + yy).checked_sub(2) else {
-            continue;
-        };
-        if y >= rows {
-            continue;
+    // Interior: every tap (at most 2 samples from the block) is inside the frame, and the last
+    // sample a tap reads, at (y0 + h + 1, x0 + w + 1), is inside `src.px` (the oracle reads the
+    // same index of a sample).
+    let interior = x0 >= 2
+        && y0 >= 2
+        && x0 + w + 2 <= cols
+        && y0 + h + 2 <= rows
+        && (y0 + h + 1) * src.stride + x0 + w + 2 <= src.px.len();
+    let (stride, center) = if interior {
+        (src.stride, y0 * src.stride + x0)
+    } else {
+        // The padded block.
+        let tmp = tmp.insert([SENTINEL; TMP]);
+        let mut or = 0u16;
+        let xa = x0.saturating_sub(2);
+        let xb = (x0 + w + 2).min(cols);
+        for yy in 0..h + 4 {
+            let Some(y) = (y0 + yy).checked_sub(2) else {
+                continue;
+            };
+            if y >= rows {
+                continue;
+            }
+            let a = y * src.stride;
+            let row = src.px.get(a + xa..a + xb)?;
+            let d = yy * TS + xa + 2 - x0;
+            copy_row(tmp.get_mut(d..d + row.len())?, row);
+            or |= row.iter().fold(0, |o, &v| o | v);
         }
-        let a = y * src.stride;
-        let row = src.px.get(a + xa..a + xb)?;
-        let d = yy * TS + xa + 2 - x0;
-        copy_row(tmp.get_mut(d..d + row.len())?, row);
-        or |= row.iter().fold(0, |o, &v| o | v);
-    }
-    if or >= 4096 {
-        return None;
-    }
-    // A tap at (dy, dx) from a sample reads the window that starts at `CENTER + dy * TS + dx`.
+        if or >= 4096 {
+            return None;
+        }
+        (TS, CENTER)
+    };
+    // A tap at (dy, dx) from a sample reads the window that starts at
+    // `center + dy * stride + dx`.
     if dir >= 8 {
         return None;
     }
     let at = |d: usize, k: usize, sign: isize| {
         let [dy, dx] = CDEF_DIRECTIONS[d][k];
-        CENTER.wrapping_add_signed(sign * (dy as isize * TS as isize + dx as isize))
+        center.wrapping_add_signed(sign * (dy as isize * stride as isize + dx as isize))
     };
     let (s0, s1) = ((dir + 2) & 7, (dir + 6) & 7);
     let f = Filt {
         w,
         h,
+        stride,
+        center,
         pri: [at(dir, 0, 1), at(dir, 0, -1), at(dir, 1, 1), at(dir, 1, -1)],
         sec: [
             at(s0, 0, 1),
@@ -385,8 +421,9 @@ mod tests {
             let bd = [8u32, 10, 12][case % 3];
             let cs = bd - 8;
             let sub = [(0, 0), (1, 1), (1, 0), (0, 1)][(case / 3) % 4];
-            // Odd mi_cols: the last block column is half outside the frame (oracle path).
-            let (mi_rows, mi_cols) = (2 + 2 * rng.below(3) as usize, 2 + rng.below(5) as usize);
+            // Odd mi_cols: the last block column is half outside the frame (oracle path). From
+            // 6 x 6 on, some blocks are interior (read from the plane, not the padded block).
+            let (mi_rows, mi_cols) = (2 + 2 * rng.below(5) as usize, 2 + rng.below(9) as usize);
             let ctx = FilterCtx {
                 mi_rows,
                 mi_cols,
@@ -397,6 +434,15 @@ mod tests {
                 let (w, h) = ((mi_cols * 4) >> sx, (mi_rows * 4) >> sy);
                 let mut s = plane(w, h, w + rng.below(5) as usize);
                 fill(&mut s, &mut rng, bd, (case / 12) as u64 % 6);
+                // Samples above 12 bits (hostile input), which every path must hand to the
+                // oracle when the block reads one.
+                if case % 7 == 0 {
+                    for v in s.px.iter_mut() {
+                        if rng.below(64) == 0 {
+                            *v |= 0x1000 << rng.below(4);
+                        }
+                    }
+                }
                 for r in (0..mi_rows).step_by(2) {
                     for c in (0..mi_cols).step_by(2) {
                         let pri = match rng.below(4) {
